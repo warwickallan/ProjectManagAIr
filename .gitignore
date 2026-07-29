@@ -1,0 +1,55 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Local-only product data, cache, indexes, databases, and logs
+/data/
+/.data/
+/.local/
+/.cache/
+/cache/
+/logs/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+
+# Live or exported project material must never be committed
+/customer-data/
+/employer-data/
+/external-projects/
+/live-data/
+/project-data/
+/imports/
+/exports/
+
+# Read-only architectural reference must remain outside this repository
+/mypka-reference/
+/vendor/mypka-reference/
+
+# Future dependency, build, test, and tooling output
+node_modules/
+dist/
+build/
+coverage/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.venv/
+.next/
+.turbo/
+
+# Editor and operating-system noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
