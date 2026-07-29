@@ -120,7 +120,7 @@ function StorageSettingsPanel() {
 }
 
 function NewProjectPanel({ onCreated }: { onCreated: (projectId: string) => void }) {
-  const [form, setForm] = useState({ code: '', name: '', customer: '', description: '', status: 'on-track', owner: '', startDate: '', targetDate: '' });
+  const [form, setForm] = useState({ code: '', name: '', customer: '', description: '', status: 'active', owner: '', startDate: '', targetDate: '' });
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const set = (key: keyof typeof form, value: string) => setForm((current) => ({ ...current, [key]: value }));
@@ -148,7 +148,7 @@ function NewProjectPanel({ onCreated }: { onCreated: (projectId: string) => void
           <label><span className="field-label">Project code</span><input className="input" required value={form.code} onChange={(event) => set('code', event.target.value)} /></label>
           <label><span className="field-label">Project name</span><input className="input" required value={form.name} onChange={(event) => set('name', event.target.value)} /></label>
           <label><span className="field-label">Customer</span><input className="input" required value={form.customer} onChange={(event) => set('customer', event.target.value)} /></label>
-          <label><span className="field-label">Status</span><select className="input" value={form.status} onChange={(event) => set('status', event.target.value)}><option value="on-track">On track</option><option value="watch">Watch</option><option value="at-risk">At risk</option><option value="blocked">Blocked</option><option value="complete">Complete</option></select></label>
+          <label><span className="field-label">Status</span><select className="input" value={form.status} onChange={(event) => set('status', event.target.value)}><option value="active">Active</option><option value="on-track">On track</option><option value="watch">Watch</option><option value="at-risk">At risk</option><option value="blocked">Blocked</option><option value="complete">Complete</option></select></label>
           <label><span className="field-label">Owner</span><input className="input" required value={form.owner} onChange={(event) => set('owner', event.target.value)} /></label>
           <label><span className="field-label">Start date</span><input className="input" type="date" value={form.startDate} onChange={(event) => set('startDate', event.target.value)} /></label>
           <label><span className="field-label">Target completion</span><input className="input" type="date" value={form.targetDate} onChange={(event) => set('targetDate', event.target.value)} /></label>

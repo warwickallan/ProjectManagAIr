@@ -27,7 +27,7 @@ export interface CreateProjectInput {
   name: string;
   customer: string;
   description: string;
-  status: 'on-track' | 'watch' | 'at-risk' | 'blocked' | 'complete';
+  status: 'active' | 'on-track' | 'watch' | 'at-risk' | 'blocked' | 'complete';
   owner: string;
   startDate?: string;
   targetDate?: string;

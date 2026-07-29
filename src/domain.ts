@@ -217,7 +217,7 @@ export const projectSchema = z.object({
   name: z.string().min(1),
   code: z.string().min(1),
   summary: z.string().min(1),
-  deliveryStatus: z.enum(['on-track', 'watch', 'at-risk', 'blocked', 'complete']),
+  deliveryStatus: z.enum(['active', 'on-track', 'watch', 'at-risk', 'blocked', 'complete']),
   stage: z.string().min(1),
   owner: z.string().min(1),
   startDate: dateOnly,
