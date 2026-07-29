@@ -1,12 +1,25 @@
 import { useEffect, useState } from 'react';
 
-export type Route = { name: 'portfolio' } | { name: 'project'; projectId: string; focus: string | null };
+export type Route =
+  | { name: 'today' }
+  | { name: 'inbox' }
+  | { name: 'calendar' }
+  | { name: 'portfolio' }
+  | { name: 'needs-you' }
+  | { name: 'ai-chat' }
+  | { name: 'project'; projectId: string; focus: string | null };
 
 export function parseRoute(hash: string): Route {
-  const value = hash.replace(/^#/, '') || '/';
+  const value = hash.replace(/^#/, '') || '/today';
   const [path, query = ''] = value.split('?');
+  if (path === '/' || path === '/today') return { name: 'today' };
+  if (path === '/inbox') return { name: 'inbox' };
+  if (path === '/calendar') return { name: 'calendar' };
+  if (path === '/projects') return { name: 'portfolio' };
+  if (path === '/needs-you') return { name: 'needs-you' };
+  if (path === '/ai-chat') return { name: 'ai-chat' };
   const match = path.match(/^\/projects\/([^/]+)$/);
-  if (!match) return { name: 'portfolio' };
+  if (!match) return { name: 'today' };
   return {
     name: 'project',
     projectId: decodeURIComponent(match[1]),

@@ -25,13 +25,13 @@ describe('SQLite operational database', () => {
     const { dir, dbPath } = tempDbPath();
     try {
       const first = openProjectManagairDatabase(dbPath);
-      expect(first.migrationsApplied).toEqual(['001_operational_schema.sql']);
+      expect(first.migrationsApplied).toEqual(['001_operational_schema.sql', '002_m365_workday_projection.sql']);
       first.db.close();
 
       const second = openProjectManagairDatabase(dbPath);
       expect(second.migrationsApplied).toEqual([]);
       const tableCount = (second.db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE type = 'table'").get() as { count: number }).count;
-      expect(tableCount).toBeGreaterThanOrEqual(17);
+      expect(tableCount).toBeGreaterThanOrEqual(25);
       expect((second.db.prepare('PRAGMA quick_check').get() as { quick_check: string }).quick_check).toBe('ok');
       second.db.close();
     } finally {

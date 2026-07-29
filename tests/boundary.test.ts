@@ -35,17 +35,20 @@ describe('repository data boundary', () => {
     expect(collections.flat().every((record) => record.dataClassification === 'fictional')).toBe(true);
   });
 
-  it('exposes no mutation endpoint implementation', () => {
+  it('exposes only explicit approved POST command endpoints and no hard delete route', () => {
     const server = readFileSync(path.join(root, 'server.ts'), 'utf8');
-    expect(server).not.toMatch(/app\.(post|put|patch|delete)\s*\(/i);
-    expect(server).not.toContain('express.json(');
+    expect(server).not.toMatch(/app\.(put|patch|delete)\s*\(/i);
+    expect(server).not.toMatch(/method:\s*['"]DELETE['"]/i);
+    expect(server).toContain('/api/inbox/:graphId/delete');
+    expect(server).toContain('moveMessageToDeletedItems');
   });
 
-  it('does not track database artifacts, portable runtime, or native sqlite dependencies', () => {
+  it('does not track database artifacts, portable runtime, native sqlite dependencies, tokens, or tenant config', () => {
     const packageJson = readFileSync(path.join(root, 'package.json'), 'utf8');
     expect(packageJson).not.toMatch(/better-sqlite3|sqlite3|postgres|mysql|mongodb|prisma/i);
     const repositoryFiles = filesUnder('.').map((file) => path.relative(root, file));
     expect(repositoryFiles.some((name) => /(^|[\\/])\.runtime([\\/]|$)/i.test(name))).toBe(false);
     expect(repositoryFiles.some((name) => /\.(db|sqlite|sqlite3)$/i.test(name))).toBe(false);
+    expect(repositoryFiles.some((name) => /m365-auth\.local\.json|token/i.test(name))).toBe(false);
   });
 });

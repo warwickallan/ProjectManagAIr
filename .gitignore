@@ -1,4 +1,4 @@
-﻿# Secrets and local configuration
+# Secrets and local configuration
 .env
 .env.*
 !.env.example
@@ -57,3 +57,8 @@ Thumbs.db
 /test-results/
 /playwright-report/
 /artifacts/
+
+/.local-m365/
+/config/*.local.json
+/config/*secret*.json
+/tokens/

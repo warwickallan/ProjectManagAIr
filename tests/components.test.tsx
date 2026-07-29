@@ -8,7 +8,7 @@ const fixture = portfolioFixtureSchema.parse(fixtureJson);
 const jsonResponse = (data: unknown, ok = true) => Promise.resolve({ ok, status: ok ? 200 : 500, json: () => Promise.resolve(data) });
 
 beforeEach(() => {
-  window.location.hash = '#/';
+  window.location.hash = '#/projects';
   vi.restoreAllMocks();
 });
 

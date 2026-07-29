@@ -1,21 +1,28 @@
 import type { ReactNode } from 'react';
 import type { AttentionItem, Freshness, ActivityEvent } from './domain';
 
-export function AppFrame({ active, children }: { active: 'portfolio' | 'project'; children: ReactNode }) {
+type ActiveNav = 'today' | 'inbox' | 'calendar' | 'portfolio' | 'needs-you' | 'ai-chat';
+
+export function AppFrame({ active, children }: { active: ActiveNav; children: ReactNode }) {
+  const nav = [
+    ['today', '#/today', 'Today'],
+    ['inbox', '#/inbox', 'Inbox'],
+    ['calendar', '#/calendar', 'Calendar'],
+    ['portfolio', '#/projects', 'Projects'],
+    ['needs-you', '#/needs-you', 'Needs You'],
+    ['ai-chat', '#/ai-chat', 'AI Chat'],
+  ] as const;
   return (
     <div className="app-shell">
       <aside className="sidebar" aria-label="Primary navigation">
-        <a className="brand" href="#/" aria-label="Project ManagAIr portfolio home">
+        <a className="brand" href="#/today" aria-label="Project ManagAIr today home">
           <span className="brand-mark" aria-hidden="true">PM</span>
           <span><strong>Project ManagAIr</strong><small>Implementation Cockpit</small></span>
         </a>
         <nav className="nav-list">
-          <a className={active === 'portfolio' ? 'nav-link active' : 'nav-link'} href="#/">
-            <span aria-hidden="true">Ã¢Å’â€š</span> Portfolio
-          </a>
-          <span className={active === 'project' ? 'nav-link active nav-static' : 'nav-link nav-static'}>
-            <span aria-hidden="true">Ã¢â€”â€¡</span> Project detail
-          </span>
+          {nav.map(([id, href, label]) => (
+            <a key={id} className={active === id ? 'nav-link active' : 'nav-link'} href={href}>{label}</a>
+          ))}
         </nav>
         <div className="sidebar-foot">
           <span className="pulse-dot" aria-hidden="true" />
@@ -26,8 +33,8 @@ export function AppFrame({ active, children }: { active: 'portfolio' | 'project'
         <header className="topbar">
           <span className="mobile-brand">Project ManagAIr</span>
           <div className="topbar-badges" aria-label="Environment status">
-            <span className="meta-badge demo">Local data</span>
-            <span className="meta-badge">Read only</span>
+            <span className="meta-badge demo">Local projection</span>
+            <span className="meta-badge">M365 optional</span>
           </div>
         </header>
         <main id="main-content" className="content">{children}</main>
@@ -56,8 +63,8 @@ export function ErrorState({ message }: { message: string }) {
   );
 }
 
-export function EmptyState({ children = 'No records in this fictional project.' }: { children?: ReactNode }) {
-  return <div className="empty-state" role="status"><span aria-hidden="true">Ã¢â€”â€¹</span><p>{children}</p></div>;
+export function EmptyState({ children = 'No records available.' }: { children?: ReactNode }) {
+  return <div className="empty-state" role="status"><span aria-hidden="true">○</span><p>{children}</p></div>;
 }
 
 export function FreshnessNotice({ freshness, asOf }: { freshness: Freshness; asOf: string }) {
@@ -66,11 +73,11 @@ export function FreshnessNotice({ freshness, asOf }: { freshness: Freshness; asO
     return (
       <div className="freshness stale" role="status">
         <strong>Data snapshot is stale</strong>
-        <span>As of {stamp} Ã‚Â· {freshness.hoursOld} hours old</span>
+        <span>As of {stamp} - {freshness.hoursOld} hours old</span>
       </div>
     );
   }
-  return <div className="freshness"><span className="pulse-dot" aria-hidden="true" /><span>Data current Ã‚Â· {stamp}</span></div>;
+  return <div className="freshness"><span className="pulse-dot" aria-hidden="true" /><span>Data current - {stamp}</span></div>;
 }
 
 export function PageIntro({ eyebrow, title, description, aside }: { eyebrow: string; title: string; description: string; aside?: ReactNode }) {
@@ -95,9 +102,9 @@ export function Section({ id, title, kicker, count, children, className = '' }: 
 }
 
 const statusTone: Record<string, string> = {
-  'on-track': 'good', complete: 'good', achieved: 'good', verified: 'good', decided: 'good',
-  watch: 'watch', 'at-risk': 'watch', 'in-progress': 'info', active: 'info', 'in-review': 'info', pending: 'watch',
-  blocked: 'bad', critical: 'bad', failed: 'bad', missed: 'bad', overdue: 'bad',
+  'on-track': 'good', complete: 'good', achieved: 'good', verified: 'good', decided: 'good', accepted: 'good', free: 'good', completed: 'good',
+  watch: 'watch', 'at-risk': 'watch', 'in-progress': 'info', active: 'info', 'in-review': 'info', pending: 'watch', tentative: 'watch', normal: 'neutral',
+  blocked: 'bad', critical: 'bad', failed: 'bad', missed: 'bad', overdue: 'bad', busy: 'bad', high: 'bad',
 };
 
 export function StatusChip({ value, label }: { value: string; label?: string }) {
@@ -128,7 +135,7 @@ export function AttentionList({ items, emptyLabel = 'Nothing needs your attentio
             <h3><a href={item.route}>{item.title}</a></h3>
             <p>{item.reason}</p>
           </div>
-          <div className="attention-due"><small>{item.dueAt ? 'Due' : 'Status'}</small><strong>{item.dueAt ? formatDate(item.dueAt) : 'Open'}</strong><a href={item.route} aria-label={`Open ${item.title}`}>View <span aria-hidden="true">Ã¢â€ â€™</span></a></div>
+          <div className="attention-due"><small>{item.dueAt ? 'Due' : 'Status'}</small><strong>{item.dueAt ? formatDate(item.dueAt) : 'Open'}</strong><a href={item.route} aria-label={`Open ${item.title}`}>View <span aria-hidden="true">{'->'}</span></a></div>
         </li>
       ))}
     </ol>
@@ -158,6 +165,10 @@ export function formatDateTime(value: string): string {
   return new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC', timeZoneName: 'short' }).format(new Date(value));
 }
 
+export function formatTime(value: string): string {
+  return new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit' }).format(new Date(value));
+}
+
 export function formatRelativeStamp(value: string): string {
   return formatDateTime(value).replace(' UTC', '');
 }
@@ -167,5 +178,5 @@ export function humanize(value: string): string {
 }
 
 function activityGlyph(type: ActivityEvent['eventType']): string {
-  return ({ progress: 'Ã¢â€ â€”', decision: 'Ã¢Å“â€œ', risk: '!', milestone: 'Ã¢â€”â€ ', ai: 'AI' } as const)[type];
+  return ({ progress: 'UP', decision: 'OK', risk: '!', milestone: 'MS', ai: 'AI' } as const)[type];
 }

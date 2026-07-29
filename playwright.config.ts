@@ -20,7 +20,7 @@ export default defineConfig({
   webServer: {
     command: serverCommand,
     url: 'http://127.0.0.1:4318/api/health',
-    reuseExistingServer: true,
+    reuseExistingServer: false,
     timeout: 120000,
   },
 });

@@ -19,6 +19,7 @@ for (const suffix of ['', '-wal', '-shm', '-journal']) {
 }
 
 process.env.PROJECTMANAGAIR_DB_PATH = resolvedDb;
+process.env.PROJECTMANAGAIR_M365_CONFIG = path.join(artifactsDir, 'missing-m365-auth.local.json');
 const fixture = portfolioFixtureSchema.parse(fixtureJson);
 const context = openProjectManagairDatabase(resolvedDb);
 try {

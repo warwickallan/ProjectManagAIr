@@ -9,12 +9,13 @@ const statDefinitions = [
   { key: 'aiAwaitingVerification', label: 'AI checks outstanding', accent: 'teal' },
 ] as const;
 
-export function PortfolioPage() {
+export function PortfolioPage({ initialSection }: { initialSection?: 'attention' } = {}) {
   const state = useApi<PortfolioResponse>('/api/portfolio');
   if (state.status === 'loading') return <LoadingState label="Loading portfolio" />;
   if (state.status === 'error') return <ErrorState message={state.error} />;
 
   const data = state.data;
+  if (initialSection === 'attention') window.requestAnimationFrame(() => document.getElementById('attention')?.scrollIntoView({ block: 'start' }));
   const projectNames = Object.fromEntries(data.projects.map((project) => [project.id, project.name]));
   const isEmpty = data.projects.length === 0;
 

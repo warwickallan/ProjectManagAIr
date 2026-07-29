@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { buildPortfolioResponse, buildProjectResponse, portfolioFixtureSchema } from './src/domain.js';
 import { openProjectManagairDatabase, readPortfolioData, readProjectData } from './src/db.js';
+import { authStatus, markMessageRead, moveMessageToDeletedItems, pollDeviceCode, readCalendarProjection, readInboxProjection, requiredScopes, startDeviceCode, syncCalendarView, syncInbox } from './src/m365.js';
+import { probeAIProviders, sendChatMessage } from './src/aiProvider.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -24,7 +26,17 @@ if (demoMode) {
   dbContext = openProjectManagairDatabase();
 }
 
+function db() {
+  if (!dbContext) throw new Error('Database did not initialise');
+  return dbContext.db;
+}
+
+function asyncRoute(handler: express.RequestHandler): express.RequestHandler {
+  return (request, response, next) => Promise.resolve(handler(request, response, next)).catch(next);
+}
+
 app.disable('x-powered-by');
+app.use(express.json({ limit: '256kb' }));
 app.use((_, response, next) => {
   response.setHeader('Cache-Control', 'no-store');
   response.setHeader('X-Content-Type-Options', 'nosniff');
@@ -46,7 +58,7 @@ app.get('/api/health', (_, response) => {
     return;
   }
   const portfolio = readPortfolioData(dbContext.db);
-  response.json({ ok: true, mode: 'sqlite-read-only', dbPath: dbContext.dbPath, migrationsApplied: dbContext.migrationsApplied, projects: portfolio.projects.length });
+  response.json({ ok: true, mode: 'sqlite-read-only', dbPath: dbContext.dbPath, migrationsApplied: dbContext.migrationsApplied, projects: portfolio.projects.length, m365: authStatus(), aiProviders: probeAIProviders() });
 });
 
 app.get('/api/portfolio', (_, response) => {
@@ -54,11 +66,7 @@ app.get('/api/portfolio', (_, response) => {
     response.json(buildPortfolioResponse(fixture, new Date(), demoEnvironment));
     return;
   }
-  if (!dbContext) {
-    response.status(500).json({ error: 'Database did not initialise' });
-    return;
-  }
-  response.json(buildPortfolioResponse(readPortfolioData(dbContext.db), new Date(), databaseEnvironment));
+  response.json(buildPortfolioResponse(readPortfolioData(db()), new Date(), databaseEnvironment));
 });
 
 app.get('/api/projects/:projectId', (request, response) => {
@@ -71,11 +79,7 @@ app.get('/api/projects/:projectId', (request, response) => {
     response.json(result);
     return;
   }
-  if (!dbContext) {
-    response.status(500).json({ error: 'Database did not initialise' });
-    return;
-  }
-  const data = readProjectData(dbContext.db, request.params.projectId);
+  const data = readProjectData(db(), request.params.projectId);
   if (!data) {
     response.status(404).json({ error: 'Project not found' });
     return;
@@ -83,12 +87,44 @@ app.get('/api/projects/:projectId', (request, response) => {
   response.json(buildProjectResponse(data, request.params.projectId, new Date(), databaseEnvironment));
 });
 
+app.get('/api/m365/status', (_, response) => response.json({ ...authStatus(), scopes: requiredScopes(), aiProviders: probeAIProviders() }));
+app.post('/api/m365/auth/start', asyncRoute(async (_, response) => response.json(await startDeviceCode())));
+app.post('/api/m365/auth/poll', asyncRoute(async (_, response) => response.json(await pollDeviceCode(db()))));
+
+app.get('/api/today', asyncRoute(async (request, response) => {
+  const now = new Date();
+  const start = typeof request.query.start === 'string' ? request.query.start : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
+  const end = typeof request.query.end === 'string' ? request.query.end : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 7)).toISOString();
+  const refresh = request.query.refresh === '1';
+  response.json(refresh ? await syncCalendarView(db(), start, end) : readCalendarProjection(db(), start, end));
+}));
+
+app.post('/api/today/refresh', asyncRoute(async (request, response) => {
+  const body = request.body as { start?: string; end?: string };
+  response.json(await syncCalendarView(db(), body.start ?? new Date().toISOString(), body.end ?? new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()));
+}));
+
+app.get('/api/inbox', asyncRoute(async (request, response) => response.json(request.query.refresh === '1' ? await syncInbox(db()) : readInboxProjection(db()))));
+app.post('/api/inbox/refresh', asyncRoute(async (_, response) => response.json(await syncInbox(db()))));
+app.post('/api/inbox/:graphId/read-state', asyncRoute(async (request, response) => {
+  const body = request.body as { isRead?: boolean };
+  response.json(await markMessageRead(db(), String(request.params.graphId), Boolean(body.isRead)));
+}));
+app.post('/api/inbox/:graphId/delete', asyncRoute(async (request, response) => response.json(await moveMessageToDeletedItems(db(), String(request.params.graphId)))));
+
+app.get('/api/ai/providers', (_, response) => response.json({ providers: probeAIProviders() }));
+app.post('/api/ai/chat', asyncRoute(async (request, response) => response.json(await sendChatMessage(db(), request.body))));
+
 app.use('/api', (request, response) => {
-  if (request.method !== 'GET') {
-    response.status(405).json({ error: 'Read-only Cockpit: mutation methods are not available' });
+  if (!['GET', 'POST'].includes(request.method)) {
+    response.status(405).json({ error: 'Read-only Cockpit except explicit Graph-backed mailbox actions: mutation method is not available' });
     return;
   }
   response.status(404).json({ error: 'API route not found' });
+});
+
+app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {
+  response.status(500).json({ error: error instanceof Error ? error.message : 'Unknown server error' });
 });
 
 if (production) {
@@ -106,6 +142,6 @@ app.listen(port, '127.0.0.1', () => {
   if (demoMode) {
     console.log('Mode: explicit fictional demo data, read-only, loopback-only');
   } else {
-    console.log(`Mode: SQLite operational database, read-only, loopback-only, db=${dbContext?.dbPath}`);
+    console.log(`Mode: SQLite operational database, M365 projection enabled, loopback-only, db=${dbContext?.dbPath}`);
   }
 });

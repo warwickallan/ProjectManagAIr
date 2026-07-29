@@ -28,6 +28,7 @@ The sibling `Vendor/mypka-reference` folder is read-only architectural reference
 - [docs/architecture.md](docs/architecture.md) proposes the product's component boundaries.
 - [docs/data-boundary.md](docs/data-boundary.md) defines what may cross into Git and what must remain external or local-only.
 - [docs/sqlite-runtime.md](docs/sqlite-runtime.md) documents the local SQLite runtime and import path.
+- [docs/m365-workday-cockpit.md](docs/m365-workday-cockpit.md) documents the Microsoft 365 workday Cockpit configuration and boundaries.
 
 ## Local Start
 

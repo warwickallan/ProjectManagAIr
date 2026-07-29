@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { useApi, type ProjectResponse } from './api';
+import { AIChatPanel } from './AIChatPanel';
 import { ActivityList, AttentionList, EmptyState, ErrorState, FreshnessNotice, LoadingState, PageIntro, ProgressBar, Section, StatusChip, formatDate, formatDateTime, humanize } from './components';
 
 const sections = [
@@ -22,7 +23,7 @@ export function ProjectPage({ projectId, focus }: { projectId: string; focus: st
   const { project, attentionLabel, attention, freshness, asOf } = state.data;
   return (
     <div className="page-stack project-page">
-      <a className="back-link" href="#/"><span aria-hidden="true">{'<-'}</span> Portfolio</a>
+      <a className="back-link" href="#/projects"><span aria-hidden="true">{'<-'}</span> Portfolio</a>
       <PageIntro
         eyebrow={`${project.code} . ${project.stage}`}
         title={project.name}
@@ -177,6 +178,12 @@ export function ProjectPage({ projectId, focus }: { projectId: string; focus: st
       <Section id="activity" title="Latest project activity" kicker="Recent meaningful changes" count={project.activity.length}>
         <ActivityList activity={project.activity} />
       </Section>
+      <AIChatPanel contextOptions={[
+        { contextType: 'selected-project', contextId: project.id, label: project.name, preview: project.summary },
+        ...project.actions.map((item) => ({ contextType: 'project-record' as const, contextId: item.id, label: item.title, preview: item.summary })),
+        ...project.risksIssues.map((item) => ({ contextType: 'project-record' as const, contextId: item.id, label: item.title, preview: item.summary })),
+        ...project.decisions.map((item) => ({ contextType: 'project-record' as const, contextId: item.id, label: item.title, preview: item.summary })),
+      ]} />
     </div>
   );
 }
