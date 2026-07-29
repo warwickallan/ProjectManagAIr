@@ -1,8 +1,7 @@
 # Project ManagAIr MVP Build Contract
 
-**Status:** Proposed for Warwick's review  
-**Build authority:** No implementation starts until Warwick approves the open
-decisions in this contract.
+**Status:** Approved for implementation, including the person-neutral attention model
+**Approved by:** Warwick
 
 ## North Star
 
@@ -60,7 +59,9 @@ Warwick needs to:
 
 The Cockpit is a single-user local application bound to loopback. The MVP has no
 accounts, collaboration, tenancy, remote access, or authorization model because
-it contains fictional data only.
+it contains fictional data only. Reusable logic identifies the current user
+generically. An optional local display name may personalize labels (for example,
+`Needs Warwick`); without one, the product label is `Needs You`.
 
 ## Success Criteria
 
@@ -72,7 +73,7 @@ The MVP is successful when:
    projects.
 3. Warwick can identify the highest-priority cross-project attention item
    without opening either project.
-4. Every attention item explains why it needs Warwick and links to its project
+4. Every attention item explains why it needs the configured user and links to its project
    detail context.
 5. Each project card communicates delivery status, next milestone, open
    attention count, and data freshness at a glance.
@@ -167,7 +168,7 @@ Minimum content:
 - a clear **Fictional demo data** banner and `asOf` timestamp;
 - portfolio summary counts for projects, attention items, high risks/issues,
   pending decisions, and AI outputs awaiting verification;
-- **Needs Warwick attention** queue, ordered by urgency;
+- **Needs You** queue, ordered by urgency. An optional configured display name may render this as **Needs Warwick** in the fictional demo;
 - two project cards;
 - latest activity across both projects; and
 - direct navigation from attention items and project cards to project detail.
@@ -226,6 +227,20 @@ Every project-owned record has:
 - `dataClassification`: always `fictional` in the MVP; and
 - `summary`: optional plain-language context.
 
+### User Configuration
+
+Local display configuration; it is not a reusable domain identity.
+
+Minimum fields:
+
+- `userId`: stable generic current-user identifier;
+- `displayName`: optional presentation-only name; and
+- `attentionLabel`: derived at render time as `Needs {displayName}` when a
+  display name exists, otherwise `Needs You`.
+
+The fictional demo may configure `displayName: "Warwick"`. Reusable schemas,
+selectors, components, and tests must not require or branch on that name.
+
 ### Project
 
 Minimum fields:
@@ -249,8 +264,9 @@ Minimum fields:
 - common fields;
 - `priority`: `low | medium | high | critical`;
 - `dueDate`;
-- `needsWarwick`: boolean; and
-- `attentionReason`: controlled reason when `needsWarwick` is true.
+- `needsUserAttention`: boolean;
+- `attentionOwner`: generic user identifier; and
+- `attentionReason`: controlled reason when `needsUserAttention` is true.
 
 ### Risk or Issue
 
@@ -264,19 +280,21 @@ Minimum fields:
 - `likelihood`: required for risks, omitted for issues;
 - `impact`;
 - `response`;
-- `targetResolutionDate`; and
-- `needsWarwick`.
+- `targetResolutionDate`;
+- `needsUserAttention`; and
+- `attentionOwner`.
 
 ### Decision
 
 Minimum fields:
 
 - common fields;
-- `decisionStatus`: `proposed | awaiting-warwick | decided | superseded`;
+- `decisionStatus`: `proposed | awaiting-user | decided | superseded`;
 - `decisionNeededBy`;
 - `optionsSummary`;
-- `outcome`; and
-- `needsWarwick`.
+- `outcome`;
+- `needsUserAttention`; and
+- `attentionOwner`.
 
 ### Open Question
 
@@ -286,7 +304,8 @@ Minimum fields:
 - `question`;
 - `answerNeededBy`;
 - `blocking`: boolean;
-- `needsWarwick`; and
+- `needsUserAttention`;
+- `attentionOwner`; and
 - `resolution`.
 
 ### Milestone
@@ -296,8 +315,10 @@ Minimum fields:
 - common fields;
 - `targetDate`;
 - `milestoneStatus`: `not-started | in-progress | at-risk | achieved | missed`;
-- `completionPercent`; and
-- `workPackageIds`.
+- `completionPercent`;
+- `workPackageIds`;
+- `needsUserAttention`; and
+- `attentionOwner`.
 
 ### Work Package
 
@@ -309,8 +330,10 @@ Minimum fields:
 - `lead`;
 - `startDate`, `targetDate`;
 - `completionPercent`;
-- `blockerSummary`; and
-- `milestoneId`.
+- `blockerSummary`;
+- `milestoneId`;
+- `needsUserAttention`; and
+- `attentionOwner`.
 
 ### Activity Event
 
@@ -341,8 +364,9 @@ Minimum fields:
 - `verificationMethod`;
 - `lastAttemptAt`;
 - `verifiedAt`;
-- `verifiedBy`; and
-- `statusDetail`.
+- `verifiedBy`;
+- `statusDetail`; and
+- `attentionOwner`.
 
 ### Attention Item
 
@@ -353,6 +377,7 @@ Minimum fields:
 - `id`;
 - `projectId`;
 - `sourceEntityType`, `sourceEntityId`;
+- `attentionOwner`;
 - `reason`;
 - `urgency`: `now | soon | watch`;
 - `dueAt`;
@@ -361,11 +386,11 @@ Minimum fields:
 
 Initial deterministic inclusion rules:
 
-- an action explicitly marked `needsWarwick`;
-- a high/critical open risk or issue marked `needsWarwick`;
-- a decision in `awaiting-warwick`;
-- an unanswered question marked `needsWarwick`;
-- a blocked work package or missed milestone requiring Warwick;
+- an action explicitly marked `needsUserAttention` for the current `attentionOwner`;
+- a high/critical open risk or issue marked `needsUserAttention` for the current `attentionOwner`;
+- a decision in `awaiting-user` for the current `attentionOwner`;
+- an unanswered question marked `needsUserAttention` for the current `attentionOwner`;
+- a blocked work package or missed milestone assigned to the current `attentionOwner`;
 - an AI output whose verification failed; or
 - an AI output that is `complete` while verification is still pending beyond
   the fixture's agreed threshold.
@@ -429,95 +454,93 @@ React Portfolio and Project Detail views
 - fixture validation makes the fictional-data boundary executable rather than
   merely documented.
 
-This is a proposal, not implementation authority. Versions will be pinned only
-after Warwick approves the stack.
+This stack is approved for the MVP. Versions are pinned during implementation.
 
 ## Acceptance Criteria
 
 ### Scope and data
 
-- [ ] The application contains exactly two implementation projects.
-- [ ] Both projects and every related record are marked fictional.
-- [ ] No live source connector, credential, customer record, or employer record
+- [x] The application contains exactly two implementation projects.
+- [x] Both projects and every related record are marked fictional.
+- [x] No live source connector, credential, customer record, or employer record
       exists in the repository or runtime.
-- [ ] The runtime does not read outside the repository or make an external
+- [x] The runtime does not read outside the repository or make an external
       network request.
-- [ ] No database is required or created.
+- [x] No database is required or created.
 
 ### Portfolio
 
-- [ ] Home shows a visible fictional-data label and fixture `asOf` time.
-- [ ] Home shows both project cards with status, stage, next milestone,
+- [x] Home shows a visible fictional-data label and fixture `asOf` time.
+- [x] Home shows both project cards with status, stage, next milestone,
       attention count, and freshness.
-- [ ] Home shows a single cross-project Needs Warwick attention queue.
-- [ ] Attention items are ordered by the documented deterministic rules.
-- [ ] Every attention item explains its inclusion and links to project detail.
-- [ ] Home shows the latest meaningful activity across both projects.
+- [x] Home shows a single cross-project **Needs You** attention queue, optionally personalized from display configuration.
+- [x] Attention items are ordered by the documented deterministic rules.
+- [x] Every attention item explains its inclusion and links to project detail.
+- [x] Home shows the latest meaningful activity across both projects.
 
 ### Project detail
 
-- [ ] Each project has a deep-linkable detail route.
-- [ ] Each detail page shows all nine required areas: actions; risks and issues;
+- [x] Each project has a deep-linkable detail route.
+- [x] Each detail page shows all nine required areas: actions; risks and issues;
       decisions; open questions; milestones; work packages; latest activity; AI
       write/verification status; and project-specific attention.
-- [ ] Empty sections state that no records exist rather than disappearing or
+- [x] Empty sections state that no records exist rather than disappearing or
       rendering placeholders.
-- [ ] Summary counts reconcile with the displayed records.
+- [x] Summary counts reconcile with the displayed records.
 
 ### Read-only behaviour
 
-- [ ] No UI control mutates fixture or runtime data.
-- [ ] No POST, PUT, PATCH, or DELETE application endpoint exists.
-- [ ] Filters, links, anchors, and navigation are the only interactive controls
+- [x] No UI control mutates fixture or runtime data.
+- [x] No POST, PUT, PATCH, or DELETE application endpoint exists.
+- [x] Filters, links, anchors, and navigation are the only interactive controls
       beyond disclosure/collapse behaviour.
-- [ ] A persistent read-only indicator is visible.
+- [x] A persistent read-only indicator is visible.
 
 ### Quality
 
-- [ ] Fixture and API payloads pass schema validation.
-- [ ] Unit tests cover every attention inclusion rule and ordering rule.
-- [ ] Component tests cover portfolio and project detail states.
-- [ ] An end-to-end test covers Home -> attention item -> project detail ->
+- [x] Fixture and API payloads pass schema validation.
+- [x] Unit tests cover every attention inclusion rule and ordering rule.
+- [x] Component tests cover portfolio and project detail states.
+- [x] An end-to-end test covers Home -> attention item -> project detail ->
       relevant section.
-- [ ] Loading, empty, error, and stale states are tested.
-- [ ] The core journey is usable by keyboard and passes agreed automated
+- [x] Loading, empty, error, and stale states are tested.
+- [x] The core journey is usable by keyboard and passes agreed automated
       accessibility checks.
-- [ ] The production build succeeds from a clean checkout using documented
+- [x] The production build succeeds from a clean checkout using documented
       commands.
-- [ ] A repository scan finds no prohibited live-data indicators or secrets.
+- [x] A repository scan finds no prohibited live-data indicators or secrets.
 
-## Open Decisions Requiring Warwick
+## Approved Decisions
 
-Warwick should approve or change the recommended default for each item before
-coding begins.
+| Decision | Approved MVP default |
+|---|---|
+| Product focus | Portfolio attention and project delivery only; no PKM features |
+| Project count | Exactly two fictional projects: Atlas and Beacon |
+| Primary route structure | Portfolio Home plus one detail route per project |
+| Project-detail layout | Single page with anchored sections, not tabs |
+| Attention ownership | Person-neutral `needsUserAttention` and `attentionOwner`; generic label `Needs You`; optional configured display name |
+| Attention urgency | `now`, `soon`, `watch` with deterministic date ordering |
+| Risk display | Calm status language; reserve red for blocked/critical/failed states |
+| AI scope | Display write and verification statuses only; execute no AI |
+| Verification meaning | `verified` requires an identified fictional verifier and method |
+| Data architecture | Validated JSON fixtures through a read-only local API; no database |
+| Technology stack | TypeScript, React, Vite, Express, Zod, Vitest, Playwright |
+| Local access | Loopback-only, single user, no authentication for fictional MVP |
+| Routing | Deep-linkable client routes with browser back/forward support |
+| Fixture date model | Fixed `asOf` timestamp for deterministic demos and tests |
+| Visual direction | Dense enough for delivery control, calm enough for rapid scanning |
+| Launch experience | Documented terminal command for MVP; no installer or auto-launch |
 
-| Decision | Recommended MVP default | Warwick approval |
-|---|---|---|
-| Product focus | Portfolio attention and project delivery only; no PKM features | Pending |
-| Project count | Exactly two fictional projects: Atlas and Beacon | Pending |
-| Primary route structure | Portfolio Home plus one detail route per project | Pending |
-| Project-detail layout | Single page with anchored sections, not tabs | Pending |
-| Attention ownership | Only items explicitly requiring Warwick enter the queue, plus failed verification | Pending |
-| Attention urgency | `now`, `soon`, `watch` with deterministic date ordering | Pending |
-| Risk display | Calm status language; reserve red for blocked/critical/failed states | Pending |
-| AI scope | Display write and verification statuses only; execute no AI | Pending |
-| Verification meaning | `verified` requires an identified fictional verifier and method | Pending |
-| Data architecture | Validated JSON fixtures through a read-only local API; no database | Pending |
-| Technology stack | TypeScript, React, Vite, Express, Zod, Vitest, Playwright | Pending |
-| Local access | Loopback-only, single user, no authentication for fictional MVP | Pending |
-| Routing | Deep-linkable client routes with browser back/forward support | Pending |
-| Fixture date model | Fixed `asOf` timestamp for deterministic demos and tests | Pending |
-| Visual direction | Dense enough for delivery control, calm enough for rapid scanning | Pending |
-| Launch experience | Documented terminal command for MVP; no installer or auto-launch | Pending |
+There are no remaining product decisions blocking the fictional-data MVP.
 
 ## Build Sequence
 
-No sequence begins until Warwick approves this contract.
+This sequence is approved for implementation.
 
 ### 1. Lock decisions and invariants
 
-- record Warwick's decisions in this contract or a follow-on decision record;
-- confirm the stack, fixture names, attention rules, and detail layout;
+- retain the approved stack, fixture names, attention rules, and detail layout;
+- keep all reusable attention logic person-neutral;
 - keep live integrations and writable behaviour explicitly out of scope.
 
 ### 2. Establish the application skeleton
@@ -562,7 +585,7 @@ No sequence begins until Warwick approves this contract.
 
 - run unit, component, end-to-end, accessibility, build, and boundary checks;
 - verify no external runtime requests or non-GET application routes exist;
-- complete a manual Warwick-oriented acceptance pass.
+- complete a manual configured-user acceptance pass.
 
 ### 9. Package the local MVP
 

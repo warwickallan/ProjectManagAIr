@@ -6,9 +6,9 @@ turning the product repository into a store for live project documents.
 
 ## Status
 
-This repository is at the controlled-foundation stage. It contains policy and
-architecture documents only. No application, integration, database, dashboard,
-deployment, or live-data ingestion has been created.
+This repository contains the first local, read-only fictional-data MVP: a
+multi-project Cockpit for Project Atlas and Project Beacon. It includes no live
+integration, database, deployment, or live-data ingestion.
 
 ## Repository boundary
 
@@ -44,7 +44,31 @@ copied into this repository.
 
 ## Next decision gate
 
-Before implementation begins, Warwick must approve the open assumptions listed
-in `GOAL-CONTRACT.md`, including the physical local-data root, initial
-read/write posture, project identity model, and first implementation stack.
+Warwick should manually review the fictional-data MVP before this build branch
+is considered for merge. Live connectors, writable behaviour, databases, and
+deployment remain separate future decisions.
 
+## Run the fictional-data MVP
+
+Requirements: Node.js 22 or later and npm.
+
+```powershell
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:4318`. The server binds to loopback, reads only
+`fixtures/portfolio.json`, and exposes GET-only APIs. The visible `Needs
+Warwick` label comes from the fictional demo display configuration; reusable
+attention logic remains person-neutral and falls back to `Needs You`.
+
+Validation commands:
+
+```powershell
+npm test
+npm run build
+npm run test:e2e
+```
+
+Use `npm start` after `npm run build` to serve the production build locally.
+No connector, database, secret, or live project source is required.

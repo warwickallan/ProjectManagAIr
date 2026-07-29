@@ -52,4 +52,7 @@ Thumbs.db
 .vscode/
 *.swp
 *~
-
+# Browser-test and local verification output
+/test-results/
+/playwright-report/
+/artifacts/
