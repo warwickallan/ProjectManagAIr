@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 const isoDateTime = z.string().datetime({ offset: true });
 const dateOnly = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
-const classification = z.literal('fictional');
+const dataClassification = z.enum(['fictional', 'operational-reference']);
 const attentionFields = {
   needsUserAttention: z.boolean(),
   attentionOwner: z.string().nullable(),
@@ -15,13 +15,23 @@ const commonRecord = z.object({
   status: z.string().min(1),
   owner: z.string().min(1),
   updatedAt: isoDateTime,
-  dataClassification: classification,
+  dataClassification,
   summary: z.string().default(''),
 });
 
 export const userConfigSchema = z.object({
   userId: z.string().min(1),
   displayName: z.string().min(1).optional(),
+});
+
+export const projectSourceSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  sourceType: z.string().min(1),
+  label: z.string().min(1),
+  externalPath: z.string().min(1),
+  lastSeenAt: isoDateTime.nullable(),
+  dataClassification,
 });
 
 export const actionSchema = commonRecord.extend({
@@ -39,6 +49,14 @@ export const riskIssueSchema = commonRecord.extend({
   response: z.string().min(1),
   targetResolutionDate: dateOnly.nullable(),
   ...attentionFields,
+});
+
+export const changeSchema = commonRecord.extend({
+  changeType: z.string().min(1),
+  impact: z.string().min(1),
+  decisionId: z.string().nullable(),
+  ...attentionFields,
+  attentionReason: z.string().nullable(),
 });
 
 export const decisionSchema = commonRecord.extend({
@@ -85,7 +103,15 @@ export const activitySchema = z.object({
   actor: z.string().min(1),
   relatedEntityType: z.string(),
   relatedEntityId: z.string(),
-  dataClassification: classification,
+  dataClassification,
+});
+
+export const deliverableSchema = commonRecord.extend({
+  deliverableType: z.string().min(1),
+  externalPath: z.string().nullable(),
+  dueDate: dateOnly.nullable(),
+  ...attentionFields,
+  attentionReason: z.string().nullable(),
 });
 
 export const aiWorkSchema = z.object({
@@ -102,7 +128,31 @@ export const aiWorkSchema = z.object({
   verifiedBy: z.string().nullable(),
   statusDetail: z.string(),
   attentionOwner: z.string().nullable(),
-  dataClassification: classification,
+  dataClassification,
+});
+
+export const verificationSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  aiWriteId: z.string().nullable(),
+  verificationStatus: z.enum(['not-required', 'not-started', 'pending', 'verified', 'failed']),
+  method: z.string().nullable(),
+  checkedAt: isoDateTime.nullable(),
+  checkedBy: z.string().nullable(),
+  summary: z.string(),
+  dataClassification,
+});
+
+export const provenanceFileRefSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  entityType: z.string().min(1),
+  entityId: z.string().min(1),
+  label: z.string().min(1),
+  externalPath: z.string().min(1),
+  evidenceKind: z.string().min(1),
+  capturedAt: isoDateTime.nullable(),
+  dataClassification,
 });
 
 export const projectSchema = z.object({
@@ -118,32 +168,53 @@ export const projectSchema = z.object({
   nextMilestoneId: z.string(),
   updatedAt: isoDateTime,
   asOf: isoDateTime,
-  dataClassification: classification,
-  actions: z.array(actionSchema),
-  risksIssues: z.array(riskIssueSchema),
-  decisions: z.array(decisionSchema),
-  openQuestions: z.array(openQuestionSchema),
-  milestones: z.array(milestoneSchema),
-  workPackages: z.array(workPackageSchema),
-  activity: z.array(activitySchema),
-  aiWork: z.array(aiWorkSchema),
+  dataClassification,
+  projectSources: z.array(projectSourceSchema).default([]),
+  actions: z.array(actionSchema).default([]),
+  risksIssues: z.array(riskIssueSchema).default([]),
+  changes: z.array(changeSchema).default([]),
+  decisions: z.array(decisionSchema).default([]),
+  openQuestions: z.array(openQuestionSchema).default([]),
+  milestones: z.array(milestoneSchema).default([]),
+  workPackages: z.array(workPackageSchema).default([]),
+  activity: z.array(activitySchema).default([]),
+  deliverables: z.array(deliverableSchema).default([]),
+  aiWork: z.array(aiWorkSchema).default([]),
+  verifications: z.array(verificationSchema).default([]),
+  provenance: z.array(provenanceFileRefSchema).default([]),
 });
 
-export const portfolioFixtureSchema = z.object({
+export const portfolioDataSchema = z.object({
   schemaVersion: z.literal(1),
-  dataClassification: classification,
+  dataClassification,
   asOf: isoDateTime,
   userConfig: userConfigSchema,
-  projects: z.array(projectSchema).length(2),
+  projects: z.array(projectSchema),
+});
+
+export const portfolioFixtureSchema = portfolioDataSchema.extend({
+  dataClassification: z.literal('fictional'),
+  projects: z.array(projectSchema.extend({ dataClassification: z.literal('fictional') })).length(2),
+});
+
+export const importPayloadSchema = z.object({
+  schemaVersion: z.literal(1),
+  source: z.object({
+    label: z.string().min(1),
+    externalPath: z.string().min(1).optional(),
+  }).optional(),
+  project: projectSchema,
 });
 
 export type UserConfig = z.infer<typeof userConfigSchema>;
 export type Project = z.infer<typeof projectSchema>;
+export type PortfolioData = z.infer<typeof portfolioDataSchema>;
 export type PortfolioFixture = z.infer<typeof portfolioFixtureSchema>;
+export type ImportPayload = z.infer<typeof importPayloadSchema>;
 export type ActivityEvent = z.infer<typeof activitySchema>;
 
 export type AttentionUrgency = 'now' | 'soon' | 'watch';
-export type AttentionSource = 'action' | 'risk-issue' | 'decision' | 'open-question' | 'milestone' | 'work-package' | 'ai-work';
+export type AttentionSource = 'action' | 'risk-issue' | 'change' | 'decision' | 'open-question' | 'milestone' | 'work-package' | 'deliverable' | 'ai-work';
 
 export interface AttentionItem {
   id: string;
@@ -243,6 +314,12 @@ export function deriveAttentionItems(project: Project, userId: string, asOf: str
     }
   }
 
+  for (const change of project.changes) {
+    if (belongsToUser(change.needsUserAttention, change.attentionOwner) && change.status !== 'closed') {
+      add('change', change.id, change.title, change.attentionReason ?? `Change needs your review: ${change.impact}`, null);
+    }
+  }
+
   for (const decision of project.decisions) {
     if (decision.decisionStatus === 'awaiting-user' && decision.attentionOwner === userId) {
       add('decision', decision.id, decision.title, 'A decision is waiting for you.', decision.decisionNeededBy);
@@ -264,6 +341,12 @@ export function deriveAttentionItems(project: Project, userId: string, asOf: str
   for (const workPackage of project.workPackages) {
     if (belongsToUser(workPackage.needsUserAttention, workPackage.attentionOwner) && workPackage.workPackageStatus === 'blocked') {
       add('work-package', workPackage.id, workPackage.title, workPackage.blockerSummary ?? 'A blocked work package needs your intervention.', workPackage.targetDate, true);
+    }
+  }
+
+  for (const deliverable of project.deliverables) {
+    if (belongsToUser(deliverable.needsUserAttention, deliverable.attentionOwner) && deliverable.status !== 'complete') {
+      add('deliverable', deliverable.id, deliverable.title, deliverable.attentionReason ?? 'A deliverable needs your attention.', deliverable.dueDate);
     }
   }
 
@@ -308,49 +391,49 @@ export function projectSummary(project: Project, attention: AttentionItem[]): Pr
   };
 }
 
-export function buildPortfolioResponse(fixture: PortfolioFixture, now = new Date()) {
-  const attention = fixture.projects.flatMap((project) => deriveAttentionItems(project, fixture.userConfig.userId, fixture.asOf))
+export function buildPortfolioResponse(data: PortfolioData, now = new Date(), environment = 'SQLite operational database') {
+  const attention = data.projects.flatMap((project) => deriveAttentionItems(project, data.userConfig.userId, data.asOf))
     .toSorted((a, b) => {
       const urgency = urgencyRank[a.urgency] - urgencyRank[b.urgency];
       if (urgency !== 0) return urgency;
       const due = dateValue(a.dueAt) - dateValue(b.dueAt);
       return due !== 0 ? due : a.id.localeCompare(b.id);
     });
-  const projectAttention = new Map(fixture.projects.map((project) => [project.id, attention.filter((item) => item.projectId === project.id)]));
-  const activity = fixture.projects.flatMap((project) => project.activity)
+  const projectAttention = new Map(data.projects.map((project) => [project.id, attention.filter((item) => item.projectId === project.id)]));
+  const activity = data.projects.flatMap((project) => project.activity)
     .toSorted((a, b) => new Date(b.occurredAt).getTime() - new Date(a.occurredAt).getTime())
     .slice(0, 8);
   return {
-    environment: 'Fictional demo data' as const,
+    environment,
     readOnly: true,
-    asOf: fixture.asOf,
-    freshness: getFreshness(fixture.asOf, now),
-    userConfig: fixture.userConfig,
-    attentionLabel: formatAttentionLabel(fixture.userConfig),
-    projects: fixture.projects.map((project) => projectSummary(project, projectAttention.get(project.id) ?? [])),
+    asOf: data.asOf,
+    freshness: getFreshness(data.asOf, now),
+    userConfig: data.userConfig,
+    attentionLabel: formatAttentionLabel(data.userConfig),
+    projects: data.projects.map((project) => projectSummary(project, projectAttention.get(project.id) ?? [])),
     attention,
     activity,
     counts: {
-      projects: fixture.projects.length,
+      projects: data.projects.length,
       attention: attention.length,
-      highRiskIssues: fixture.projects.flatMap((project) => project.risksIssues).filter((item) => item.status !== 'closed' && ['high', 'critical'].includes(item.severity)).length,
-      pendingDecisions: fixture.projects.flatMap((project) => project.decisions).filter((item) => item.decisionStatus === 'awaiting-user').length,
-      aiAwaitingVerification: fixture.projects.flatMap((project) => project.aiWork).filter((item) => ['pending', 'failed'].includes(item.verificationStatus)).length,
+      highRiskIssues: data.projects.flatMap((project) => project.risksIssues).filter((item) => item.status !== 'closed' && ['high', 'critical'].includes(item.severity)).length,
+      pendingDecisions: data.projects.flatMap((project) => project.decisions).filter((item) => item.decisionStatus === 'awaiting-user').length,
+      aiAwaitingVerification: data.projects.flatMap((project) => project.aiWork).filter((item) => ['pending', 'failed'].includes(item.verificationStatus)).length,
     },
   };
 }
 
-export function buildProjectResponse(fixture: PortfolioFixture, projectId: string, now = new Date()) {
-  const project = fixture.projects.find((item) => item.id === projectId);
+export function buildProjectResponse(data: PortfolioData, projectId: string, now = new Date(), environment = 'SQLite operational database') {
+  const project = data.projects.find((item) => item.id === projectId);
   if (!project) return null;
   return {
-    environment: 'Fictional demo data' as const,
+    environment,
     readOnly: true,
-    asOf: fixture.asOf,
-    freshness: getFreshness(fixture.asOf, now),
-    userConfig: fixture.userConfig,
-    attentionLabel: formatAttentionLabel(fixture.userConfig),
-    attention: deriveAttentionItems(project, fixture.userConfig.userId, fixture.asOf),
+    asOf: data.asOf,
+    freshness: getFreshness(data.asOf, now),
+    userConfig: data.userConfig,
+    attentionLabel: formatAttentionLabel(data.userConfig),
+    attention: deriveAttentionItems(project, data.userConfig.userId, data.asOf),
     project,
   };
 }

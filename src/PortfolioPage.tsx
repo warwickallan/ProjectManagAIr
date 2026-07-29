@@ -1,5 +1,5 @@
 import { useApi, type PortfolioResponse } from './api';
-import { ActivityList, AttentionList, ErrorState, FreshnessNotice, LoadingState, PageIntro, Section, StatusChip, formatDate } from './components';
+import { ActivityList, AttentionList, EmptyState, ErrorState, FreshnessNotice, LoadingState, PageIntro, Section, StatusChip, formatDate } from './components';
 
 const statDefinitions = [
   { key: 'projects', label: 'Active projects', accent: 'blue' },
@@ -16,19 +16,20 @@ export function PortfolioPage() {
 
   const data = state.data;
   const projectNames = Object.fromEntries(data.projects.map((project) => [project.id, project.name]));
+  const isEmpty = data.projects.length === 0;
 
   return (
     <div className="page-stack">
       <PageIntro
         eyebrow="Portfolio control"
         title="Implementation focus, without the noise."
-        description="Two fictional projects. One clear view of decisions, blockers, delivery signals, and AI verification."
+        description="A local read-only Cockpit for seeing project attention, delivery signals, provenance, and AI verification status across imported implementation projects."
         aside={<FreshnessNotice freshness={data.freshness} asOf={data.asOf} />}
       />
 
       <div className="demo-banner" role="note">
-        <span aria-hidden="true">◇</span>
-        <div><strong>{data.environment}</strong><p>Every name, date, project, and delivery record on this screen is synthetic.</p></div>
+        <span aria-hidden="true">PM</span>
+        <div><strong>{data.environment}</strong><p>{isEmpty ? 'No projects have been imported into the local operational database yet.' : 'This view is read from the local operational database.'}</p></div>
         <span className="read-only-seal">Read only</span>
       </div>
 
@@ -43,14 +44,16 @@ export function PortfolioPage() {
 
       <Section id="attention" title={data.attentionLabel} kicker="Portfolio priority" count={data.attention.length} className="attention-panel">
         <p className="section-description">The queue is derived from explicit ownership, delivery urgency, and verification state. It is not manually curated.</p>
-        <AttentionList items={data.attention} />
+        <AttentionList items={data.attention} emptyLabel={isEmpty ? 'No project records have been imported, so nothing can need attention yet.' : 'Nothing needs your attention.'} />
       </Section>
 
       <section className="portfolio-block" aria-labelledby="projects-heading">
-        <header className="block-heading"><div><p className="section-kicker">Delivery landscape</p><h2 id="projects-heading">Implementation projects</h2></div><span>{data.projects.length} fictional projects</span></header>
-        <div className="project-grid">
-          {data.projects.map((project) => <ProjectCard key={project.id} project={project} />)}
-        </div>
+        <header className="block-heading"><div><p className="section-kicker">Delivery landscape</p><h2 id="projects-heading">Implementation projects</h2></div><span>{data.projects.length} projects</span></header>
+        {isEmpty ? <EmptyState>No projects have been imported into Project ManagAIr yet. Import validated structured JSON to populate this Cockpit.</EmptyState> : (
+          <div className="project-grid">
+            {data.projects.map((project) => <ProjectCard key={project.id} project={project} />)}
+          </div>
+        )}
       </section>
 
       <Section id="activity" title="Latest project activity" kicker="Across the portfolio" count={data.activity.length}>
@@ -79,13 +82,13 @@ function ProjectCard({ project }: { project: PortfolioResponse['projects'][numbe
       </dl>
       <div className="milestone-strip">
         <div><small>Next milestone</small><strong>{project.nextMilestone?.title ?? 'Not set'}</strong></div>
-        <span>{project.nextMilestone ? formatDate(project.nextMilestone.targetDate) : '—'}</span>
+        <span>{project.nextMilestone ? formatDate(project.nextMilestone.targetDate) : '-'}</span>
       </div>
-      <footer className="project-card-foot"><span>Owner · {project.owner}</span><a href={`#/projects/${project.id}`}>Open project <span aria-hidden="true">→</span></a></footer>
+      <footer className="project-card-foot"><span>Owner - {project.owner}</span><a href={`#/projects/${project.id}`}>Open project <span aria-hidden="true">{'->'}</span></a></footer>
     </article>
   );
 }
 
 function statGlyph(key: typeof statDefinitions[number]['key']): string {
-  return ({ projects: '◇', attention: '!', highRiskIssues: '△', pendingDecisions: '?', aiAwaitingVerification: 'AI' } as const)[key];
+  return ({ projects: 'PM', attention: '!', highRiskIssues: '!', pendingDecisions: '?', aiAwaitingVerification: 'AI' } as const)[key];
 }

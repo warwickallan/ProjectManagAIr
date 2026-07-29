@@ -3,14 +3,26 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { buildPortfolioResponse, buildProjectResponse, portfolioFixtureSchema } from './src/domain.js';
+import { openProjectManagairDatabase, readPortfolioData, readProjectData } from './src/db.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const fixturePath = path.join(root, 'fixtures', 'portfolio.json');
-const rawFixture = JSON.parse(await readFile(fixturePath, 'utf8')) as unknown;
-const fixture = portfolioFixtureSchema.parse(rawFixture);
 const app = express();
 const port = Number(process.env.PORT ?? 4318);
 const production = process.argv.includes('--production');
+const demoMode = process.env.PROJECTMANAGAIR_DEMO === '1';
+const demoEnvironment = 'Fictional demo data';
+const databaseEnvironment = 'SQLite operational database';
+
+let dbContext: ReturnType<typeof openProjectManagairDatabase> | null = null;
+let fixture: ReturnType<typeof portfolioFixtureSchema.parse> | null = null;
+
+if (demoMode) {
+  const fixturePath = path.join(root, 'fixtures', 'portfolio.json');
+  const rawFixture = JSON.parse(await readFile(fixturePath, 'utf8')) as unknown;
+  fixture = portfolioFixtureSchema.parse(rawFixture);
+} else {
+  dbContext = openProjectManagairDatabase();
+}
 
 app.disable('x-powered-by');
 app.use((_, response, next) => {
@@ -25,20 +37,50 @@ app.use((_, response, next) => {
 });
 
 app.get('/api/health', (_, response) => {
-  response.json({ ok: true, mode: 'fictional-read-only', projects: fixture.projects.length });
+  if (demoMode && fixture) {
+    response.json({ ok: true, mode: 'demo-fixtures', projects: fixture.projects.length });
+    return;
+  }
+  if (!dbContext) {
+    response.status(500).json({ ok: false, error: 'Database did not initialise' });
+    return;
+  }
+  const portfolio = readPortfolioData(dbContext.db);
+  response.json({ ok: true, mode: 'sqlite-read-only', dbPath: dbContext.dbPath, migrationsApplied: dbContext.migrationsApplied, projects: portfolio.projects.length });
 });
 
 app.get('/api/portfolio', (_, response) => {
-  response.json(buildPortfolioResponse(fixture));
+  if (demoMode && fixture) {
+    response.json(buildPortfolioResponse(fixture, new Date(), demoEnvironment));
+    return;
+  }
+  if (!dbContext) {
+    response.status(500).json({ error: 'Database did not initialise' });
+    return;
+  }
+  response.json(buildPortfolioResponse(readPortfolioData(dbContext.db), new Date(), databaseEnvironment));
 });
 
 app.get('/api/projects/:projectId', (request, response) => {
-  const result = buildProjectResponse(fixture, request.params.projectId);
-  if (!result) {
+  if (demoMode && fixture) {
+    const result = buildProjectResponse(fixture, request.params.projectId, new Date(), demoEnvironment);
+    if (!result) {
+      response.status(404).json({ error: 'Project not found' });
+      return;
+    }
+    response.json(result);
+    return;
+  }
+  if (!dbContext) {
+    response.status(500).json({ error: 'Database did not initialise' });
+    return;
+  }
+  const data = readProjectData(dbContext.db, request.params.projectId);
+  if (!data) {
     response.status(404).json({ error: 'Project not found' });
     return;
   }
-  response.json(result);
+  response.json(buildProjectResponse(data, request.params.projectId, new Date(), databaseEnvironment));
 });
 
 app.use('/api', (request, response) => {
@@ -61,5 +103,9 @@ if (production) {
 
 app.listen(port, '127.0.0.1', () => {
   console.log(`Project ManagAIr Cockpit running at http://127.0.0.1:${port}`);
-  console.log('Mode: fictional fixture data, read-only, loopback-only');
+  if (demoMode) {
+    console.log('Mode: explicit fictional demo data, read-only, loopback-only');
+  } else {
+    console.log(`Mode: SQLite operational database, read-only, loopback-only, db=${dbContext?.dbPath}`);
+  }
 });

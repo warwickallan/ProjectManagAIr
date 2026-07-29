@@ -11,22 +11,22 @@ export function AppFrame({ active, children }: { active: 'portfolio' | 'project'
         </a>
         <nav className="nav-list">
           <a className={active === 'portfolio' ? 'nav-link active' : 'nav-link'} href="#/">
-            <span aria-hidden="true">⌂</span> Portfolio
+            <span aria-hidden="true">Ã¢Å’â€š</span> Portfolio
           </a>
           <span className={active === 'project' ? 'nav-link active nav-static' : 'nav-link nav-static'}>
-            <span aria-hidden="true">◇</span> Project detail
+            <span aria-hidden="true">Ã¢â€”â€¡</span> Project detail
           </span>
         </nav>
         <div className="sidebar-foot">
           <span className="pulse-dot" aria-hidden="true" />
-          <span><strong>Local Cockpit</strong><small>No live connections</small></span>
+          <span><strong>Local Cockpit</strong><small>Loopback only</small></span>
         </div>
       </aside>
       <div className="workspace">
         <header className="topbar">
           <span className="mobile-brand">Project ManagAIr</span>
           <div className="topbar-badges" aria-label="Environment status">
-            <span className="meta-badge demo">Fictional demo data</span>
+            <span className="meta-badge demo">Local data</span>
             <span className="meta-badge">Read only</span>
           </div>
         </header>
@@ -57,7 +57,7 @@ export function ErrorState({ message }: { message: string }) {
 }
 
 export function EmptyState({ children = 'No records in this fictional project.' }: { children?: ReactNode }) {
-  return <div className="empty-state" role="status"><span aria-hidden="true">○</span><p>{children}</p></div>;
+  return <div className="empty-state" role="status"><span aria-hidden="true">Ã¢â€”â€¹</span><p>{children}</p></div>;
 }
 
 export function FreshnessNotice({ freshness, asOf }: { freshness: Freshness; asOf: string }) {
@@ -65,12 +65,12 @@ export function FreshnessNotice({ freshness, asOf }: { freshness: Freshness; asO
   if (freshness.status === 'stale') {
     return (
       <div className="freshness stale" role="status">
-        <strong>Fixture snapshot is stale</strong>
-        <span>As of {stamp} · {freshness.hoursOld} hours old</span>
+        <strong>Data snapshot is stale</strong>
+        <span>As of {stamp} Ã‚Â· {freshness.hoursOld} hours old</span>
       </div>
     );
   }
-  return <div className="freshness"><span className="pulse-dot" aria-hidden="true" /><span>Snapshot current · {stamp}</span></div>;
+  return <div className="freshness"><span className="pulse-dot" aria-hidden="true" /><span>Data current Ã‚Â· {stamp}</span></div>;
 }
 
 export function PageIntro({ eyebrow, title, description, aside }: { eyebrow: string; title: string; description: string; aside?: ReactNode }) {
@@ -128,7 +128,7 @@ export function AttentionList({ items, emptyLabel = 'Nothing needs your attentio
             <h3><a href={item.route}>{item.title}</a></h3>
             <p>{item.reason}</p>
           </div>
-          <div className="attention-due"><small>{item.dueAt ? 'Due' : 'Status'}</small><strong>{item.dueAt ? formatDate(item.dueAt) : 'Open'}</strong><a href={item.route} aria-label={`Open ${item.title}`}>View <span aria-hidden="true">→</span></a></div>
+          <div className="attention-due"><small>{item.dueAt ? 'Due' : 'Status'}</small><strong>{item.dueAt ? formatDate(item.dueAt) : 'Open'}</strong><a href={item.route} aria-label={`Open ${item.title}`}>View <span aria-hidden="true">Ã¢â€ â€™</span></a></div>
         </li>
       ))}
     </ol>
@@ -167,5 +167,5 @@ export function humanize(value: string): string {
 }
 
 function activityGlyph(type: ActivityEvent['eventType']): string {
-  return ({ progress: '↗', decision: '✓', risk: '!', milestone: '◆', ai: 'AI' } as const)[type];
+  return ({ progress: 'Ã¢â€ â€”', decision: 'Ã¢Å“â€œ', risk: '!', milestone: 'Ã¢â€”â€ ', ai: 'AI' } as const)[type];
 }

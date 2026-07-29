@@ -1,74 +1,66 @@
 # Project ManagAIr
 
-Project ManagAIr is a reusable, AI-native project implementation operating
-system. Its future Cockpit will provide a multi-project dashboard without
-turning the product repository into a store for live project documents.
+Project ManagAIr is a reusable, AI-native project implementation operating system. Its Cockpit provides a local, read-only view of implementation projects without turning the product repository into a store for live project documents.
 
 ## Status
 
-This repository contains the first local, read-only fictional-data MVP: a
-multi-project Cockpit for Project Atlas and Project Beacon. It includes no live
-integration, database, deployment, or live-data ingestion.
+This repository contains the first local Cockpit MVP with a SQLite operational database. The included Atlas and Beacon data remains fictional demo material only; the default application state is the local database in the sibling Data folder.
 
-## Repository boundary
+## Repository Boundary
 
 Git is for the reusable product:
 
 - application and connector code;
 - schemas and stable contracts;
+- migrations and database adapters;
 - automated tests;
-- documentation; and
+- launcher scripts and documentation; and
 - explicitly fictional fixtures.
 
-Git is not for customer or employer project data. Live NPL, NWLDC, and other
-project documents remain in their externally synced OneDrive or Google Drive
-project folders. Machine-local configuration, cache, indexes, and derived
-working state belong outside the repository under the approved local data root
-(intended to be `C:\Brain\data`) and must remain ignored.
+Git is not for customer or employer project data. Live NPL, NWLDC, and other project documents remain in externally synced OneDrive or Google Drive project folders. Machine-local configuration, cache, indexes, portable runtimes, databases, WAL files, journals, imports, exports, and derived working state remain ignored and outside Git.
 
-The sibling `Vendor/mypka-reference` folder was inspected as read-only
-architectural reference material. myPKA is neither Project ManagAIr's
-application repository nor its runtime data store. No myPKA source has been
-copied into this repository.
+The sibling `Vendor/mypka-reference` folder is read-only architectural reference material. myPKA is neither Project ManagAIr's application repository nor its runtime data store. No myPKA source has been copied into this repository.
 
-## Foundation documents
+## Foundation Documents
 
-- [GOAL-CONTRACT.md](GOAL-CONTRACT.md) defines the product goal and current
-  delivery limits.
-- [AGENTS.md](AGENTS.md) defines the rules for humans and AI agents working in
-  this repository.
-- [docs/architecture.md](docs/architecture.md) proposes the product's
-  component boundaries.
-- [docs/data-boundary.md](docs/data-boundary.md) defines what may cross into
-  Git and what must remain external or local-only.
+- [GOAL-CONTRACT.md](GOAL-CONTRACT.md) defines the product goal and current delivery limits.
+- [AGENTS.md](AGENTS.md) defines the rules for humans and AI agents working in this repository.
+- [docs/architecture.md](docs/architecture.md) proposes the product's component boundaries.
+- [docs/data-boundary.md](docs/data-boundary.md) defines what may cross into Git and what must remain external or local-only.
+- [docs/sqlite-runtime.md](docs/sqlite-runtime.md) documents the local SQLite runtime and import path.
 
-## Next decision gate
+## Local Start
 
-Warwick should manually review the fictional-data MVP before this build branch
-is considered for merge. Live connectors, writable behaviour, databases, and
-deployment remain separate future decisions.
+Do not install Node globally for this repository. The Windows launcher uses the ignored Project ManagAIr-owned portable runtime under `.runtime`.
 
-## Run the fictional-data MVP
+Double-click:
 
-Requirements: Node.js 22 or later and npm.
+`start-projectmanagair.bat`
+
+or run:
 
 ```powershell
-npm install
-npm run dev
+.\start-projectmanagair.ps1
 ```
 
-Open `http://127.0.0.1:4318`. The server binds to loopback, reads only
-`fixtures/portfolio.json`, and exposes GET-only APIs. The visible `Needs
-Warwick` label comes from the fictional demo display configuration; reusable
-attention logic remains person-neutral and falls back to `Needs You`.
+The launcher creates or migrates `..\Data\projectmanagair.db`, starts the server on `127.0.0.1`, prefers port `4318`, and opens the Cockpit in the default browser.
 
-Validation commands:
+## Import Structured JSON
 
 ```powershell
-npm test
-npm run build
-npm run test:e2e
+.\.runtime\node-v22.23.1-win-x64\node.exe --import tsx .\scripts\import-json.ts <path-to-structured-project.json>
 ```
 
-Use `npm start` after `npm run build` to serve the production build locally.
-No connector, database, secret, or live project source is required.
+The importer validates the payload, identifies the project by durable ID, upserts records by durable ID, records an import run, and stores source/provenance paths as external references. It does not copy source documents into Git or into the database.
+
+## Validation
+
+Use the copied portable runtime and local dependencies already present in the workspace:
+
+```powershell
+.\.runtime\node-v22.23.1-win-x64\npm.cmd test
+.\.runtime\node-v22.23.1-win-x64\npm.cmd run build
+.\.runtime\node-v22.23.1-win-x64\npm.cmd run test:e2e
+```
+
+Google Drive, OneDrive, SharePoint, Rocketlane, Dataverse, deployment, and writable Cockpit behavior remain separate future decisions.

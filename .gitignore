@@ -1,4 +1,4 @@
-# Secrets and local configuration
+﻿# Secrets and local configuration
 .env
 .env.*
 !.env.example
@@ -8,6 +8,7 @@
 *.p12
 
 # Local-only product data, cache, indexes, databases, and logs
+/.runtime/
 /data/
 /.data/
 /.local/

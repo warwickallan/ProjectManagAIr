@@ -21,7 +21,7 @@ test('project cards navigate to both fictional project routes', async ({ page })
   await page.goto('/');
   await page.getByRole('heading', { name: 'Project Beacon' }).getByRole('link').click();
   await expect(page).toHaveURL(/#\/projects\/beacon$/);
-  await expect(page.getByText('BCN-02 · Solution design')).toBeVisible();
+  await expect(page.getByText('BCN-02 . Solution design')).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Risks and issues' })).toBeVisible();
 });
 

@@ -3,8 +3,8 @@ import { useApi, type ProjectResponse } from './api';
 import { ActivityList, AttentionList, EmptyState, ErrorState, FreshnessNotice, LoadingState, PageIntro, ProgressBar, Section, StatusChip, formatDate, formatDateTime, humanize } from './components';
 
 const sections = [
-  ['attention', 'Attention'], ['actions', 'Actions'], ['risk-issue', 'Risks & issues'], ['decision', 'Decisions'],
-  ['open-question', 'Open questions'], ['milestone', 'Milestones'], ['work-package', 'Work packages'], ['ai-work', 'AI status'], ['activity', 'Activity'],
+  ['attention', 'Attention'], ['actions', 'Actions'], ['risk-issue', 'Risks & issues'], ['change', 'Changes'], ['decision', 'Decisions'],
+  ['open-question', 'Open questions'], ['milestone', 'Milestones'], ['work-package', 'Work packages'], ['deliverable', 'Deliverables'], ['ai-work', 'AI status'], ['provenance', 'Provenance'], ['activity', 'Activity'],
 ] as const;
 
 export function ProjectPage({ projectId, focus }: { projectId: string; focus: string | null }) {
@@ -22,9 +22,9 @@ export function ProjectPage({ projectId, focus }: { projectId: string; focus: st
   const { project, attentionLabel, attention, freshness, asOf } = state.data;
   return (
     <div className="page-stack project-page">
-      <a className="back-link" href="#/"><span aria-hidden="true">←</span> Portfolio</a>
+      <a className="back-link" href="#/"><span aria-hidden="true">{'<-'}</span> Portfolio</a>
       <PageIntro
-        eyebrow={`${project.code} · ${project.stage}`}
+        eyebrow={`${project.code} . ${project.stage}`}
         title={project.name}
         description={project.summary}
         aside={<FreshnessNotice freshness={freshness} asOf={asOf} />}
@@ -74,6 +74,17 @@ export function ProjectPage({ projectId, focus }: { projectId: string; focus: st
         </div>
       </Section>
 
+      <Section id="change" title="Changes" kicker="Scope and delivery movement" count={project.changes.length}>
+        <div className="stacked-records">
+          {project.changes.length === 0 ? <EmptyState>No changes recorded.</EmptyState> : project.changes.map((change) => (
+            <article className="stacked-record" key={change.id}>
+              <div className="record-line"><div><h3>{change.title}</h3><p>{change.summary}</p></div><StatusChip value={change.status} /></div>
+              <dl className="inline-details"><div><dt>Type</dt><dd>{change.changeType}</dd></div><div><dt>Impact</dt><dd>{change.impact}</dd></div><div><dt>Owner</dt><dd>{change.owner}</dd></div></dl>
+            </article>
+          ))}
+        </div>
+      </Section>
+
       <Section id="decision" title="Decisions" kicker="Choices and outcomes" count={project.decisions.length}>
         <div className="stacked-records">
           {project.decisions.length === 0 ? <EmptyState /> : project.decisions.map((decision) => (
@@ -111,21 +122,53 @@ export function ProjectPage({ projectId, focus }: { projectId: string; focus: st
         <div className="work-package-list">
           {project.workPackages.length === 0 ? <EmptyState /> : project.workPackages.map((item) => (
             <article className="work-package" key={item.id}>
-              <div className="work-package-main"><div className="record-line"><div><p className="record-type">Lead · {item.lead}</p><h3>{item.title}</h3></div><StatusChip value={item.workPackageStatus} /></div><p>{item.summary}</p>{item.blockerSummary ? <p className="blocker-note"><strong>Blocker:</strong> {item.blockerSummary}</p> : null}</div>
-              <div className="work-package-progress"><ProgressBar value={item.completionPercent} label="Work package completion" /><small>{formatDate(item.startDate)} — {formatDate(item.targetDate)}</small></div>
+              <div className="work-package-main"><div className="record-line"><div><p className="record-type">Lead . {item.lead}</p><h3>{item.title}</h3></div><StatusChip value={item.workPackageStatus} /></div><p>{item.summary}</p>{item.blockerSummary ? <p className="blocker-note"><strong>Blocker:</strong> {item.blockerSummary}</p> : null}</div>
+              <div className="work-package-progress"><ProgressBar value={item.completionPercent} label="Work package completion" /><small>{formatDate(item.startDate)} - {formatDate(item.targetDate)}</small></div>
             </article>
           ))}
         </div>
       </Section>
 
-      <Section id="ai-work" title="AI write and verification status" kicker="Visibility only — no AI executes here" count={project.aiWork.length}>
+      <Section id="deliverable" title="Deliverables" kicker="Outputs and evidence references" count={project.deliverables.length}>
+        <RecordTable
+          label="Project deliverables"
+          columns={['Deliverable', 'Type', 'Owner', 'Due', 'Status']}
+          rows={project.deliverables.map((item) => [
+            <RecordTitle key="title" title={item.title} summary={item.externalPath ? `${item.summary} Reference: ${item.externalPath}` : item.summary} attention={item.needsUserAttention && item.attentionOwner === state.data.userConfig.userId ? attentionLabel : null} />,
+            item.deliverableType,
+            item.owner,
+            formatDate(item.dueDate),
+            <StatusChip key="status" value={item.status} />,
+          ])}
+        />
+      </Section>
+
+      <Section id="ai-work" title="AI write and verification status" kicker="Visibility only - no AI executes here" count={project.aiWork.length + project.verifications.length}>
         <div className="ai-grid">
           {project.aiWork.length === 0 ? <EmptyState>No AI work records.</EmptyState> : project.aiWork.map((item) => (
             <article className="ai-card" key={item.id}>
               <header><span className="ai-mark" aria-hidden="true">AI</span><div><h3>{item.label}</h3><p>{humanize(item.relatedEntityType)}</p></div></header>
-              <div className="ai-status-row"><div><small>Write</small><StatusChip value={item.writeStatus} /></div><span aria-hidden="true">→</span><div><small>Verification</small><StatusChip value={item.verificationStatus} /></div></div>
+              <div className="ai-status-row"><div><small>Write</small><StatusChip value={item.writeStatus} /></div><span aria-hidden="true">{'->'}</span><div><small>Verification</small><StatusChip value={item.verificationStatus} /></div></div>
               <p>{item.statusDetail}</p>
               <dl className="detail-list"><div><dt>Method</dt><dd>{item.verificationMethod ?? 'Not set'}</dd></div><div><dt>Verified by</dt><dd>{item.verifiedBy ?? 'Pending'}</dd></div></dl>
+            </article>
+          ))}
+        </div>
+      </Section>
+
+      <Section id="provenance" title="Freshness and provenance" kicker="External source references only" count={project.projectSources.length + project.provenance.length}>
+        <div className="stacked-records">
+          {project.projectSources.length === 0 && project.provenance.length === 0 ? <EmptyState>No provenance references recorded.</EmptyState> : null}
+          {project.projectSources.map((source) => (
+            <article className="stacked-record" key={source.id}>
+              <div className="record-line"><div><h3>{source.label}</h3><p>{source.externalPath}</p></div><StatusChip value={source.sourceType} /></div>
+              <dl className="inline-details"><div><dt>Last seen</dt><dd>{source.lastSeenAt ? formatDateTime(source.lastSeenAt) : 'Not recorded'}</dd></div><div><dt>Classification</dt><dd>{source.dataClassification}</dd></div></dl>
+            </article>
+          ))}
+          {project.provenance.map((ref) => (
+            <article className="stacked-record" key={ref.id}>
+              <div className="record-line"><div><h3>{ref.label}</h3><p>{ref.externalPath}</p></div><StatusChip value={ref.evidenceKind} /></div>
+              <dl className="inline-details"><div><dt>Entity</dt><dd>{humanize(ref.entityType)} / {ref.entityId}</dd></div><div><dt>Captured</dt><dd>{ref.capturedAt ? formatDateTime(ref.capturedAt) : 'Not recorded'}</dd></div></dl>
             </article>
           ))}
         </div>

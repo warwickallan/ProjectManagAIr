@@ -1,8 +1,9 @@
 import { defineConfig } from '@playwright/test';
 
+const node = JSON.stringify(process.execPath);
 const serverCommand = process.env.PLAYWRIGHT_DEV_SERVER === '1'
-  ? 'node node_modules/tsx/dist/cli.mjs server.ts'
-  : 'node node_modules/tsx/dist/cli.mjs server.ts --production';
+  ? `${node} node_modules/tsx/dist/cli.mjs scripts/start-e2e-server.ts`
+  : `${node} node_modules/tsx/dist/cli.mjs scripts/start-e2e-server.ts --production`;
 
 export default defineConfig({
   testDir: './tests',

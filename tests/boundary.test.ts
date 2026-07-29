@@ -5,7 +5,7 @@ import { portfolioFixtureSchema } from '../src/domain';
 
 const root = process.cwd();
 const forbiddenLiveNames = /\b(NPL|NWLDC|Bellrock)\b/i;
-const ignored = new Set(['node_modules', '.git', 'dist', 'coverage', 'test-results', 'playwright-report']);
+const ignored = new Set(['node_modules', '.git', 'dist', 'coverage', 'test-results', 'playwright-report', 'artifacts', '.runtime']);
 
 function filesUnder(relative: string): string[] {
   const target = path.join(root, relative);
@@ -19,7 +19,7 @@ function filesUnder(relative: string): string[] {
 
 describe('repository data boundary', () => {
   it('contains no prohibited live project names in runtime source or fixtures', () => {
-    const runtimeFiles = [...filesUnder('src'), ...filesUnder('fixtures'), path.join(root, 'server.ts')];
+    const runtimeFiles = [...filesUnder('src'), ...filesUnder('scripts'), ...filesUnder('fixtures'), path.join(root, 'server.ts')];
     const findings = runtimeFiles.filter((file) => forbiddenLiveNames.test(readFileSync(file, 'utf8')));
     expect(findings).toEqual([]);
   });
@@ -30,7 +30,7 @@ describe('repository data boundary', () => {
 
   it('validates all fixture records as fictional', () => {
     const fixture = portfolioFixtureSchema.parse(fixtureJson);
-    const collections = fixture.projects.flatMap((project) => [project.actions, project.risksIssues, project.decisions, project.openQuestions, project.milestones, project.workPackages, project.activity, project.aiWork]);
+    const collections = fixture.projects.flatMap((project) => [project.projectSources, project.actions, project.risksIssues, project.changes, project.decisions, project.openQuestions, project.milestones, project.workPackages, project.activity, project.deliverables, project.aiWork, project.verifications, project.provenance]);
     expect(fixture.dataClassification).toBe('fictional');
     expect(collections.flat().every((record) => record.dataClassification === 'fictional')).toBe(true);
   });
@@ -41,10 +41,11 @@ describe('repository data boundary', () => {
     expect(server).not.toContain('express.json(');
   });
 
-  it('creates no database artifact or dependency', () => {
+  it('does not track database artifacts, portable runtime, or native sqlite dependencies', () => {
     const packageJson = readFileSync(path.join(root, 'package.json'), 'utf8');
-    expect(packageJson).not.toMatch(/sqlite|postgres|mysql|mongodb|prisma/i);
-    const repositoryFiles = filesUnder('.').map((file) => path.basename(file));
+    expect(packageJson).not.toMatch(/better-sqlite3|sqlite3|postgres|mysql|mongodb|prisma/i);
+    const repositoryFiles = filesUnder('.').map((file) => path.relative(root, file));
+    expect(repositoryFiles.some((name) => /(^|[\\/])\.runtime([\\/]|$)/i.test(name))).toBe(false);
     expect(repositoryFiles.some((name) => /\.(db|sqlite|sqlite3)$/i.test(name))).toBe(false);
   });
 });

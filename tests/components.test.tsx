@@ -26,9 +26,9 @@ describe('Cockpit states and routes', () => {
   });
 
   it('renders the error state when the API fails', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => jsonResponse({ error: 'Fixture validation failed' }, false)));
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse({ error: 'Database read failed' }, false)));
     render(<App />);
-    expect(await screen.findByRole('alert')).toHaveTextContent('Fixture validation failed');
+    expect(await screen.findByRole('alert')).toHaveTextContent('Database read failed');
   });
 
   it('keeps a truthful loading state while data is pending', () => {
@@ -40,7 +40,7 @@ describe('Cockpit states and routes', () => {
   it('renders a stale data notice', async () => {
     vi.stubGlobal('fetch', vi.fn(() => jsonResponse(buildPortfolioResponse(fixture, new Date('2026-08-05T12:00:00Z')))));
     render(<App />);
-    expect(await screen.findByText('Fixture snapshot is stale')).toBeInTheDocument();
+    expect(await screen.findByText('Data snapshot is stale')).toBeInTheDocument();
   });
 
   it('renders every required project detail section', async () => {

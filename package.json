@@ -12,7 +12,9 @@
     "test:unit": "vitest run tests/domain.test.ts tests/components.test.tsx",
     "test:boundary": "vitest run tests/boundary.test.ts",
     "test:e2e": "playwright test",
-    "check": "npm run test && npm run build && npm run test:e2e"
+    "check": "npm run test && npm run build && npm run test:e2e",
+    "import:json": "tsx scripts/import-json.ts",
+    "db:migrate": "tsx -e \"import('./src/db.ts').then(({openProjectManagairDatabase}) => { const ctx = openProjectManagairDatabase(); console.log(JSON.stringify({dbPath: ctx.dbPath, migrationsApplied: ctx.migrationsApplied})); ctx.db.close(); })\""
   },
   "engines": {
     "node": ">=22"
