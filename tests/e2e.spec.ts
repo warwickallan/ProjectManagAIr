@@ -12,7 +12,7 @@ test('Portfolio to attention item to Project Detail still works end to end', asy
   const consoleErrors: string[] = [];
   page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
   await page.goto('/#/projects');
-  await expect(page.getByRole('heading', { name: 'Implementation focus, without the noise.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Project portfolio workspace' })).toBeVisible();
   await expect(page.locator('#attention').getByRole('heading', { level: 2 })).toHaveText(/^Needs /);
   await expect(page.getByRole('heading', { name: 'Project Atlas' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Project Beacon' })).toBeVisible();

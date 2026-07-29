@@ -47,7 +47,7 @@ export function applyMigrations(db: DatabaseSync): string[] {
     const sql = readFileSync(path.join(migrationDir, file), 'utf8');
     db.exec('BEGIN IMMEDIATE;');
     try {
-      db.exec(sql);
+      executeMigrationSql(db, file, sql);
       db.prepare('INSERT INTO schema_migrations (id) VALUES (?)').run(file);
       db.exec('COMMIT;');
       appliedNow.push(file);
@@ -56,10 +56,27 @@ export function applyMigrations(db: DatabaseSync): string[] {
       throw error;
     }
   }
-  db.exec('PRAGMA foreign_key_check;');
+  const fkViolations = db.prepare('PRAGMA foreign_key_check').all();
+  if (fkViolations.length > 0) throw new Error(`SQLite foreign key check failed: ${JSON.stringify(fkViolations)}`);
   return appliedNow;
 }
 
+
+function executeMigrationSql(db: DatabaseSync, file: string, sql: string) {
+  if (file !== '003_project_lifecycle.sql') {
+    db.exec(sql);
+    return;
+  }
+  for (const statement of sql.split(/;\s*(?:\r?\n|$)/).map((part) => part.trim()).filter(Boolean)) {
+    try {
+      db.exec(`${statement};`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const duplicateProjectColumn = /^ALTER TABLE projects ADD COLUMN/i.test(statement) && /duplicate column name/i.test(message);
+      if (!duplicateProjectColumn) throw error;
+    }
+  }
+}
 function userConfig(db: DatabaseSync): UserConfig {
   const rows = db.prepare('SELECT key, value FROM app_config').all() as Array<{ key: string; value: string | null }>;
   const config = new Map(rows.map((row) => [row.key, row.value]));
@@ -107,6 +124,8 @@ function readProjectFromRows(db: DatabaseSync, row: Record<string, unknown>): Pr
     updatedAt: String(row.updated_at),
     asOf: String(row.as_of),
     dataClassification: String(row.data_classification),
+    externalPath: row.external_path ? String(row.external_path) : null,
+    folderName: row.folder_name ? String(row.folder_name) : null,
     projectSources: (db.prepare('SELECT * FROM project_sources WHERE project_id = ? ORDER BY label').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
       id: String(item.id), projectId, sourceType: String(item.source_type), label: String(item.label), externalPath: String(item.external_path), lastSeenAt: item.last_seen_at ? String(item.last_seen_at) : null, dataClassification: String(item.data_classification),
     })),
@@ -145,6 +164,18 @@ function readProjectFromRows(db: DatabaseSync, row: Record<string, unknown>): Pr
     })),
     provenance: (db.prepare('SELECT * FROM provenance_file_refs WHERE project_id = ? ORDER BY entity_type, label').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
       id: String(item.id), projectId, entityType: String(item.entity_type), entityId: String(item.entity_id), label: String(item.label), externalPath: String(item.external_path), evidenceKind: String(item.evidence_kind), capturedAt: item.captured_at ? String(item.captured_at) : null, dataClassification: String(item.data_classification),
+    })),
+    inboxSources: (db.prepare('SELECT * FROM project_source_intake WHERE project_id = ? ORDER BY updated_at DESC').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
+      id: String(item.id), projectId, originalFileName: String(item.original_file_name), originalReceivedAt: String(item.original_received_at), contentHash: String(item.content_hash), sourceType: String(item.source_type), currentExternalPath: String(item.current_external_path), previousExternalPath: item.previous_external_path ? String(item.previous_external_path) : null, processingStatus: String(item.processing_status), processorProvider: String(item.processor_provider), extractedItemIds: jsonArray(item.extracted_item_ids_json as string), reviewState: String(item.review_state), verificationState: String(item.verification_state), createdAt: String(item.created_at), updatedAt: String(item.updated_at),
+    })),
+    proposedChanges: (db.prepare('SELECT * FROM proposed_changes WHERE project_id = ? ORDER BY created_at DESC').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
+      id: String(item.id), projectId, sourceId: String(item.source_id), status: String(item.status), payload: JSON.parse(String(item.payload_json)) as unknown, createdAt: String(item.created_at), reviewedAt: item.reviewed_at ? String(item.reviewed_at) : null, reviewedBy: item.reviewed_by ? String(item.reviewed_by) : null, appliedAt: item.applied_at ? String(item.applied_at) : null,
+    })),
+    sourceEntityProvenance: (db.prepare('SELECT * FROM source_entity_provenance WHERE project_id = ? ORDER BY created_at DESC').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
+      id: String(item.id), sourceId: String(item.source_id), projectId, entityType: String(item.entity_type), entityId: String(item.entity_id), sourcePath: String(item.source_path), contentHash: String(item.content_hash), createdAt: String(item.created_at),
+    })),
+    sourceFileHistory: (db.prepare('SELECT * FROM source_file_history WHERE project_id = ? ORDER BY occurred_at DESC').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
+      id: String(item.id), sourceId: String(item.source_id), projectId, fromExternalPath: item.from_external_path ? String(item.from_external_path) : null, toExternalPath: String(item.to_external_path), action: String(item.action), occurredAt: String(item.occurred_at), actor: String(item.actor), contentHash: String(item.content_hash),
     })),
   };
   return project as Project;
@@ -201,4 +232,3 @@ export function importProjectPayload(db: DatabaseSync, rawPayload: unknown): Imp
 export function importJsonText(db: DatabaseSync, jsonText: string): ImportResult {
   return importProjectPayload(db, JSON.parse(jsonText) as unknown);
 }
-

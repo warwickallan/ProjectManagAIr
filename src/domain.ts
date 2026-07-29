@@ -155,6 +155,63 @@ export const provenanceFileRefSchema = z.object({
   dataClassification,
 });
 
+export const inboxSourceSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  originalFileName: z.string().min(1),
+  originalReceivedAt: isoDateTime,
+  contentHash: z.string().min(1),
+  sourceType: z.string().min(1),
+  currentExternalPath: z.string().min(1),
+  previousExternalPath: z.string().nullable(),
+  processingStatus: z.enum(['awaiting_processing', 'processing', 'awaiting_review', 'verified', 'failed', 'rejected', 'archived']),
+  processorProvider: z.string().min(1),
+  extractedItemIds: z.array(z.string()),
+  reviewState: z.string().min(1),
+  verificationState: z.string().min(1),
+  createdAt: isoDateTime,
+  updatedAt: isoDateTime,
+});
+
+export const proposedChangeSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  sourceId: z.string().min(1),
+  status: z.enum(['proposed', 'reviewed', 'approved', 'applied', 'rejected']),
+  payload: z.object({
+    contractVersion: z.literal(1),
+    provider: z.string().min(1),
+    sourceMetadata: z.object({ sourceType: z.string(), contentHash: z.string(), originalFileName: z.string() }),
+    items: z.array(z.object({ id: z.string(), type: z.string(), title: z.string(), summary: z.string(), body: z.string().optional(), severity: z.string().optional(), priority: z.string().optional() })),
+  }),
+  createdAt: isoDateTime,
+  reviewedAt: isoDateTime.nullable(),
+  reviewedBy: z.string().nullable(),
+  appliedAt: isoDateTime.nullable(),
+});
+
+export const sourceEntityProvenanceSchema = z.object({
+  id: z.string().min(1),
+  sourceId: z.string().min(1),
+  projectId: z.string().min(1),
+  entityType: z.string().min(1),
+  entityId: z.string().min(1),
+  sourcePath: z.string().min(1),
+  contentHash: z.string().min(1),
+  createdAt: isoDateTime,
+});
+
+export const sourceFileHistorySchema = z.object({
+  id: z.string().min(1),
+  sourceId: z.string().min(1),
+  projectId: z.string().min(1),
+  fromExternalPath: z.string().nullable(),
+  toExternalPath: z.string().min(1),
+  action: z.string().min(1),
+  occurredAt: isoDateTime,
+  actor: z.string().min(1),
+  contentHash: z.string().min(1),
+});
 export const projectSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -169,6 +226,8 @@ export const projectSchema = z.object({
   updatedAt: isoDateTime,
   asOf: isoDateTime,
   dataClassification,
+  externalPath: z.string().nullable().default(null),
+  folderName: z.string().nullable().default(null),
   projectSources: z.array(projectSourceSchema).default([]),
   actions: z.array(actionSchema).default([]),
   risksIssues: z.array(riskIssueSchema).default([]),
@@ -182,6 +241,10 @@ export const projectSchema = z.object({
   aiWork: z.array(aiWorkSchema).default([]),
   verifications: z.array(verificationSchema).default([]),
   provenance: z.array(provenanceFileRefSchema).default([]),
+  inboxSources: z.array(inboxSourceSchema).default([]),
+  proposedChanges: z.array(proposedChangeSchema).default([]),
+  sourceEntityProvenance: z.array(sourceEntityProvenanceSchema).default([]),
+  sourceFileHistory: z.array(sourceFileHistorySchema).default([]),
 });
 
 export const portfolioDataSchema = z.object({
@@ -419,6 +482,7 @@ export function buildPortfolioResponse(data: PortfolioData, now = new Date(), en
       highRiskIssues: data.projects.flatMap((project) => project.risksIssues).filter((item) => item.status !== 'closed' && ['high', 'critical'].includes(item.severity)).length,
       pendingDecisions: data.projects.flatMap((project) => project.decisions).filter((item) => item.decisionStatus === 'awaiting-user').length,
       aiAwaitingVerification: data.projects.flatMap((project) => project.aiWork).filter((item) => ['pending', 'failed'].includes(item.verificationStatus)).length,
+      awaitingSourceReview: data.projects.flatMap((project) => project.proposedChanges).filter((item) => item.status === 'proposed').length,
     },
   };
 }
