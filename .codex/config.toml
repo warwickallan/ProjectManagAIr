@@ -1,0 +1,6 @@
+# Project ManagAIr project-scoped Codex configuration.
+#
+# Keep this file intentionally minimal. The reviewer definitions live in
+# .codex/agents/*.toml and carry their own role instructions. Do not add model,
+# sandbox, MCP, connector or integration keys here unless they are first verified
+# against the locally installed Codex configuration schema.

@@ -69,6 +69,46 @@ licensing implications before copying code or text.
 - Do not add a write-back path to a source system without explicit Warwick
   approval and an auditable command boundary.
 
+## Multi-agent delivery and review workflow
+
+The main Codex session owns implementation. Independent investigation and
+review should be delegated to focused read-only reviewers when that is useful
+for quality or responsiveness.
+
+Workflow:
+
+1. The main agent owns implementation.
+2. Independent investigation and review should be delegated.
+3. Read-heavy reviewers may run in parallel.
+4. Only one implementation agent writes to a working tree at a time.
+5. Reviewers never repair their own findings.
+6. The main agent decides whether findings are genuine.
+7. Only genuine blockers are fixed.
+8. Relevant reviewers re-check the repaired exact head.
+9. Release Gate runs last against the exact pushed SHA.
+10. No merge occurs without an APPROVE verdict.
+11. Once APPROVE is issued, stop building.
+12. Further polish requires a new approved goal.
+
+Keep the system lightweight:
+
+- Run a maximum of three reviewer agents concurrently.
+- Run Release Gate only after the specialist reviews finish.
+- Do not run every reviewer for every change.
+- Do not repeat broad test suites unnecessarily.
+- Delegate bounded investigations so the main agent remains responsive.
+- Review agents return concise findings, not long activity logs.
+
+Future routing:
+
+- UI work: `ui-reviewer` and `qa-reviewer`.
+- SQLite/import work: `schema-reviewer` and `qa-reviewer`.
+- Microsoft/external integration work: `research-reviewer` and `qa-reviewer`.
+- Every candidate merge: relevant specialist reviewers, then `release-gate`.
+
+Project-scoped reviewer definitions live in `.codex/agents/`. They are
+read-only governance roles and must not be treated as application runtime code.
+
 ## Current foundation freeze
 
 Until Warwick approves the next milestone, do not create:
