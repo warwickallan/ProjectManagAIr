@@ -1,11 +1,12 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import path from 'node:path';
 import fixtureJson from '../fixtures/portfolio.json';
 import { importProjectPayload, openProjectManagairDatabase, readPortfolioData, readProjectData } from '../src/db';
-import { approveProposedChange, createProject, intakeProjectSource, recordBlindExtractionPacket, updateStorageSettings, verifyStorageRoot } from '../src/projectLifecycle';
+import { approveProposedChange, createProject, fileProjectArtifact, intakeProjectSource, localConfigWriteDecision, openOriginalPath, recordBlindExtractionPacket, resolveDesktopLauncher, updateStorageSettings, validateProjectsRoot, verifyStorageRoot } from '../src/projectLifecycle';
 import { compareBlindExtractionToBenchmark } from '../src/blindExtractionComparison';
 import { importProjectRegisterBenchmark } from '../src/projectRegisters';
 import { portfolioFixtureSchema } from '../src/domain';
@@ -40,9 +41,13 @@ describe('SQLite operational database', () => {
   it('creates a database and applies migrations idempotently', () => {
     const { dir, dbPath } = tempDbPath();
     try {
+      // Derived from the migrations directory rather than pinned to a count, so
+      // adding a migration does not make this assertion fail for the wrong
+      // reason. What is under test is that every migration applies once and the
+      // second open applies none.
+      const migrationFiles = readdirSync(path.resolve('migrations')).filter((name) => name.endsWith('.sql')).sort();
       const first = openProjectManagairDatabase(dbPath);
-      expect(first.migrationsApplied).toHaveLength(10);
-      expect(first.migrationsApplied.at(-1)).toBe('010_grounded_brief_runs.sql');
+      expect(first.migrationsApplied).toEqual(migrationFiles);
       first.db.close();
 
       const second = openProjectManagairDatabase(dbPath);
@@ -263,6 +268,368 @@ describe('SQLite operational database', () => {
       expect(demo.blindExtractionComparisonReports[0].reportMarkdown).toContain('Benchmark-Informed Extraction Comparison');
       expect(demo.actions).toHaveLength(0);
       expect(demo.aiWork.some((item) => item.label === 'Benchmark-informed extraction comparison' && item.verificationStatus === 'failed')).toBe(true);
+      context.db.close();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('local configuration write guard (D7)', () => {
+  it('refuses to write the local config file even when NODE_ENV is not test', async () => {
+    // The regression this pins: `NODE_ENV=development npx vitest run ...`
+    // previously overwrote the consultant's live projectsRoot, permanently, in
+    // three of the four suites that call updateStorageSettings. Vitest only
+    // DEFAULTS NODE_ENV to 'test' when it is unset, so an ambient value re-armed
+    // the clobber. The guard now also keys off the Vitest worker's own
+    // variables, which no ambient value and no config edit can remove.
+    const { dir, dbPath } = tempDbPath();
+    const root = path.join(dir, 'Projects');
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousMode = process.env.PROJECTMANAGAIR_LOCAL_CONFIG_MODE;
+    const before = existsSync(localStorageConfigPath) ? readFileSync(localStorageConfigPath, 'utf8') : null;
+    try {
+      mkdirSync(root, { recursive: true });
+      // Strip every signal the old guard depended on, and the one vite.config.ts adds.
+      process.env.NODE_ENV = 'development';
+      delete process.env.PROJECTMANAGAIR_LOCAL_CONFIG_MODE;
+      expect(localConfigWriteDecision(process.env).allowed).toBe(false);
+      expect(localConfigWriteDecision(process.env).reason).toMatch(/VITEST/);
+
+      const context = openProjectManagairDatabase(dbPath);
+      await updateStorageSettings(context.db, { projectsRoot: root });
+      context.db.close();
+
+      const after = existsSync(localStorageConfigPath) ? readFileSync(localStorageConfigPath, 'utf8') : null;
+      expect(after).toBe(before);
+      expect(after ?? '').not.toContain(root);
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previousNodeEnv;
+      if (previousMode === undefined) delete process.env.PROJECTMANAGAIR_LOCAL_CONFIG_MODE; else process.env.PROJECTMANAGAIR_LOCAL_CONFIG_MODE = previousMode;
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('reports each independent blocking signal by name and only allows a clean non-test environment', () => {
+    const clean = { PATH: '/usr/bin' } as NodeJS.ProcessEnv;
+    expect(localConfigWriteDecision(clean)).toMatchObject({ allowed: true });
+    expect(localConfigWriteDecision({ ...clean, NODE_ENV: 'test' }).allowed).toBe(false);
+    expect(localConfigWriteDecision({ ...clean, VITEST: 'true' }).allowed).toBe(false);
+    expect(localConfigWriteDecision({ ...clean, VITEST_WORKER_ID: '3' }).allowed).toBe(false);
+    expect(localConfigWriteDecision({ ...clean, PROJECTMANAGAIR_LOCAL_CONFIG_MODE: 'blocked' }).allowed).toBe(false);
+    expect(localConfigWriteDecision({ ...clean, npm_lifecycle_event: 'test:boundary' }).allowed).toBe(false);
+    // The explicit opt-in cannot re-enable writes inside a Vitest worker.
+    expect(localConfigWriteDecision({ ...clean, PROJECTMANAGAIR_LOCAL_CONFIG_MODE: 'allow', VITEST: 'true' }).allowed).toBe(false);
+    expect(localConfigWriteDecision({ ...clean, PROJECTMANAGAIR_LOCAL_CONFIG_MODE: 'allow', NODE_ENV: 'test' }).allowed).toBe(true);
+  });
+});
+
+describe('projects root validation (D8)', () => {
+  function withTempDir<T>(run: (dir: string) => T): T {
+    const { dir } = tempDbPath();
+    try {
+      return run(dir);
+    } finally {
+      cleanupTempDir(dir);
+    }
+  }
+
+  it('accepts a real, writable directory and returns the normalised absolute path', () => {
+    withTempDir((dir) => {
+      const root = path.join(dir, 'Projects');
+      mkdirSync(root, { recursive: true });
+      expect(validateProjectsRoot(`${root}${path.sep}`)).toBe(path.resolve(root));
+    });
+  });
+
+  it('rejects a path that does not exist', () => {
+    withTempDir((dir) => {
+      expect(() => validateProjectsRoot(path.join(dir, 'nope'))).toThrow(/does not exist/i);
+    });
+  });
+
+  it('rejects a file that is not a directory', () => {
+    withTempDir((dir) => {
+      const file = path.join(dir, 'projects.txt');
+      writeFileSync(file, 'not a directory', 'utf8');
+      expect(() => validateProjectsRoot(file)).toThrow(/not a directory/i);
+    });
+  });
+
+  it('rejects a relative path instead of silently resolving it against the server cwd', () => {
+    for (const candidate of ['Projects', './Projects', '../Projects', '']) {
+      expect(() => validateProjectsRoot(candidate)).toThrow();
+    }
+    expect(() => validateProjectsRoot('Projects')).toThrow(/absolute/i);
+  });
+
+  it('rejects filesystem and system roots', () => {
+    expect(() => validateProjectsRoot('/')).toThrow(/filesystem root|system location/i);
+    for (const candidate of ['/etc', '/usr', '/var', '/home', '/root']) {
+      expect(() => validateProjectsRoot(candidate)).toThrow(/system location|not readable/i);
+    }
+  });
+
+  it('rejects a root inside the product repository, where live data must never live', () => {
+    expect(() => validateProjectsRoot(path.resolve('src'))).toThrow(/repository/i);
+    expect(() => validateProjectsRoot(path.resolve('.'))).toThrow(/repository/i);
+  });
+
+  it('carries a 400 status so the route does not answer with an opaque 500', () => {
+    try {
+      validateProjectsRoot('Projects');
+      throw new Error('expected a rejection');
+    } catch (error) {
+      expect((error as { statusCode?: number }).statusCode).toBe(400);
+    }
+  });
+
+  it('rejects a root that leaves no room inside the Windows MAX_PATH budget', () => {
+    withTempDir((dir) => {
+      const root = path.join(dir, 'Projects');
+      mkdirSync(root, { recursive: true });
+      const previous = process.env.PROJECTMANAGAIR_MAX_PATH_BUDGET;
+      process.env.PROJECTMANAGAIR_MAX_PATH_BUDGET = String(root.length + 85);
+      try {
+        expect(() => validateProjectsRoot(root)).toThrow(/too long/i);
+      } finally {
+        if (previous === undefined) delete process.env.PROJECTMANAGAIR_MAX_PATH_BUDGET; else process.env.PROJECTMANAGAIR_MAX_PATH_BUDGET = previous;
+      }
+    });
+  });
+
+  it('is enforced by updateStorageSettings, which no longer persists an unchecked root', async () => {
+    const { dir, dbPath } = tempDbPath();
+    try {
+      const context = openProjectManagairDatabase(dbPath);
+      await expect(updateStorageSettings(context.db, { projectsRoot: path.join(dir, 'missing') })).rejects.toThrow(/does not exist/i);
+      const stored = context.db.prepare("SELECT projects_root FROM project_storage_settings WHERE id = 'local'").get() as { projects_root: string | null };
+      expect(stored.projects_root).toBeNull();
+      context.db.close();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('long path handling', () => {
+  it('bounds the filed artifact path so a deep OneDrive root does not fail with ENOENT', async () => {
+    const { dir, dbPath } = tempDbPath();
+    const root = path.join(dir, 'Projects');
+    const previous = process.env.PROJECTMANAGAIR_MAX_PATH_BUDGET;
+    try {
+      mkdirSync(root, { recursive: true });
+      process.env.PROJECTMANAGAIR_MAX_PATH_BUDGET = String(root.length + 150);
+      const context = openProjectManagairDatabase(dbPath);
+      await updateStorageSettings(context.db, { projectsRoot: root, projectFolderNamingFormat: '{code} - {name}' });
+      const longName = 'Extremely Long Synthetic Project Name '.repeat(6);
+      const project = createProject(context.db, { code: 'LONG', name: longName, customer: 'Synthetic', description: 'Long path bound.', status: 'active', owner: 'Casey' });
+      const longFile = `${'synthetic-transcript-segment-'.repeat(8)}.vtt`;
+      const bytes = Buffer.from('WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nAction: bound the path', 'utf8');
+      const filed = fileProjectArtifact(context.db, project.projectId, 'uploadEvidence', longFile, bytes);
+      expect(existsSync(filed.destinationPath)).toBe(true);
+      expect(filed.destinationPath.length).toBeLessThanOrEqual(root.length + 150);
+      expect(path.basename(filed.destinationPath)).toMatch(/-[0-9a-f]{12}\.vtt$/);
+      context.db.close();
+    } finally {
+      if (previous === undefined) delete process.env.PROJECTMANAGAIR_MAX_PATH_BUDGET; else process.env.PROJECTMANAGAIR_MAX_PATH_BUDGET = previous;
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('openOriginalPath (D8)', () => {
+  async function projectWithFile() {
+    const { dir, dbPath } = tempDbPath();
+    const root = path.join(dir, 'Projects');
+    mkdirSync(root, { recursive: true });
+    const context = openProjectManagairDatabase(dbPath);
+    await updateStorageSettings(context.db, { projectsRoot: root, projectFolderNamingFormat: '{code} - {name}' });
+    const project = createProject(context.db, { code: 'OPEN', name: 'Synthetic Open', customer: 'Synthetic', description: 'Launcher fixture.', status: 'active', owner: 'Casey' });
+    const filed = fileProjectArtifact(context.db, project.projectId, 'transcripts', 'note.txt', Buffer.from('synthetic', 'utf8'));
+    return { dir, context, root, filePath: filed.destinationPath };
+  }
+
+  it('fails cleanly on a host with no desktop launcher instead of spawning nothing', async () => {
+    const fixture = await projectWithFile();
+    try {
+      expect(resolveDesktopLauncher('linux', { PATH: path.join(fixture.dir, 'no-such-bin') })).toBeNull();
+      expect(() => openOriginalPath(fixture.context.db, fixture.filePath, { platform: 'linux', env: { PATH: path.join(fixture.dir, 'no-such-bin') } }))
+        .toThrow(/No desktop file launcher is available/i);
+    } finally {
+      fixture.context.db.close();
+      cleanupTempDir(fixture.dir);
+    }
+  });
+
+  it("does not kill the process when the spawned child emits 'error'", async () => {
+    // An 'error' event with no listener is rethrown as an uncaught exception.
+    // Before the fix, one request on a host without `cmd` took the whole server
+    // down. The listener must absorb it.
+    const fixture = await projectWithFile();
+    const uncaught: unknown[] = [];
+    const onUncaught = (error: unknown) => uncaught.push(error);
+    process.on('uncaughtException', onUncaught);
+    try {
+      const emitter = new EventEmitter() as EventEmitter & { unref: () => void };
+      emitter.unref = () => undefined;
+      const result = openOriginalPath(fixture.context.db, fixture.filePath, {
+        // win32 resolves its launcher from ComSpec without probing PATH, so
+        // this exercises the spawn path on any host.
+        platform: 'win32',
+        env: { ComSpec: 'cmd.exe' },
+        spawnImpl: (() => emitter) as never,
+      });
+      expect(result).toMatchObject({ opened: true });
+      expect(() => emitter.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }))).not.toThrow();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(uncaught).toEqual([]);
+    } finally {
+      process.off('uncaughtException', onUncaught);
+      fixture.context.db.close();
+      cleanupTempDir(fixture.dir);
+    }
+  });
+
+  it('keeps assertInside and refuses executable file types', async () => {
+    const fixture = await projectWithFile();
+    try {
+      expect(() => openOriginalPath(fixture.context.db, path.join(fixture.dir, 'outside.txt'))).toThrow(/escapes the configured projects root/i);
+      const script = fileProjectArtifact(fixture.context.db, 'open', 'transcripts', 'payload.bat', Buffer.from('@echo off', 'utf8'));
+      expect(() => openOriginalPath(fixture.context.db, script.destinationPath)).toThrow(/executable file type/i);
+    } finally {
+      fixture.context.db.close();
+      cleanupTempDir(fixture.dir);
+    }
+  });
+});
+
+describe('recordBlindExtractionPacket collision (D9 residual)', () => {
+  it('reuses an existing intake row for the same content hash and leaves no orphan file', async () => {
+    const { dir, dbPath } = tempDbPath();
+    const root = path.join(dir, 'Projects');
+    try {
+      mkdirSync(root, { recursive: true });
+      const context = openProjectManagairDatabase(dbPath);
+      await updateStorageSettings(context.db, { projectsRoot: root, projectFolderNamingFormat: '{code} - {name}' });
+      const project = createProject(context.db, { code: 'DEMO', name: 'Synthetic Blind', customer: 'Synthetic', description: 'Blind packet collision fixture.', status: 'active', owner: 'Casey' });
+      const sourceText = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nAction: Configure approval workflow route';
+      const sourceHash = createHash('sha256').update(Buffer.from(sourceText, 'utf8')).digest('hex');
+      const dataBase64 = Buffer.from(sourceText, 'utf8').toString('base64');
+
+      // The same file arrives first through the ordinary Cockpit intake route,
+      // which is what creates the `(project_id, content_hash)` row the blind
+      // packet's upsert then collides with.
+      const intake = await intakeProjectSource(context.db, project.projectId, { name: 'approval-workflow.vtt', dataBase64 });
+      const intakeRowId = (context.db.prepare('SELECT id FROM project_source_intake WHERE project_id = ? AND content_hash = ?').get(project.projectId, sourceHash) as { id: string }).id;
+      expect(intake).toBeTruthy();
+
+      const packet = {
+        contractVersion: 1 as const,
+        provider: 'Codex',
+        model: 'GPT-5',
+        generatedAt: '2026-07-30T12:00:00.000Z',
+        extractionMode: 'blind-approval-workflow-vtt',
+        sourceMetadata: { sourceType: 'vtt-transcript', contentHash: sourceHash, originalFileName: 'approval-workflow.vtt' },
+        items: [{ id: 'DEMO-A-002', type: 'action' as const, title: 'Configure approval workflow route', summary: 'Configure approval workflow route from transcript evidence.' }],
+      };
+      const result = recordBlindExtractionPacket(context.db, project.projectId, { sourceFile: { name: 'approval-workflow.vtt', dataBase64 }, frozenPacket: packet });
+
+      // Previously this threw `FOREIGN KEY constraint failed` as an opaque 500,
+      // because the job row referenced a synthetic id the upsert had discarded.
+      expect(result.duplicate).toBe(false);
+      expect(result.sourceId).toBe(intakeRowId);
+      const job = context.db.prepare('SELECT source_id FROM source_processing_jobs WHERE proposed_change_id = ?').get(result.proposedChangeId) as { source_id: string };
+      expect(job.source_id).toBe(intakeRowId);
+      expect(context.db.prepare('SELECT count(*) AS count FROM project_source_intake WHERE project_id = ? AND content_hash = ?').get(project.projectId, sourceHash)).toMatchObject({ count: 1 });
+      context.db.close();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+
+  it('does not leave a filed immutable original behind when the transaction rolls back', async () => {
+    const { dir, dbPath } = tempDbPath();
+    const root = path.join(dir, 'Projects');
+    try {
+      mkdirSync(root, { recursive: true });
+      const context = openProjectManagairDatabase(dbPath);
+      await updateStorageSettings(context.db, { projectsRoot: root, projectFolderNamingFormat: '{code} - {name}' });
+      const project = createProject(context.db, { code: 'DEMO', name: 'Synthetic Blind', customer: 'Synthetic', description: 'Rollback fixture.', status: 'active', owner: 'Casey' });
+      const sourceText = 'WEBVTT\n\n00:00:03.000 --> 00:00:04.000\nAction: Roll back cleanly';
+      const sourceHash = createHash('sha256').update(Buffer.from(sourceText, 'utf8')).digest('hex');
+      const dataBase64 = Buffer.from(sourceText, 'utf8').toString('base64');
+      const packet = {
+        contractVersion: 1 as const,
+        provider: 'Codex',
+        sourceMetadata: { sourceType: 'vtt-transcript', contentHash: sourceHash, originalFileName: 'rollback.vtt' },
+        items: [{ id: 'DEMO-A-003', type: 'action' as const, title: 'Roll back cleanly', summary: 'Roll back cleanly.' }],
+      };
+      const packetHash = createHash('sha256').update(JSON.stringify(packet)).digest('hex');
+
+      // Force the transaction to fail on its last insert by pre-claiming the
+      // deterministic ai_writes id the function will try to write.
+      context.db.prepare('INSERT INTO ai_writes (id, project_id, label, related_entity_type, related_entity_id, write_status, verification_status, verification_method, last_attempt_at, verified_at, verified_by, status_detail, attention_owner, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(`ai-write:${project.projectId}:${packetHash.slice(0, 16)}`, project.projectId, 'Pre-existing', 'source', 'placeholder-source', 'complete', 'pending', 'manual', null, null, null, 'Pre-existing row that forces a rollback.', 'current-user', 'operational-reference');
+
+      const immutableDir = path.join(root, `DEMO - Synthetic Blind`, '01_Sources_Immutable', 'Meeting_Transcripts');
+      expect(() => recordBlindExtractionPacket(context.db, project.projectId, { sourceFile: { name: 'rollback.vtt', dataBase64 }, frozenPacket: packet })).toThrow();
+      const orphans = existsSync(immutableDir) ? readdirSync(immutableDir) : [];
+      expect(orphans).toEqual([]);
+      expect(context.db.prepare('SELECT count(*) AS count FROM project_source_intake WHERE project_id = ?').get(project.projectId)).toMatchObject({ count: 0 });
+      context.db.close();
+    } finally {
+      cleanupTempDir(dir);
+    }
+  });
+});
+
+describe('register projection ownership at the database boundary (C3)', () => {
+  it('keeps operational rows the projector did not create when a register import rebuilds the projection', async () => {
+    // `rebuildProjection` used to delete every operational row for the project
+    // before re-inserting the register-derived ones, so anything written
+    // directly through this module - the JSON import path, the fixture loader,
+    // the connected-folder projection - was destroyed by the next register
+    // import or the next recorded register event.
+    const { dir, dbPath } = tempDbPath();
+    const root = path.join(dir, 'OneDrive Projects');
+    try {
+      const context = openProjectManagairDatabase(dbPath);
+      mkdirSync(root, { recursive: true });
+      await updateStorageSettings(context.db, { projectsRoot: root, projectFolderNamingFormat: '{code} - {name}' });
+      await verifyStorageRoot(context.db, true);
+      const project = createProject(context.db, { code: 'OWN', name: 'Ownership Fixture', customer: 'Synthetic', description: 'Projection ownership fixture.', status: 'active', owner: 'Casey' });
+
+      context.db.prepare('INSERT INTO project_sources (id, project_id, source_type, label, external_path, last_seen_at, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run('connected-folder', project.projectId, 'cloud-folder', 'Connected project folder', 'Cloud/Projects/OWN', '2026-07-30T09:00:00.000Z', 'operational-reference');
+      context.db.prepare('INSERT INTO actions (id, project_id, title, status, owner, updated_at, data_classification, summary, priority, due_date, needs_user_attention, attention_owner, attention_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL, NULL)')
+        .run('connector-action', project.projectId, 'Action from a connected system', 'open', 'Avery Lane', '2026-07-30T09:00:00.000Z', 'operational-reference', 'Not derived from any register row.', 'medium');
+
+      const packet = {
+        packet_type: 'project_register_benchmark',
+        packet_version: 1,
+        project_code: 'OWN',
+        registers: {
+          Actions: [{ id: 'OWN-A-001', title: 'Confirm owner', status: 'Open', owner: 'Casey', due_date: '2026-08-01' }],
+          Sources: [{ id: 'OWN-S-001', title: 'Canonical workbook', status: 'Current', type: 'workbook' }],
+        },
+      };
+      const benchmarkText = JSON.stringify(packet, null, 2);
+      importProjectRegisterBenchmark(context.db, project.projectId, { benchmarkFile: { name: 'OWN_register_benchmark_canonical.json', dataBase64: Buffer.from(benchmarkText, 'utf8').toString('base64') } });
+
+      const data = readProjectData(context.db, project.projectId)!.projects[0];
+      expect(data.projectSources.map((source) => source.id).sort()).toEqual(['OWN-S-001', 'connected-folder']);
+      expect(data.actions.map((action) => action.id).sort()).toEqual(['OWN-A-001', 'connector-action']);
+      expect(data.actions.find((action) => action.id === 'connector-action')?.title).toBe('Action from a connected system');
+
+      // A second rebuild, through the human-event path, must not duplicate or
+      // destroy anything either.
+      const { recordRegisterEvent } = await import('../src/registerProjection');
+      recordRegisterEvent(context.db, project.projectId, 'OWN-A-001', { actor: 'Casey', eventType: 'update', field: 'owner', newValue: 'Avery Lane', reason: 'Reassigned in the playback session.', occurredAt: '2026-07-30T10:00:00.000Z' });
+      const after = readProjectData(context.db, project.projectId)!.projects[0];
+      expect(after.projectSources).toHaveLength(2);
+      expect(after.actions).toHaveLength(2);
+      expect(after.actions.find((action) => action.id === 'OWN-A-001')?.owner).toBe('Avery Lane');
       context.db.close();
     } finally {
       cleanupTempDir(dir);

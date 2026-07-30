@@ -1,5 +1,5 @@
 import express from 'express';
-import { existsSync } from 'node:fs';
+
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -11,8 +11,9 @@ import { probeAIProviders, sendChatMessage } from './src/aiProvider.js';
 import { compareBlindExtractionToBenchmark } from './src/blindExtractionComparison.js';
 import { importProjectRegisterBenchmark } from './src/projectRegisters.js';
 import { recordRegisterEvent } from './src/registerProjection.js';
-import { applyReviewedChangeset, buildConsultantBrief, freezePacketAndCreateChangeset, pinOverviewMode, readSourceIntelligence, replayPacket, reviewChangeset } from './src/sourceIntelligence.js';
-import { createLifecycleSourceEnqueuer, orchestrateSourceExtraction, WatchedInboxScanner } from './src/sourcePipeline.js';
+import { acknowledgeChangeset, applyReviewedChangeset, buildConsultantBrief, freezePacketAndCreateChangeset, pinOverviewMode, readSourceIntelligence, replayPacket, reviewChangeset } from './src/sourceIntelligence.js';
+import { createLifecycleSourceEnqueuer, retrySourceJob, runSourceExtractionJob, skipSourceAfterComprehension, startSourceJobSweeper, WatchedInboxScanner } from './src/sourcePipeline.js';
+import { createLocalOriginGuard } from './src/httpSecurity.js';
 import { ClaudeCodeStructuredExtractionProvider } from './src/extractionProvider.js';
 import { ClaudeCodeGroundedBriefProvider } from './src/briefProvider.js';
 
@@ -47,18 +48,30 @@ let extractionWorker = Promise.resolve();
 function scheduleSourceExtraction(sourceId: string) {
   const source = db().prepare('SELECT id, project_id, intake_source_id, content_hash FROM source_documents WHERE id = ?').get(sourceId) as { id: string; project_id: string; intake_source_id: string | null; content_hash: string } | undefined;
   if (!source) return;
+  // Re-probe before declaring the provider unavailable: installing the CLI
+  // must not require a server restart.
+  structuredExtractionProvider.refresh?.();
   if (!structuredExtractionProvider.isAvailable()) {
     const timestamp = new Date().toISOString();
     const jobId = `source-job:${source.project_id}:${source.content_hash.slice(0, 16)}`;
     db().prepare("UPDATE source_processing_jobs SET status = 'queued', current_stage = 'awaiting-provider', updated_at = ?, error_message = ? WHERE id = ?")
       .run(timestamp, 'Local structured extraction provider is unavailable; deterministic source evidence remains available.', jobId);
-    db().prepare("UPDATE project_source_intake SET processing_status = 'awaiting_processing', updated_at = ? WHERE id = ?").run(timestamp, source.intake_source_id);
+    db().prepare("UPDATE project_source_intake SET processing_status = 'awaiting_processing', processing_stage = 'awaiting-provider', processing_error = ?, processing_recovery_action = ?, processing_updated_at = ?, updated_at = ? WHERE id = ?")
+      .run('Local structured extraction provider is unavailable.', 'Install or sign in to the local Claude CLI, then retry this source from the Cockpit.', timestamp, timestamp, source.intake_source_id);
     return;
   }
-  extractionWorker = extractionWorker.catch(() => undefined).then(async () => {
-    await orchestrateSourceExtraction(db(), { sourceId, provider: structuredExtractionProvider });
+  // `runSourceExtractionJob` resolves rather than rejecting: every failure path
+  // records a readable reason and a recovery action on the job and intake rows
+  // before returning. Nothing is swallowed.
+  extractionWorker = extractionWorker.then(async () => {
+    const result = await runSourceExtractionJob(db(), {
+      sourceId,
+      provider: structuredExtractionProvider,
+      onEvent: (event) => console.log('[source-pipeline]', JSON.stringify(event)),
+    });
+    if (!result.ok) console.error(`[source-pipeline] ${result.status}: ${result.message ?? 'no message'} -> ${result.recoveryAction ?? 'no recovery action recorded'}`);
   });
-  void extractionWorker.catch(() => undefined);
+  void extractionWorker;
 }
 
 async function enqueueSourceFile(projectId: string, file: IntakeFileInput) {
@@ -76,12 +89,19 @@ const inboxWatchers = new Map<string, WatchedInboxScanner>();
 function ensureInboxWatcher(projectId: string, externalPath: string | null) {
   if (demoMode || !externalPath || inboxWatchers.has(projectId)) return;
   const inboxPath = path.join(externalPath, '00_Inbox', 'Unsorted');
-  if (!existsSync(inboxPath)) return;
+  // A missing inbox folder is no longer a silent drop: OneDrive is frequently
+  // still mounting at startup, and the previous guard meant that project was
+  // never watched again until someone restarted the server.
   const scanner = new WatchedInboxScanner({
     projectId,
     inboxPath,
     enqueue: enqueueSourceFile,
     isKnownHash: (contentHash) => Boolean(db().prepare('SELECT 1 FROM project_source_intake WHERE project_id = ? AND content_hash = ? LIMIT 1').get(projectId, contentHash)),
+    onEvents: (events) => {
+      for (const event of events) {
+        if (['failed', 'abandoned', 'inbox-missing', 'inbox-ready', 'refused'].includes(String(event.status))) console.warn('[inbox-watcher]', JSON.stringify(event));
+      }
+    },
   });
   scanner.start();
   inboxWatchers.set(projectId, scanner);
@@ -93,6 +113,10 @@ function startInboxWatchers() {
   for (const project of projects) ensureInboxWatcher(project.id, project.external_path);
 }
 app.disable('x-powered-by');
+// Loopback is not a security boundary against a page the user visits: a
+// DNS-rebinding site is same-origin to the browser. Host and Origin are checked
+// before any body is parsed.
+app.use(createLocalOriginGuard({ ports: [port] }));
 app.use(express.json({ limit: '32mb' }));
 app.use((_, response, next) => {
   response.setHeader('Cache-Control', 'no-store');
@@ -206,6 +230,18 @@ app.post('/api/projects/:projectId/register-rows/:externalRegisterId/events', as
   if (!body.eventType || !body.reason) { response.status(400).json({ error: 'eventType and reason are required.' }); return; }
   response.status(201).json(recordRegisterEvent(db(), String(request.params.projectId), String(request.params.externalRegisterId), { actor: String(body.actor ?? 'current-user'), eventType: body.eventType, field: body.field, newValue: body.newValue, reason: body.reason, evidenceRef: body.evidenceRef, occurredAt: body.occurredAt }));
 }));
+app.post('/api/projects/:projectId/sources/:sourceId/retry', asyncRoute(async (request, response) => {
+  const result = await retrySourceJob(db(), { sourceId: String(request.params.sourceId), provider: structuredExtractionProvider });
+  response.status(result.status === 'lease-held' ? 409 : 200).json(result);
+}));
+app.post('/api/projects/:projectId/sources/:sourceId/skip', asyncRoute(async (request, response) => {
+  const body = request.body as { reason?: string; markerDismissals?: Array<{ markerId: string; reason: string }> };
+  if (!body.reason || !String(body.reason).trim()) { response.status(400).json({ error: 'reason is required to skip a source after comprehension.' }); return; }
+  response.json(skipSourceAfterComprehension(db(), { sourceId: String(request.params.sourceId), reason: String(body.reason), markerDismissals: body.markerDismissals }));
+}));
+app.post('/api/projects/:projectId/changesets/:changesetId/acknowledge', asyncRoute(async (request, response) => {
+  response.json(acknowledgeChangeset(db(), String(request.params.changesetId), String((request.body as { actor?: string }).actor ?? 'current-user')));
+}));
 app.post('/api/projects/:projectId/overview/pin', asyncRoute(async (request, response) => {
   const mode = (request.body as { mode?: 'changes' | 'meeting' | 'needs-warwick' | null }).mode ?? null;
   response.json(pinOverviewMode(db(), String(request.params.projectId), mode, 'current-user'));
@@ -265,6 +301,15 @@ if (production) {
 }
 
 startInboxWatchers();
+
+// Crash recovery: reclaim any job whose lease expired while the process was
+// down, then keep sweeping. Without this a job interrupted mid-extraction stayed
+// `processing` forever and re-uploading the file hit the content-hash dedup.
+if (!demoMode) {
+  startSourceJobSweeper(db(), {
+    onReclaim: (jobs) => { if (jobs.length) console.warn('[source-pipeline] reclaimed stalled jobs', JSON.stringify(jobs)); },
+  });
+}
 
 app.listen(port, '127.0.0.1', () => {
   console.log(`Project ManagAIr Cockpit running at http://127.0.0.1:${port}`);

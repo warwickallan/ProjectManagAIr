@@ -64,7 +64,7 @@ function trustedRun(db: DatabaseSync, projectId: string, sourceId: string) {
   const id = `run:${sourceId}:${Date.now()}`;
   const source = db.prepare('SELECT word_count FROM source_documents WHERE id = ?').get(sourceId) as { word_count: number };
   db.prepare('INSERT INTO extraction_runs (id, source_id, project_id, stage, provider_id, model_label, skill_sha256, prompt_sha256, input_tokens, output_tokens, source_tokens, started_at, duration_ms, status, error, output_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)')
-    .run(id, sourceId, projectId, 'extract', 'frozen-synthetic-provider', 'fixture-v1', 'a'.repeat(64), 'b'.repeat(64), 100, 40, Math.ceil(source.word_count * 1.35), new Date().toISOString(), 12, 'complete', 'c'.repeat(64));
+    .run(id, sourceId, projectId, 'extract', 'frozen-synthetic-provider', 'fixture-v1', 'a'.repeat(64), 'b'.repeat(64), 100, 40, Math.ceil(source.word_count * 1.35), new Date().toISOString(), 12, 'completed', 'c'.repeat(64));
   return id;
 }
 
@@ -136,10 +136,12 @@ describe('deterministic Source Intelligence spine', () => {
     const { dir, root, context } = tempDatabase();
     try {
       const project = await createSyntheticProject(context.db, root);
-      const vtt = ['WEBVTT', '', '00:00:01.000 --> 00:00:04.000', 'Casey: I will confirm the release route by Friday.'].join('\n');
+      const vtt = ['WEBVTT', 'NOTE Recorded: 2026-07-30', '', '00:00:01.000 --> 00:00:04.000', 'Casey: I will confirm the release route by Friday.'].join('\n');
       const intake = await intakeProjectSource(context.db, project.projectId, { name: 'release.vtt', dataBase64: Buffer.from(vtt).toString('base64') });
       const sourceId = String(intake.sourceId);
-      context.db.prepare('UPDATE source_documents SET event_date = ? WHERE id = ?').run('2026-07-30', sourceId);
+      // The event date is derived from the source itself at intake; nothing may
+      // rewrite immutable evidence afterwards.
+      expect(context.db.prepare('SELECT event_date FROM source_documents WHERE id = ?').get(sourceId)).toMatchObject({ event_date: '2026-07-30' });
       const runId = trustedRun(context.db, project.projectId, sourceId);
       const packet = packetFor(context.db, project.projectId, 'DEMO', sourceId, runId);
 
@@ -164,7 +166,7 @@ describe('deterministic Source Intelligence spine', () => {
       expect((context.db.prepare('SELECT count(*) count FROM project_register_rows WHERE project_id = ?').get(project.projectId) as { count: number }).count).toBe(0);
       expect(applyReviewedChangeset(context.db, frozen.changesetId)).toMatchObject({ appliedOperations: 2 });
       const allocated = context.db.prepare('SELECT allocated_external_id FROM register_change_ops WHERE changeset_id = ? ORDER BY seq').all(frozen.changesetId) as Array<{ allocated_external_id: string }>;
-      expect(allocated.every((row) => /^(?:DEMO-A|SRC)-\d{3}$/.test(row.allocated_external_id))).toBe(true);
+      expect(allocated.every((row) => /^DEMO-(?:A|SRC)-\d{3}$/.test(row.allocated_external_id))).toBe(true);
       let briefCalls = 0;
       const briefProvider = new FakeGroundedBriefProvider(() => {
         briefCalls += 1;
@@ -212,9 +214,8 @@ describe('deterministic Source Intelligence spine', () => {
       const target = String((context.db.prepare("SELECT external_register_id FROM project_register_rows WHERE project_id = ? AND register_name = 'Actions'").get(project.projectId) as { external_register_id: string }).external_register_id);
       recordRegisterEvent(context.db, project.projectId, target, { actor: 'Casey', eventType: 'status-change', field: 'status', newValue: 'completed', reason: 'Verified complete.', occurredAt: '2026-08-02T10:00:00.000Z' });
 
-      const secondText = ['WEBVTT', '', '00:00:01.000 --> 00:00:03.000', 'Casey: The release route remains open.'].join('\n');
+      const secondText = ['WEBVTT', 'NOTE Recorded: 2026-08-01', '', '00:00:01.000 --> 00:00:03.000', 'Casey: The release route remains open.'].join('\n');
       const second = await intakeProjectSource(context.db, project.projectId, { name: 'older-update.vtt', dataBase64: Buffer.from(secondText).toString('base64') });
-      context.db.prepare('UPDATE source_documents SET event_date = ? WHERE id = ?').run('2026-08-01', String(second.sourceId));
       const run2 = trustedRun(context.db, project.projectId, String(second.sourceId));
       const packet2 = packetFor(context.db, project.projectId, 'SAFE', String(second.sourceId), run2);
       const update = packet2.sheets.Actions.rows[0];

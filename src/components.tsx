@@ -106,6 +106,9 @@ const statusTone: Record<string, string> = {
   'on-track': 'good', complete: 'good', achieved: 'good', verified: 'good', decided: 'good', accepted: 'good', free: 'good', completed: 'good',
   watch: 'watch', 'at-risk': 'watch', 'in-progress': 'info', active: 'info', 'in-review': 'info', pending: 'watch', tentative: 'watch', normal: 'neutral',
   blocked: 'bad', critical: 'bad', failed: 'bad', missed: 'bad', overdue: 'bad', busy: 'bad', high: 'bad',
+  // Source-intake processing states (migration 011). `quarantined` used to have no
+  // tone at all because the schema did not admit it.
+  quarantined: 'bad', rejected: 'bad', awaiting_processing: 'watch', processing: 'info', awaiting_review: 'watch', archived: 'neutral',
 };
 
 export function StatusChip({ value, label }: { value: string; label?: string }) {
@@ -154,6 +157,108 @@ export function ActivityList({ activity, projectNames }: { activity: ActivityEve
         </li>
       ))}
     </ol>
+  );
+}
+
+/* ------------------------------------------------------------------------- *
+ * D1 — surfacing extraction failure.
+ *
+ * The pipeline records `processing_stage`, `processing_error` and
+ * `processing_recovery_action` on the intake row, and nothing rendered any of
+ * them: a quarantined source showed a "Processing" chip forever, and the only
+ * way to learn what had happened was to open the database. These components
+ * are pure functions of the row — no effects, no mirrored state.
+ * ------------------------------------------------------------------------- */
+
+export interface SourceProcessingSnapshot {
+  originalFileName?: string;
+  processingStatus: string;
+  processingStage?: string | null;
+  processingError?: string | null;
+  processingRecoveryAction?: string | null;
+  updatedAt?: string | null;
+}
+
+const FAILED_PROCESSING_STATUSES = new Set(['failed', 'quarantined', 'rejected']);
+const FAILED_PROCESSING_STAGES = new Set(['failed', 'quarantined']);
+const OPEN_PROCESSING_STATUSES = new Set(['awaiting_processing', 'processing']);
+
+export interface SourceProcessingView {
+  failed: boolean;
+  inProgress: boolean;
+  needsAttention: boolean;
+  stage: string | null;
+  error: string | null;
+  recovery: string | null;
+  chipValue: string;
+  chipLabel: string;
+}
+
+export function sourceProcessingView(source: SourceProcessingSnapshot): SourceProcessingView {
+  const stage = source.processingStage?.trim() || null;
+  const error = source.processingError?.trim() || null;
+  const recovery = source.processingRecoveryAction?.trim() || null;
+  const failed = FAILED_PROCESSING_STATUSES.has(source.processingStatus) || (stage !== null && FAILED_PROCESSING_STAGES.has(stage));
+  const inProgress = !failed && OPEN_PROCESSING_STATUSES.has(source.processingStatus);
+  const chipValue = failed ? 'failed' : source.processingStatus;
+  return {
+    failed,
+    inProgress,
+    // An in-progress source that has already recorded an error is the stalled case:
+    // it will never move on its own, so it must not read as ordinary progress.
+    needsAttention: failed || (inProgress && error !== null),
+    stage,
+    error,
+    recovery,
+    chipValue,
+    chipLabel: processingLabel(source.processingStatus, stage, failed),
+  };
+}
+
+function processingLabel(status: string, stage: string | null, failed: boolean): string {
+  const base = humanize(status.replaceAll('_', '-'));
+  if (failed && stage && stage !== status) return `${base} - ${humanize(stage.replaceAll('_', '-'))}`;
+  if (!failed && stage) return `${base} - ${humanize(stage.replaceAll('_', '-'))}`;
+  return base;
+}
+
+/** What went wrong and what to do about it, for one source. Renders nothing when nothing is wrong. */
+export function SourceProcessingNotice({ source }: { source: SourceProcessingSnapshot }) {
+  const view = sourceProcessingView(source);
+  if (!view.needsAttention) return null;
+  return (
+    <div className="quarantine-note" role="alert">
+      <strong>{view.failed ? 'This source stopped before it was extracted.' : 'This source reported a problem while processing.'}</strong>
+      <p><strong>What went wrong:</strong> {view.error ?? 'The pipeline recorded no error detail for this failure. Check the source processing job for this file.'}</p>
+      <p><strong>What to do:</strong> {view.recovery ?? 'No recovery action was recorded. Retry this source from the quarantine lane, and if it fails again capture the job error before re-uploading.'}</p>
+      <dl className="inline-details">
+        <div><dt>Stage reached</dt><dd>{view.stage ?? 'Not recorded'}</dd></div>
+        <div><dt>State</dt><dd>{view.chipLabel}</dd></div>
+        {source.updatedAt ? <div><dt>Last change</dt><dd>{formatDateTime(source.updatedAt)}</dd></div> : null}
+      </dl>
+    </div>
+  );
+}
+
+/** The same information gathered to the top of a page, so a failure is seen without scrolling. */
+export function SourceProcessingAlerts({ sources }: { sources: Array<SourceProcessingSnapshot & { id: string; originalFileName: string }> }) {
+  const blocked = sources.filter((source) => sourceProcessingView(source).needsAttention);
+  if (blocked.length === 0) return null;
+  return (
+    <section className="source-processing-alerts" aria-label="Sources that need attention">
+      <h3 className="subhead">{blocked.length === 1 ? '1 source needs attention' : `${blocked.length} sources need attention`}</h3>
+      <div className="stacked-records">
+        {blocked.map((source) => (
+          <article className="stacked-record" key={source.id}>
+            <div className="record-line">
+              <div><h3>{source.originalFileName}</h3><p>Extraction did not complete.</p></div>
+              <StatusChip value={sourceProcessingView(source).chipValue} label={sourceProcessingView(source).chipLabel} />
+            </div>
+            <SourceProcessingNotice source={source} />
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 

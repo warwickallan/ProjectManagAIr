@@ -68,6 +68,10 @@ describe('watched Inbox scanner', () => {
 
     expect((await scanner.scan())[0].status).toBe('observed');
     time = 200;
+    const pending = (await scanner.scan())[0];
+    expect(pending.status).toBe('unstable');
+    expect(pending.detail).toMatch(/Content hash confirmed 1 of 2/);
+    time = 400;
     expect((await scanner.scan())[0].status).toBe('enqueued');
     time = 2_000;
     expect((await scanner.scan())[0].status).toBe('duplicate');
@@ -95,6 +99,8 @@ describe('watched Inbox scanner', () => {
 
     await scanner.scan();
     time = 1;
+    await scanner.scan();
+    time = 2;
     const events = await scanner.scan();
     expect(events.filter((event) => event.status === 'enqueued')).toHaveLength(1);
     expect(events.filter((event) => event.status === 'duplicate')).toHaveLength(1);

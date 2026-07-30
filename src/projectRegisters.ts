@@ -1,7 +1,16 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { fileProjectArtifact } from './projectLifecycle.js';
-import { rebuildProjection, readRowEvidence, readTypedDetails } from './registerProjection.js';
+import { canonicalNormalizedRowJson, canonicalNormalizedValue, canonicalRowJson, canonicalValueJson, rebuildProjection, readRowEvidence, readTypedDetails } from './registerProjection.js';
+
+/**
+ * C11 — the canonical serialisation pair, re-exported here because this is
+ * where the import writer lives. Both writers of
+ * `project_register_row_fields` / `*_row_json` must use these and nothing else.
+ * They are defined in `registerProjection.ts` so that `sourceIntelligence.ts`
+ * can import them without creating a module cycle through `projectLifecycle`.
+ */
+export { canonicalNormalizedRowJson, canonicalNormalizedValue, canonicalRowJson, canonicalValueJson };
 
 const knownRegisters = ['Decisions', 'Actions', 'Risks_Issues', 'Config_Changes', 'Open_Questions', 'Milestones', 'Entities', 'Sources', 'Uncertainty'] as const;
 export type RegisterName = typeof knownRegisters[number];
@@ -70,8 +79,9 @@ function jsonArrayValue(value: unknown): string[] {
   return raw.split(/[;,]/).map((part) => part.trim()).filter(Boolean);
 }
 
+/** The canonical normalisation, under the name this module has always used. */
 function normalizeValue(value: unknown) {
-  return text(value).replace(/\s+/g, ' ').trim().toLowerCase();
+  return canonicalNormalizedValue(value);
 }
 
 function dateOnlyOrNull(value: unknown) {
@@ -125,7 +135,10 @@ function rowSummary(registerName: RegisterName, row: JsonObject) {
     summary,
     status,
     type: text(rowValue(row, ['type', 'kind', 'change_type', 'entity_type', 'source_type'])),
-    owner: text(rowValue(row, ['owner', 'assigned_to', 'lead', 'parked_with', 'decider', 'committed_by', 'made_by'])) || 'Unassigned',
+    // C10 — no sentinel here. An unowned row carries a null owner all the way
+    // through the derived layers; only the operational tables, whose `owner`
+    // column is NOT NULL, substitute the display sentinel.
+    owner: text(rowValue(row, ['owner', 'assigned_to', 'lead', 'parked_with', 'decider', 'committed_by', 'made_by'])),
     dueDate: dueDateValue(registerName, row),
     sourceRef: text(rowValue(row, ['source_ref', 'source', 'source_id'])),
     sourceAnchor: text(rowValue(row, ['source_anchor', 'anchor', 'cell', 'range'])),
@@ -167,15 +180,65 @@ function insertTypedDetails(db: DatabaseSync, projectId: string, registerName: R
 }
 
 function compareRowFields(db: DatabaseSync, importRunId: string, projectId: string, registerName: RegisterName, externalId: string, row: JsonObject, timestamp: string) {
+  const counts = { compared: 0, exact: 0, normalised: 0, mismatched: 0 };
   for (const [fieldName, sourceValue] of Object.entries(row)) {
     const normalizedSource = normalizeValue(sourceValue);
     const field = db.prepare('SELECT original_value_json, normalized_value FROM project_register_row_fields WHERE project_id = ? AND external_register_id = ? AND field_name = ?').get(projectId, externalId, fieldName) as { original_value_json: string; normalized_value: string } | undefined;
     const sqliteValueJson = field?.original_value_json ?? null;
     const normalizedSqlite = field?.normalized_value ?? '';
-    const exact = sqliteValueJson === JSON.stringify(sourceValue);
+    // Both sides go through the canonical serialiser, so a field can only
+    // differ because its content differs, never because two writers spelled the
+    // same value differently (C11).
+    const exact = sqliteValueJson === canonicalValueJson(sourceValue);
     const status = exact ? 'EXACT' : normalizedSource === normalizedSqlite ? 'MATCH_WITH_NORMALISATION' : 'MISMATCH';
-    db.prepare('INSERT INTO project_register_comparison_results (id, import_run_id, project_id, register_name, external_register_id, field_name, comparison_status, source_value_json, sqlite_value_json, normalized_source_value, normalized_sqlite_value, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(randomUUID(), importRunId, projectId, registerName, externalId, fieldName, status, JSON.stringify(sourceValue), sqliteValueJson, normalizedSource, normalizedSqlite, status === 'EXACT' ? 'Exact field match.' : status === 'MATCH_WITH_NORMALISATION' ? 'Matched after whitespace/case normalisation.' : 'Field differs from canonical packet.', timestamp);
+    counts.compared += 1;
+    counts[exact ? 'exact' : status === 'MATCH_WITH_NORMALISATION' ? 'normalised' : 'mismatched'] += 1;
+    db.prepare('INSERT INTO project_register_comparison_results (id, import_run_id, project_id, register_name, external_register_id, field_name, comparison_status, source_value_json, sqlite_value_json, normalized_source_value, normalized_sqlite_value, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(randomUUID(), importRunId, projectId, registerName, externalId, fieldName, status, canonicalValueJson(sourceValue), sqliteValueJson, normalizedSource, normalizedSqlite, status === 'EXACT' ? 'Exact field match.' : status === 'MATCH_WITH_NORMALISATION' ? 'Matched after whitespace/case normalisation.' : 'Field differs from canonical packet.', timestamp);
   }
+  return counts;
+}
+
+/**
+ * C11 (second half) — field-level parity, recomputed rather than frozen.
+ *
+ * `compareRowFields` only ever ran inside `importProjectRegisterBenchmark`, so
+ * the parity figure was a snapshot of import time and said nothing about the
+ * database after a changeset applied. This recomputes it on demand against the
+ * canonical benchmark packet retained on the import run, replacing that run's
+ * comparison rows in place so the Cockpit reads a current number rather than a
+ * historical one. It is read-and-compare only: no register row is modified.
+ */
+export function recomputeRegisterFieldParity(db: DatabaseSync, projectId: string, options: { importRunId?: string; timestamp?: string } = {}) {
+  const run = options.importRunId
+    ? db.prepare("SELECT id, raw_packet_json FROM project_register_import_runs WHERE id = ? AND project_id = ?").get(options.importRunId, projectId) as { id: string; raw_packet_json: string | null } | undefined
+    : db.prepare("SELECT id, raw_packet_json FROM project_register_import_runs WHERE project_id = ? AND status = 'completed' AND packet_type = 'project_register_benchmark' ORDER BY completed_at DESC, id DESC LIMIT 1").get(projectId) as { id: string; raw_packet_json: string | null } | undefined;
+  if (!run) throw new Error('No completed canonical register import run to recompute parity against.');
+  if (!run.raw_packet_json) throw new Error(`Import run ${run.id} did not retain its canonical packet, so parity cannot be recomputed.`);
+  const packet = parsePacket(String(run.raw_packet_json));
+  const timestamp = options.timestamp ?? nowIso();
+  const totals = { compared: 0, exact: 0, normalised: 0, mismatched: 0, rows: 0, missingRows: [] as string[] };
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    db.prepare('DELETE FROM project_register_comparison_results WHERE import_run_id = ? AND project_id = ?').run(run.id, projectId);
+    for (const register of packet.registers) {
+      for (const row of register.rows) {
+        const summary = rowSummary(register.name, row);
+        totals.rows += 1;
+        const present = db.prepare('SELECT 1 FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(projectId, summary.externalId);
+        if (!present) totals.missingRows.push(summary.externalId);
+        const counts = compareRowFields(db, run.id, projectId, register.name, summary.externalId, row, timestamp);
+        totals.compared += counts.compared;
+        totals.exact += counts.exact;
+        totals.normalised += counts.normalised;
+        totals.mismatched += counts.mismatched;
+      }
+    }
+    db.exec('COMMIT;');
+  } catch (error) {
+    db.exec('ROLLBACK;');
+    throw error;
+  }
+  return { importRunId: run.id, projectId, ...totals };
 }
 
 export function importProjectRegisterBenchmark(db: DatabaseSync, projectId: string, input: RegisterImportInput) {
@@ -213,11 +276,11 @@ export function importProjectRegisterBenchmark(db: DatabaseSync, projectId: stri
       for (const row of register.rows) {
         const summary = rowSummary(register.name, row);
         const rowId = registerRowId(projectId, summary.externalId);
-        const normalizedRow = Object.fromEntries(Object.entries(row).map(([key, value]) => [key, normalizeValue(value)]));
-        db.prepare(`INSERT INTO project_register_rows (id, project_id, register_name, external_register_id, title, summary, record_status, record_type, owner, due_date, source_ref, source_anchor, original_status_wording, related_ids_json, supersession_ids_json, work_package_tags_json, import_run_id, source_id, original_row_number, original_tab_name, raw_row_json, normalized_row_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, external_register_id) DO UPDATE SET register_name = excluded.register_name, title = excluded.title, summary = excluded.summary, record_status = excluded.record_status, record_type = excluded.record_type, owner = excluded.owner, due_date = excluded.due_date, source_ref = excluded.source_ref, source_anchor = excluded.source_anchor, original_status_wording = excluded.original_status_wording, related_ids_json = excluded.related_ids_json, supersession_ids_json = excluded.supersession_ids_json, work_package_tags_json = excluded.work_package_tags_json, import_run_id = excluded.import_run_id, source_id = excluded.source_id, original_row_number = excluded.original_row_number, original_tab_name = excluded.original_tab_name, raw_row_json = excluded.raw_row_json, normalized_row_json = excluded.normalized_row_json, updated_at = excluded.updated_at`).run(rowId, projectId, register.name, summary.externalId, summary.title, summary.summary, summary.status, summary.type || null, summary.owner || null, summary.dueDate || null, summary.sourceRef || filedWorkbook?.relativePath || filedBenchmark.relativePath, summary.sourceAnchor || null, summary.originalStatus, JSON.stringify(summary.relatedIds), JSON.stringify(summary.supersessionIds), JSON.stringify(summary.workPackageTags), importRunId, null, summary.rowNumber, summary.tabName, JSON.stringify(row), JSON.stringify(normalizedRow), timestamp, timestamp);
+        const normalizedRowJson = canonicalNormalizedRowJson(row);
+        db.prepare(`INSERT INTO project_register_rows (id, project_id, register_name, external_register_id, title, summary, record_status, record_type, owner, due_date, source_ref, source_anchor, original_status_wording, related_ids_json, supersession_ids_json, work_package_tags_json, import_run_id, source_id, original_row_number, original_tab_name, raw_row_json, normalized_row_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, external_register_id) DO UPDATE SET register_name = excluded.register_name, title = excluded.title, summary = excluded.summary, record_status = excluded.record_status, record_type = excluded.record_type, owner = excluded.owner, due_date = excluded.due_date, source_ref = excluded.source_ref, source_anchor = excluded.source_anchor, original_status_wording = excluded.original_status_wording, related_ids_json = excluded.related_ids_json, supersession_ids_json = excluded.supersession_ids_json, work_package_tags_json = excluded.work_package_tags_json, import_run_id = excluded.import_run_id, source_id = excluded.source_id, original_row_number = excluded.original_row_number, original_tab_name = excluded.original_tab_name, raw_row_json = excluded.raw_row_json, normalized_row_json = excluded.normalized_row_json, updated_at = excluded.updated_at`).run(rowId, projectId, register.name, summary.externalId, summary.title, summary.summary, summary.status, summary.type || null, summary.owner || null, summary.dueDate || null, summary.sourceRef || filedWorkbook?.relativePath || filedBenchmark.relativePath, summary.sourceAnchor || null, summary.originalStatus, JSON.stringify(summary.relatedIds), JSON.stringify(summary.supersessionIds), JSON.stringify(summary.workPackageTags), importRunId, null, summary.rowNumber, summary.tabName, canonicalRowJson(row), normalizedRowJson, timestamp, timestamp);
         db.prepare('DELETE FROM project_register_row_fields WHERE register_row_id = ?').run(rowId);
         for (const [fieldName, value] of Object.entries(row)) {
-          db.prepare('INSERT INTO project_register_row_fields (id, register_row_id, project_id, register_name, external_register_id, field_name, original_value_json, normalized_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(randomUUID(), rowId, projectId, register.name, summary.externalId, fieldName, JSON.stringify(value), normalizeValue(value));
+          db.prepare('INSERT INTO project_register_row_fields (id, register_row_id, project_id, register_name, external_register_id, field_name, original_value_json, normalized_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(randomUUID(), rowId, projectId, register.name, summary.externalId, fieldName, canonicalValueJson(value), canonicalNormalizedValue(value));
         }
         insertTypedDetails(db, projectId, register.name, rowId, row);
         compareRowFields(db, importRunId, projectId, register.name, summary.externalId, row, timestamp);

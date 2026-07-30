@@ -164,11 +164,21 @@ export const inboxSourceSchema = z.object({
   sourceType: z.string().min(1),
   currentExternalPath: z.string().min(1),
   previousExternalPath: z.string().nullable(),
-  processingStatus: z.enum(['awaiting_processing', 'processing', 'awaiting_review', 'verified', 'failed', 'rejected', 'archived']),
+  processingStatus: z.enum(['awaiting_processing', 'processing', 'awaiting_review', 'verified', 'failed', 'quarantined', 'rejected', 'archived']),
   processorProvider: z.string().min(1),
   extractedItemIds: z.array(z.string()),
   reviewState: z.string().min(1),
   verificationState: z.string().min(1),
+  /**
+   * D1 — recovery information the pipeline writes (migration 011) and which,
+   * until now, was readable only by opening the database. `processingStage` is
+   * the finer state behind the coarse `processingStatus` chip, `processingError`
+   * is what went wrong, and `processingRecoveryAction` is what a consultant
+   * should do about it. All three are null for a source that has never failed.
+   */
+  processingStage: z.string().nullable().default(null),
+  processingError: z.string().nullable().default(null),
+  processingRecoveryAction: z.string().nullable().default(null),
   createdAt: isoDateTime,
   updatedAt: isoDateTime,
 });

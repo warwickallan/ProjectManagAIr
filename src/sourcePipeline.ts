@@ -7,10 +7,13 @@ import {
   SOURCE_INTELLIGENCE_CATEGORIES,
   buildStructuredExtractionPrompt,
   estimateTokens,
+  isProviderError,
   sha256,
   type CoverageStatus,
   type ExtractionCoverage,
   type ExtractionWindowInput,
+  type ProviderErrorKind,
+  type ProviderUsage,
   type SourceIntelligenceCategory,
   type SourcePacketRow,
   type StructuredExtractionOutput,
@@ -25,6 +28,25 @@ import {
 } from './sourceIntelligence.js';
 
 export const SOURCE_PIPELINE_CONTRACT = 'projectmanagair-source-intelligence-v1';
+
+/**
+ * How long a claimed job may run before another process may reclaim it. The lease is
+ * renewed after every provider call, so this bounds the time between two calls rather
+ * than the whole extraction; a 2-hour source is allowed 20 minutes of wall clock in
+ * total (§5.3) but no single call may stall for ten minutes without a heartbeat.
+ */
+export const SOURCE_JOB_LEASE_MS = 10 * 60_000;
+/** How often the sweeper looks for jobs whose owner died mid-extraction. */
+export const SOURCE_JOB_SWEEP_INTERVAL_MS = 60_000;
+/** Design §4: "one in-process timer, 30 s, scanning each project's 00_Inbox/Unsorted". */
+export const WATCHED_INBOX_POLL_MS = 30_000;
+/** Bounded per-file enqueue attempts before the watcher stops re-reading a failing file. */
+export const WATCHED_INBOX_MAX_ENQUEUE_ATTEMPTS = 3;
+/** First backoff after a failed enqueue; doubles per attempt. */
+export const WATCHED_INBOX_FAILURE_BACKOFF_MS = 60_000;
+
+/** Identifies this process as a lease holder without recording anything host-identifying. */
+const PROCESS_LEASE_OWNER = `worker:${process.pid}:${randomUUID().slice(0, 8)}`;
 
 export interface ExtractionBudget {
   maxCalls: number;
@@ -52,6 +74,9 @@ export interface SourceExtractionOptions {
   skipWindows?: Array<{ seq: number; reason: string }>;
   markerDismissals?: MarkerDismissal[];
   signal?: AbortSignal;
+  /** Lease owner to keep alive while the extraction runs. Set by {@link runSourceExtractionJob}. */
+  leaseOwner?: string;
+  leaseMs?: number;
 }
 
 interface SourceDocumentRow {
@@ -84,8 +109,30 @@ interface RegisterRow {
   due_date: string | null;
 }
 
+interface SourceJobRow {
+  id: string;
+  source_id: string;
+  project_id: string;
+  status: string;
+  current_stage: string | null;
+  attempt_count: number;
+  max_attempts: number;
+  lease_owner: string | null;
+  lease_expires_at: string | null;
+  packet_id: string | null;
+  changeset_id: string | null;
+  error_message: string | null;
+  error_kind: string | null;
+  recovery_action: string | null;
+  updated_at: string | null;
+}
+
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function isoAfter(ms: number, from = Date.now()): string {
+  return new Date(from + ms).toISOString();
 }
 
 function stable(value: unknown): string {
@@ -161,13 +208,19 @@ function readWindow(db: DatabaseSync, sourceId: string, row: SourceWindowRow): E
   };
 }
 
+export function sourceJobId(projectId: string, contentHash: string): string {
+  return `source-job:${projectId}:${contentHash.slice(0, 16)}`;
+}
+
 export function prepareSourceIntelligenceJob(db: DatabaseSync, input: { projectId: string; intakeSourceId: string; contentHash: string }): string {
-  const jobId = `source-job:${input.projectId}:${input.contentHash.slice(0, 16)}`;
+  const jobId = sourceJobId(input.projectId, input.contentHash);
   const timestamp = nowIso();
   db.prepare(`INSERT INTO source_processing_jobs
     (id, source_id, project_id, provider, status, started_at, completed_at, error_message, structured_output_contract, proposed_change_id, current_stage, attempt_count, max_attempts, queued_at, updated_at, packet_id, changeset_id)
     VALUES (?, ?, ?, 'unassigned', 'queued', ?, NULL, NULL, ?, NULL, 'queued', 0, 2, ?, ?, NULL, NULL)
-    ON CONFLICT(id) DO UPDATE SET status = 'queued', current_stage = 'queued', error_message = NULL, queued_at = excluded.queued_at, updated_at = excluded.updated_at`)
+    ON CONFLICT(id) DO UPDATE SET status = 'queued', current_stage = 'queued', error_message = NULL, error_kind = NULL,
+      error_detail_json = NULL, recovery_action = NULL, last_error_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
+      queued_at = excluded.queued_at, updated_at = excluded.updated_at`)
     .run(jobId, input.intakeSourceId, input.projectId, timestamp, SOURCE_PIPELINE_CONTRACT, timestamp, timestamp);
   return jobId;
 }
@@ -195,22 +248,412 @@ export function dismissSourceMarkers(db: DatabaseSync, sourceId: string, dismiss
   }
 }
 
+/* ------------------------------------------------------------------------------------ *
+ * Failure taxonomy, recovery actions and job/intake visibility (D1, D2, D5)
+ *
+ * Every failure ends in three places a human can actually see: the job row (machine
+ * state), the intake row (what the Cockpit chip renders) and the caller's event stream.
+ * Nothing is swallowed and nothing is left in `processing`.
+ * ------------------------------------------------------------------------------------ */
+
+export type SourceFailureKind =
+  | ProviderErrorKind
+  | 'provider-unavailable'
+  | 'budget'
+  | 'packet-validation'
+  | 'internal';
+
+export interface SourceFailure {
+  kind: SourceFailureKind;
+  message: string;
+  detail: Record<string, unknown> | null;
+  /** Whether an identical retry could plausibly succeed without an operator changing something. */
+  retryable: boolean;
+}
+
+/**
+ * Kinds an automatic retry can never fix. `cli-missing`, `cli-too-old`,
+ * `model-unsupported` and `auth` all need an operator; `budget` needs a bigger budget or
+ * re-windowing; `provider-unavailable` needs the provider to exist.
+ */
+const NON_RETRYABLE_KINDS = new Set<SourceFailureKind>([
+  'cli-missing',
+  'cli-too-old',
+  'model-unsupported',
+  'auth',
+  'provider-unavailable',
+  'budget',
+]);
+
+/** A failure raised by the pipeline itself rather than by a provider. */
+export class SourcePipelineFailure extends Error {
+  readonly kind: SourceFailureKind;
+
+  constructor(kind: SourceFailureKind, message: string) {
+    super(message);
+    this.name = 'SourcePipelineFailure';
+    this.kind = kind;
+  }
+}
+
+/** Errors already written to the job and intake rows, so an outer handler does not double-record. */
+const recordedFailures = new WeakSet<object>();
+
+export function classifySourceFailure(error: unknown): SourceFailure {
+  if (isProviderError(error)) {
+    return {
+      kind: error.kind,
+      message: error.message,
+      detail: error.toJSON(),
+      retryable: !NON_RETRYABLE_KINDS.has(error.kind),
+    };
+  }
+  if (error instanceof SourcePipelineFailure) {
+    return {
+      kind: error.kind,
+      message: error.message,
+      detail: { name: error.name, kind: error.kind, message: error.message },
+      retryable: !NON_RETRYABLE_KINDS.has(error.kind),
+    };
+  }
+  const message = error instanceof Error ? error.message : String(error ?? 'Structured extraction failed.');
+  const packetValidation = /^Packet schema validation failed|no longer satisfies its recorded contract/.test(message);
+  const kind: SourceFailureKind = packetValidation ? 'packet-validation' : 'internal';
+  return {
+    kind,
+    message,
+    detail: { name: error instanceof Error ? error.name : typeof error, kind, message },
+    retryable: !NON_RETRYABLE_KINDS.has(kind),
+  };
+}
+
+export interface RecoveryContext {
+  providerId?: string | null;
+  attemptCount?: number;
+  maxAttempts?: number;
+  willRetry?: boolean;
+}
+
+/** A concrete instruction, never "an error occurred". This string is what the operator acts on. */
+export function recoveryActionFor(failure: SourceFailure, context: RecoveryContext = {}): string {
+  const provider = context.providerId?.trim() || 'the configured extraction provider';
+  const attempts = context.maxAttempts && context.attemptCount
+    ? ` (attempt ${context.attemptCount} of ${context.maxAttempts})`
+    : '';
+  if (context.willRetry) {
+    return `Automatic retry ${Number(context.attemptCount ?? 0) + 1} of ${context.maxAttempts ?? 0} is scheduled; no action is needed unless it also fails.`;
+  }
+  switch (failure.kind) {
+    case 'cli-missing':
+      return `Install ${provider} and make it available on PATH, then retry this source from the quarantine lane.`;
+    case 'cli-too-old':
+      return `Upgrade ${provider} to a version that supports the configured model, then retry this source from the quarantine lane. Retrying without upgrading will fail identically.`;
+    case 'model-unsupported':
+      return `Configure a model that ${provider} supports (or upgrade it), then retry this source from the quarantine lane. Retrying with the same model will fail identically.`;
+    case 'auth':
+      return `Sign in to ${provider} on this machine, then retry this source from the quarantine lane.`;
+    case 'provider-unavailable':
+      return `Make ${provider} available, then retry this source. The normalised source, segments and windows are already stored, so no re-upload is needed. Alternatively record an explicit comprehension skip with a reason.`;
+    case 'transient':
+      return `The provider failed transiently and the retry budget${attempts} is spent. Retry this source from the quarantine lane once the provider is reachable.`;
+    case 'malformed-output':
+      return `${provider} returned output that does not satisfy the extraction contract on every allowed attempt${attempts}. Read error_detail_json for the captured stdout/stderr, then retry this source from the quarantine lane.`;
+    case 'packet-validation':
+      return `The assembled packet failed contract validation. Read the recorded validation issues, correct the extraction skill or provider, then retry this source from the quarantine lane.`;
+    case 'budget':
+      return 'The extraction exceeded its configured budget. Raise the budget for this source type or re-window the source, then retry from the quarantine lane.';
+    case 'unknown':
+    case 'internal':
+    default:
+      return `The extraction stopped with an unclassified error${attempts}. Read error_message and error_detail_json on the job row, then retry this source from the quarantine lane.`;
+  }
+}
+
+function readSourceDocument(db: DatabaseSync, sourceId: string): SourceDocumentRow | undefined {
+  return db.prepare('SELECT * FROM source_documents WHERE id = ?').get(sourceId) as SourceDocumentRow | undefined;
+}
+
+function readJob(db: DatabaseSync, jobId: string): SourceJobRow | undefined {
+  return db.prepare('SELECT * FROM source_processing_jobs WHERE id = ?').get(jobId) as SourceJobRow | undefined;
+}
+
+function jobIdForSource(source: Pick<SourceDocumentRow, 'project_id' | 'content_hash'>): string {
+  return sourceJobId(source.project_id, source.content_hash);
+}
+
+function resolveIntakeId(db: DatabaseSync, source: SourceDocumentRow): string | null {
+  if (source.intake_source_id) return source.intake_source_id;
+  const row = db.prepare('SELECT id FROM project_source_intake WHERE project_id = ? AND content_hash = ? LIMIT 1')
+    .get(source.project_id, source.content_hash) as { id: string } | undefined;
+  return row ? String(row.id) : null;
+}
+
+interface IntakeState {
+  /** Constrained to the values `inboxSourceSchema` accepts; the finer state lives in `processing_stage`. */
+  status?: 'awaiting_processing' | 'processing' | 'awaiting_review' | 'failed';
+  stage: string;
+  error?: string | null;
+  recoveryAction?: string | null;
+}
+
+function setIntakeState(db: DatabaseSync, intakeId: string | null, state: IntakeState): void {
+  if (!intakeId) return;
+  const timestamp = nowIso();
+  db.prepare(`UPDATE project_source_intake
+    SET processing_status = COALESCE(?, processing_status),
+        processing_stage = ?,
+        processing_error = ?,
+        processing_recovery_action = ?,
+        processing_updated_at = ?,
+        updated_at = ?
+    WHERE id = ?`)
+    .run(state.status ?? null, state.stage, state.error ?? null, state.recoveryAction ?? null, timestamp, timestamp, intakeId);
+}
+
 function setJobState(db: DatabaseSync, source: SourceDocumentRow, status: string, stage: string, error: string | null): void {
-  const jobId = `source-job:${source.project_id}:${source.content_hash.slice(0, 16)}`;
+  const timestamp = nowIso();
   db.prepare(`UPDATE source_processing_jobs
     SET status = ?, current_stage = ?, error_message = ?, updated_at = ?,
         completed_at = CASE WHEN ? IN ('quarantined', 'failed') THEN ? ELSE completed_at END
     WHERE id = ?`)
-    .run(status, stage, error, nowIso(), status, nowIso(), jobId);
+    .run(status, stage, error, timestamp, status, timestamp, jobIdForSource(source));
 }
 
-export function quarantineSourceJob(db: DatabaseSync, sourceId: string, reason: string): void {
-  const source = db.prepare('SELECT * FROM source_documents WHERE id = ?').get(sourceId) as SourceDocumentRow | undefined;
+export interface QuarantineOptions {
+  kind?: SourceFailureKind;
+  detail?: Record<string, unknown> | null;
+  recoveryAction?: string;
+  stage?: string;
+}
+
+/**
+ * Terminal, readable failure state. Writes the job row (machine state) *and* the intake
+ * row (what the Cockpit renders) so an extraction failure can never again be invisible
+ * outside the database.
+ */
+export function quarantineSourceJob(db: DatabaseSync, sourceId: string, reason: string, options: QuarantineOptions = {}): void {
+  const source = readSourceDocument(db, sourceId);
   if (!source) throw new Error(`Source document ${sourceId} was not found.`);
-  setJobState(db, source, 'quarantined', 'quarantined', reason);
+  const kind = options.kind ?? 'internal';
+  const recoveryAction = options.recoveryAction
+    ?? recoveryActionFor({ kind, message: reason, detail: options.detail ?? null, retryable: !NON_RETRYABLE_KINDS.has(kind) });
+  const stage = options.stage ?? 'quarantined';
+  const timestamp = nowIso();
+  setJobState(db, source, 'quarantined', stage, reason);
+  db.prepare(`UPDATE source_processing_jobs
+    SET error_kind = ?, error_detail_json = ?, recovery_action = ?, last_error_at = ?, lease_owner = NULL, lease_expires_at = NULL
+    WHERE id = ?`)
+    .run(kind, options.detail ? JSON.stringify(options.detail) : null, recoveryAction, timestamp, jobIdForSource(source));
   db.prepare("UPDATE source_windows SET status = CASE WHEN status = 'pending' THEN 'failed' ELSE status END, explanation = COALESCE(explanation, ?) WHERE source_id = ?")
     .run(reason, sourceId);
+  setIntakeState(db, resolveIntakeId(db, source), {
+    status: 'failed',
+    stage,
+    error: reason,
+    recoveryAction,
+  });
 }
+
+/** Classify, record on both rows, and mark the error so an outer handler does not repeat the work. */
+function recordSourceFailure(db: DatabaseSync, source: SourceDocumentRow, error: unknown, providerId?: string | null): SourceFailure {
+  const failure = classifySourceFailure(error);
+  const job = readJob(db, jobIdForSource(source));
+  const recoveryAction = recoveryActionFor(failure, {
+    providerId,
+    attemptCount: job ? Number(job.attempt_count) : undefined,
+    maxAttempts: job ? Number(job.max_attempts) : undefined,
+  });
+  quarantineSourceJob(db, source.id, failure.message, { kind: failure.kind, detail: failure.detail, recoveryAction });
+  if (error && typeof error === 'object') recordedFailures.add(error as object);
+  return failure;
+}
+
+function failWith(db: DatabaseSync, source: SourceDocumentRow, kind: SourceFailureKind, message: string, providerId?: string | null): SourcePipelineFailure {
+  const error = new SourcePipelineFailure(kind, message);
+  recordSourceFailure(db, source, error, providerId);
+  return error;
+}
+
+/* ------------------------------------------------------------------------------------ *
+ * Leases, crash recovery and bounded retry (D2)
+ * ------------------------------------------------------------------------------------ */
+
+export interface ClaimResult {
+  claimed: boolean;
+  jobId: string;
+  attemptCount: number;
+  maxAttempts: number;
+  detail?: string;
+}
+
+/**
+ * Take ownership of a job for one attempt. A job whose lease is still live and held by
+ * someone else is never stolen; everything else (queued, retry-pending, quarantined on an
+ * explicit retry, or abandoned with an expired lease) is claimable.
+ */
+export function claimSourceJob(db: DatabaseSync, input: { jobId: string; owner?: string; leaseMs?: number; now?: number }): ClaimResult {
+  const owner = input.owner ?? PROCESS_LEASE_OWNER;
+  const leaseMs = input.leaseMs ?? SOURCE_JOB_LEASE_MS;
+  const now = input.now ?? Date.now();
+  const job = readJob(db, input.jobId);
+  if (!job) return { claimed: false, jobId: input.jobId, attemptCount: 0, maxAttempts: 0, detail: 'Job row does not exist.' };
+  const leaseLive = job.lease_expires_at !== null && job.lease_expires_at > new Date(now).toISOString();
+  if (leaseLive && job.lease_owner !== owner) {
+    return {
+      claimed: false,
+      jobId: job.id,
+      attemptCount: Number(job.attempt_count),
+      maxAttempts: Number(job.max_attempts),
+      detail: `Job is leased by ${job.lease_owner} until ${job.lease_expires_at}.`,
+    };
+  }
+  const attemptCount = Number(job.attempt_count) + 1;
+  const timestamp = new Date(now).toISOString();
+  db.prepare(`UPDATE source_processing_jobs
+    SET status = 'processing', current_stage = 'extracting', attempt_count = ?, lease_owner = ?, lease_expires_at = ?,
+        error_message = NULL, error_kind = NULL, error_detail_json = NULL, recovery_action = NULL,
+        completed_at = NULL, updated_at = ?
+    WHERE id = ?`)
+    .run(attemptCount, owner, isoAfter(leaseMs, now), timestamp, job.id);
+  const source = db.prepare('SELECT * FROM source_documents WHERE project_id = ? AND intake_source_id = ?').get(job.project_id, job.source_id) as SourceDocumentRow | undefined;
+  setIntakeState(db, source ? resolveIntakeId(db, source) : job.source_id, { status: 'processing', stage: 'extracting', error: null, recoveryAction: null });
+  return { claimed: true, jobId: job.id, attemptCount, maxAttempts: Number(job.max_attempts) };
+}
+
+/** Heartbeat. Called between provider calls so a long but healthy extraction is never reclaimed. */
+export function renewSourceJobLease(db: DatabaseSync, jobId: string, owner: string, leaseMs = SOURCE_JOB_LEASE_MS): void {
+  db.prepare('UPDATE source_processing_jobs SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND lease_owner = ?')
+    .run(isoAfter(leaseMs), nowIso(), jobId, owner);
+}
+
+export function releaseSourceJobLease(db: DatabaseSync, jobId: string): void {
+  db.prepare('UPDATE source_processing_jobs SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE id = ?')
+    .run(nowIso(), jobId);
+}
+
+/** Move a job back to a retryable state between two automatic attempts. */
+export function markSourceJobForRetry(db: DatabaseSync, jobId: string, detail: string, recoveryAction: string): void {
+  const timestamp = nowIso();
+  db.prepare(`UPDATE source_processing_jobs
+    SET status = 'queued', current_stage = 'retry-pending', recovery_action = ?, error_message = ?,
+        completed_at = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+    WHERE id = ?`)
+    .run(recoveryAction, detail, timestamp, jobId);
+  const job = readJob(db, jobId);
+  if (job) setIntakeState(db, job.source_id, { status: 'processing', stage: 'retry-pending', error: detail, recoveryAction });
+}
+
+export interface ReclaimedSourceJob {
+  jobId: string;
+  projectId: string;
+  intakeSourceId: string;
+  sourceDocumentId: string | null;
+  attemptCount: number;
+  maxAttempts: number;
+  action: 'requeued' | 'quarantined';
+  detail: string;
+}
+
+/** Job statuses that mean "a process is supposed to be working on this right now". */
+const IN_FLIGHT_STATUSES = ['processing', 'extracting', 'assembling', 'validating', 'reconciling', 'applying'];
+
+/**
+ * Crash recovery. A job whose lease expired — or which was left in flight by a process
+ * that died before leases existed — is reclaimed: requeued if it still has retry budget,
+ * quarantined with a reason if it does not. A job with a live lease is never touched.
+ *
+ * Run this once at startup and then periodically; see {@link startSourceJobSweeper}.
+ */
+export function sweepStalledSourceJobs(db: DatabaseSync, options: { now?: number; leaseMs?: number } = {}): ReclaimedSourceJob[] {
+  const now = options.now ?? Date.now();
+  const leaseMs = options.leaseMs ?? SOURCE_JOB_LEASE_MS;
+  const nowIsoValue = new Date(now).toISOString();
+  const graceIso = new Date(now - leaseMs).toISOString();
+  const placeholders = IN_FLIGHT_STATUSES.map(() => '?').join(', ');
+  const stalled = db.prepare(`SELECT * FROM source_processing_jobs
+    WHERE status IN (${placeholders})
+      AND (
+        (lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+        OR (lease_expires_at IS NULL AND COALESCE(updated_at, started_at, '') <= ?)
+      )
+    ORDER BY id`)
+    .all(...IN_FLIGHT_STATUSES, nowIsoValue, graceIso) as unknown as SourceJobRow[];
+
+  const reclaimed: ReclaimedSourceJob[] = [];
+  for (const job of stalled) {
+    const attemptCount = Number(job.attempt_count);
+    const maxAttempts = Number(job.max_attempts);
+    const source = db.prepare('SELECT * FROM source_documents WHERE project_id = ? AND intake_source_id = ?')
+      .get(job.project_id, job.source_id) as SourceDocumentRow | undefined;
+    const exhausted = attemptCount >= maxAttempts;
+    const detail = exhausted
+      ? `Extraction stopped without completing (lease expired at ${job.lease_expires_at ?? 'never claimed'}) and the retry budget of ${maxAttempts} attempts is spent.`
+      : `Extraction stopped without completing (lease expired at ${job.lease_expires_at ?? 'never claimed'}); the job was reclaimed and queued for retry after ${attemptCount} of ${maxAttempts} attempts.`;
+    if (exhausted) {
+      const failure: SourceFailure = { kind: 'transient', message: detail, detail: { reclaimedAt: nowIsoValue, leaseOwner: job.lease_owner, attemptCount, maxAttempts }, retryable: false };
+      const recoveryAction = recoveryActionFor(failure, { attemptCount, maxAttempts });
+      if (source) {
+        quarantineSourceJob(db, source.id, detail, { kind: 'transient', detail: failure.detail, recoveryAction, stage: 'quarantined' });
+      } else {
+        db.prepare(`UPDATE source_processing_jobs
+          SET status = 'quarantined', current_stage = 'quarantined', error_message = ?, error_kind = 'transient',
+              error_detail_json = ?, recovery_action = ?, last_error_at = ?, completed_at = ?, lease_owner = NULL,
+              lease_expires_at = NULL, updated_at = ?
+          WHERE id = ?`)
+          .run(detail, JSON.stringify(failure.detail), recoveryAction, nowIsoValue, nowIsoValue, nowIsoValue, job.id);
+        setIntakeState(db, job.source_id, { status: 'failed', stage: 'quarantined', error: detail, recoveryAction });
+      }
+      reclaimed.push({ jobId: job.id, projectId: job.project_id, intakeSourceId: job.source_id, sourceDocumentId: source?.id ?? null, attemptCount, maxAttempts, action: 'quarantined', detail });
+      continue;
+    }
+    const recoveryAction = `Queued for retry (attempt ${attemptCount + 1} of ${maxAttempts}) after the previous run stopped without releasing its lease. No re-upload is needed.`;
+    db.prepare(`UPDATE source_processing_jobs
+      SET status = 'queued', current_stage = 'reclaimed', error_message = ?, error_kind = 'transient',
+          error_detail_json = ?, recovery_action = ?, last_error_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+          completed_at = NULL, updated_at = ?
+      WHERE id = ?`)
+      .run(detail, JSON.stringify({ reclaimedAt: nowIsoValue, previousLeaseOwner: job.lease_owner, attemptCount, maxAttempts }), recoveryAction, nowIsoValue, nowIsoValue, job.id);
+    setIntakeState(db, job.source_id, { status: 'awaiting_processing', stage: 'reclaimed', error: detail, recoveryAction });
+    reclaimed.push({ jobId: job.id, projectId: job.project_id, intakeSourceId: job.source_id, sourceDocumentId: source?.id ?? null, attemptCount, maxAttempts, action: 'requeued', detail });
+  }
+  return reclaimed;
+}
+
+export interface SourceJobSweeper {
+  sweepNow(): ReclaimedSourceJob[];
+  stop(): void;
+}
+
+/**
+ * Startup + periodic sweep. Call once on server start: it sweeps immediately (crash
+ * recovery for whatever the previous process left behind) and then on a timer.
+ */
+export function startSourceJobSweeper(db: DatabaseSync, options: {
+  intervalMs?: number;
+  leaseMs?: number;
+  onReclaim?: (jobs: ReclaimedSourceJob[]) => void;
+} = {}): SourceJobSweeper {
+  const intervalMs = options.intervalMs ?? SOURCE_JOB_SWEEP_INTERVAL_MS;
+  const sweepNow = () => {
+    const reclaimed = sweepStalledSourceJobs(db, { leaseMs: options.leaseMs });
+    if (reclaimed.length > 0) options.onReclaim?.(reclaimed);
+    return reclaimed;
+  };
+  sweepNow();
+  const timer = setInterval(() => {
+    try {
+      sweepNow();
+    } catch {
+      /* the sweeper must never take the process down; the next tick retries */
+    }
+  }, intervalMs);
+  timer.unref?.();
+  return { sweepNow, stop: () => clearInterval(timer) };
+}
+
+/* ------------------------------------------------------------------------------------ *
+ * Orchestration
+ * ------------------------------------------------------------------------------------ */
 
 function insertRun(db: DatabaseSync, input: {
   source: SourceDocumentRow;
@@ -219,7 +662,7 @@ function insertRun(db: DatabaseSync, input: {
   modelLabel: string;
   skillSha256: string;
   promptSha256: string;
-  usage: { inputTokens: number; outputTokens: number; sourceTokens: number };
+  usage: ProviderUsage;
   startedAt: string;
   durationMs: number;
   status: string;
@@ -229,11 +672,12 @@ function insertRun(db: DatabaseSync, input: {
 }): string {
   const id = `extract:${input.source.id}:${randomUUID()}`;
   db.prepare(`INSERT INTO extraction_runs
-    (id, source_id, project_id, stage, provider_id, model_label, skill_sha256, prompt_sha256, input_tokens, output_tokens, source_tokens, started_at, duration_ms, status, error, output_sha256)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    (id, source_id, project_id, stage, provider_id, model_label, skill_sha256, prompt_sha256, input_tokens, output_tokens, source_tokens, started_at, duration_ms, status, error, output_sha256, input_token_source, output_token_source)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(id, input.source.id, input.projectId, input.stage ?? 'structured-extraction', input.providerId, input.modelLabel,
       input.skillSha256, input.promptSha256, input.usage.inputTokens, input.usage.outputTokens, input.usage.sourceTokens,
-      input.startedAt, input.durationMs, input.status, input.error, input.outputSha256);
+      input.startedAt, input.durationMs, input.status, input.error, input.outputSha256,
+      input.usage.inputTokenSource ?? 'estimated', input.usage.outputTokenSource ?? 'estimated');
   return id;
 }
 
@@ -287,15 +731,100 @@ function assertIdentity(provider: StructuredExtractionProvider): void {
   }
 }
 
+export interface FrozenSourceHandoff {
+  packetId: string;
+  packetHash: string;
+  changesetId: string | null;
+  deterministicHash: string | null;
+  gateVerdict: string;
+  reviewStatus: string | null;
+}
+
+/**
+ * A frozen packet is an immutable artefact (migration 011 makes that a database rule, not
+ * a convention). Re-running extraction over a source that already has one would call a
+ * provider to produce something we are forbidden to overwrite, so every entry point
+ * checks this first and returns the existing handoff with zero provider calls.
+ */
+export function readFrozenSourceHandoff(db: DatabaseSync, sourceId: string): FrozenSourceHandoff | null {
+  const packet = db.prepare('SELECT id, packet_sha256, validation_status FROM extraction_packets WHERE source_id = ? ORDER BY assembled_at DESC LIMIT 1')
+    .get(sourceId) as { id: string; packet_sha256: string; validation_status: string } | undefined;
+  if (!packet) return null;
+  const changeset = db.prepare('SELECT id, deterministic_hash, gate_verdict, review_status FROM register_changesets WHERE packet_id = ? ORDER BY created_at DESC LIMIT 1')
+    .get(packet.id) as { id: string; deterministic_hash: string; gate_verdict: string; review_status: string } | undefined;
+  return {
+    packetId: String(packet.id),
+    packetHash: String(packet.packet_sha256),
+    changesetId: changeset ? String(changeset.id) : null,
+    deterministicHash: changeset ? String(changeset.deterministic_hash) : null,
+    gateVerdict: changeset ? String(changeset.gate_verdict) : String(packet.validation_status),
+    reviewStatus: changeset ? String(changeset.review_status) : null,
+  };
+}
+
+/** Bring a job row into line with an already frozen packet, without touching the packet. */
+function reconcileJobToFrozenPacket(db: DatabaseSync, source: SourceDocumentRow, frozen: FrozenSourceHandoff): void {
+  const timestamp = nowIso();
+  const quarantined = frozen.gateVerdict === 'quarantined';
+  const applied = frozen.reviewStatus === 'applied';
+  const status = quarantined ? 'quarantined' : applied ? 'complete' : 'awaiting_review';
+  db.prepare(`UPDATE source_processing_jobs
+    SET status = ?, current_stage = ?, packet_id = ?, changeset_id = ?, lease_owner = NULL, lease_expires_at = NULL,
+        completed_at = COALESCE(completed_at, ?), updated_at = ?
+    WHERE id = ?`)
+    .run(status, status, frozen.packetId, frozen.changesetId, timestamp, timestamp, jobIdForSource(source));
+  setIntakeState(db, resolveIntakeId(db, source), {
+    status: quarantined ? 'failed' : 'awaiting_review',
+    stage: status,
+    error: quarantined ? 'The frozen packet for this source failed its validation gate; review it in the quarantine lane.' : null,
+    recoveryAction: quarantined ? 'Open the quarantine lane and read the named failing rules on the frozen packet. Extraction is not re-run: the packet is immutable evidence.' : null,
+  });
+}
+
 export async function orchestrateSourceExtraction(db: DatabaseSync, options: SourceExtractionOptions) {
-  const source = db.prepare('SELECT * FROM source_documents WHERE id = ?').get(options.sourceId) as SourceDocumentRow | undefined;
+  const source = readSourceDocument(db, options.sourceId);
   if (!source) throw new Error(`Source document ${options.sourceId} was not found.`);
+  try {
+    return await runSourceExtraction(db, options, source);
+  } catch (error) {
+    if (!error || typeof error !== 'object' || !recordedFailures.has(error as object)) {
+      recordSourceFailure(db, source, error, options.provider?.identity.providerId ?? null);
+    }
+    throw error;
+  }
+}
+
+async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOptions, source: SourceDocumentRow) {
   const project = db.prepare('SELECT id, code FROM projects WHERE id = ?').get(source.project_id) as { id: string; code: string } | undefined;
   if (!project) throw new Error(`Project ${source.project_id} was not found.`);
   const provider = options.provider;
   if (provider) assertIdentity(provider);
-  const budget = resolvedBudget(source.source_type, Number(source.word_count), options.budget);
+  const jobId = jobIdForSource(source);
   const started = Date.now();
+
+  const frozen = readFrozenSourceHandoff(db, source.id);
+  if (frozen) {
+    reconcileJobToFrozenPacket(db, source, frozen);
+    return {
+      packetId: frozen.packetId,
+      packetHash: frozen.packetHash,
+      changesetId: frozen.changesetId,
+      deterministicHash: frozen.deterministicHash,
+      gateVerdict: frozen.gateVerdict,
+      validation: null,
+      sourceId: source.id,
+      provider: provider?.identity ?? { providerId: 'frozen-packet', modelLabel: 'no-call' },
+      runs: [] as string[],
+      calls: 0,
+      inputTokens: 0,
+      sourceTokenRepetition: 0,
+      durationMs: Date.now() - started,
+      suggestedMarkerDismissals: [] as Array<{ markerId: string; reason: string }>,
+      alreadyFrozen: true as const,
+    };
+  }
+
+  const budget = resolvedBudget(source.source_type, Number(source.word_count), options.budget);
   const skillSha256 = sha256(SOURCE_EXTRACTION_SKILL);
   const skipReasons = new Map((options.skipWindows ?? []).map((entry) => [entry.seq, entry.reason.trim()]));
   if ([...skipReasons.values()].some((reason) => !reason)) throw new Error('Skipped windows require an explicit comprehension reason.');
@@ -310,16 +839,15 @@ export async function orchestrateSourceExtraction(db: DatabaseSync, options: Sou
     slices = planExtractionSlices(extractWindows, budget);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Extraction planning exceeded its budget.';
-    quarantineSourceJob(db, source.id, message);
-    throw error;
+    throw failWith(db, source, 'budget', message, provider?.identity.providerId);
   }
   if (slices.length > 0 && (!provider || !provider.isAvailable())) {
     const message = `Provider ${provider?.identity.providerId ?? 'none'} is unavailable; source remains quarantined for retry or explicit comprehension skip.`;
-    quarantineSourceJob(db, source.id, message);
-    throw new Error(message);
+    throw failWith(db, source, 'provider-unavailable', message, provider?.identity.providerId);
   }
 
   setJobState(db, source, 'processing', 'extracting', null);
+  setIntakeState(db, resolveIntakeId(db, source), { status: 'processing', stage: 'extracting', error: null, recoveryAction: null });
   const revision = Number((db.prepare('SELECT revision FROM project_register_revisions WHERE project_id = ?').get(project.id) as { revision: number } | undefined)?.revision ?? 0);
   const registerRows = db.prepare('SELECT register_name, external_register_id, title, record_status, owner, due_date FROM project_register_rows WHERE project_id = ? ORDER BY register_name, external_register_id')
     .all(project.id) as unknown as RegisterRow[];
@@ -358,9 +886,7 @@ export async function orchestrateSourceExtraction(db: DatabaseSync, options: Sou
     const projectedInput = totalInputTokens + estimateTokens(prompt);
     const projectedRepetition = (totalSourceTokens + slice.estimatedSourceTokens) / sourceTokens;
     if (projectedInput > budget.maxInputTokens || projectedRepetition > budget.maxSourceRepetition || Date.now() - started > budget.maxWallClockMs) {
-      const message = `Extraction budget would be exceeded before call ${slice.callIndex}.`;
-      quarantineSourceJob(db, source.id, message);
-      throw new Error(message);
+      throw failWith(db, source, 'budget', `Extraction budget would be exceeded before call ${slice.callIndex}.`, provider!.identity.providerId);
     }
     const callStarted = Date.now();
     const startedAt = nowIso();
@@ -388,13 +914,12 @@ export async function orchestrateSourceExtraction(db: DatabaseSync, options: Sou
       runIds.push(runId);
       completedRunRecorded = true;
       outputs.push(result.output);
+      if (options.leaseOwner) renewSourceJobLease(db, jobId, options.leaseOwner, options.leaseMs);
       if (totalInputTokens > budget.maxInputTokens || totalSourceTokens / sourceTokens > budget.maxSourceRepetition || Date.now() - started > budget.maxWallClockMs) {
-        const message = `Provider telemetry exceeded the configured extraction budget after call ${slice.callIndex}.`;
-        quarantineSourceJob(db, source.id, message);
-        throw new Error(message);
+        throw failWith(db, source, 'budget', `Provider telemetry exceeded the configured extraction budget after call ${slice.callIndex}.`, provider!.identity.providerId);
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Structured provider call failed.';
+      const failure = classifySourceFailure(error);
       if (!completedRunRecorded) {
         insertRun(db, {
           source,
@@ -403,15 +928,17 @@ export async function orchestrateSourceExtraction(db: DatabaseSync, options: Sou
           modelLabel: provider!.identity.modelLabel,
           skillSha256,
           promptSha256,
-          usage: { inputTokens: estimateTokens(prompt), outputTokens: 0, sourceTokens: slice.estimatedSourceTokens },
+          usage: { inputTokens: estimateTokens(prompt), outputTokens: 0, sourceTokens: slice.estimatedSourceTokens, inputTokenSource: 'estimated', outputTokenSource: 'estimated' },
           startedAt,
           durationMs: Date.now() - callStarted,
           status: 'failed',
-          error: message,
+          error: failure.message,
           outputSha256: null,
         });
       }
-      quarantineSourceJob(db, source.id, message);
+      if (!(error && typeof error === 'object' && recordedFailures.has(error as object))) {
+        recordSourceFailure(db, source, error, provider!.identity.providerId);
+      }
       throw error;
     }
   }
@@ -438,7 +965,7 @@ export async function orchestrateSourceExtraction(db: DatabaseSync, options: Sou
       modelLabel: 'code-path-v1',
       skillSha256,
       promptSha256: sha256('deterministic-comprehension-skip-v1'),
-      usage: { inputTokens: 0, outputTokens: 0, sourceTokens: 0 },
+      usage: { inputTokens: 0, outputTokens: 0, sourceTokens: 0, inputTokenSource: 'estimated', outputTokenSource: 'estimated' },
       startedAt: nowIso(),
       durationMs: Date.now() - started,
       status: 'completed',
@@ -454,9 +981,7 @@ export async function orchestrateSourceExtraction(db: DatabaseSync, options: Sou
     const serialized = stable(entry);
     const existing = rowsByRef.get(entry.row.client_ref);
     if (existing && existing.serialized !== serialized) {
-      const message = `Provider emitted conflicting rows for client_ref ${entry.row.client_ref}.`;
-      quarantineSourceJob(db, source.id, message);
-      throw new Error(message);
+      throw failWith(db, source, 'malformed-output', `Provider emitted conflicting rows for client_ref ${entry.row.client_ref}.`, provider?.identity.providerId);
     }
     rowsByRef.set(entry.row.client_ref, { ...entry, serialized });
   }
@@ -495,6 +1020,7 @@ export async function orchestrateSourceExtraction(db: DatabaseSync, options: Sou
     execution: { runs: runIds },
   };
   const handoff = freezePacketAndCreateChangeset(db, packet);
+  finaliseJobAfterFreeze(db, source, handoff.gateVerdict);
   return {
     ...handoff,
     sourceId: source.id,
@@ -505,9 +1031,243 @@ export async function orchestrateSourceExtraction(db: DatabaseSync, options: Sou
     sourceTokenRepetition: Number((totalSourceTokens / sourceTokens).toFixed(3)),
     durationMs: Date.now() - started,
     suggestedMarkerDismissals: outputs.flatMap((output) => output.markerDismissals ?? []),
+    alreadyFrozen: false as const,
   };
 }
 
+/**
+ * `freezePacketAndCreateChangeset` sets the job status; this releases the lease and moves
+ * the intake row with it, so the two never disagree about what happened.
+ */
+function finaliseJobAfterFreeze(db: DatabaseSync, source: SourceDocumentRow, gateVerdict: string): void {
+  releaseSourceJobLease(db, jobIdForSource(source));
+  if (gateVerdict === 'quarantined') {
+    const reason = 'The frozen packet failed its validation gate; the named blocking rules are recorded on the changeset.';
+    const recoveryAction = 'Open the quarantine lane and read the named failing rules. The packet is immutable evidence and is not re-extracted; correct the source or the extraction skill and ingest a corrected source.';
+    db.prepare('UPDATE source_processing_jobs SET error_kind = ?, recovery_action = ?, last_error_at = ?, updated_at = ? WHERE id = ?')
+      .run('packet-validation', recoveryAction, nowIso(), nowIso(), jobIdForSource(source));
+    setIntakeState(db, resolveIntakeId(db, source), { status: 'failed', stage: 'quarantined', error: reason, recoveryAction });
+    return;
+  }
+  setIntakeState(db, resolveIntakeId(db, source), { status: 'awaiting_review', stage: 'awaiting_review', error: null, recoveryAction: null });
+}
+
+/* ------------------------------------------------------------------------------------ *
+ * Worker entry points (D1, D2)
+ * ------------------------------------------------------------------------------------ */
+
+export type SourcePipelineEvent =
+  | { type: 'claimed'; jobId: string; sourceId: string; attempt: number; maxAttempts: number }
+  | { type: 'completed'; jobId: string; sourceId: string; packetId: string; changesetId: string | null; gateVerdict: string; calls: number }
+  | { type: 'failed'; jobId: string; sourceId: string; kind: SourceFailureKind; message: string; recoveryAction: string; attempt: number; maxAttempts: number; willRetry: boolean }
+  | { type: 'skipped'; jobId: string; sourceId: string; reason: 'lease-held' | 'already-frozen' | 'no-source' ; detail: string };
+
+function defaultPipelineLogger(event: SourcePipelineEvent): void {
+  if (event.type === 'failed') {
+    console.error(`[source-pipeline] ${event.jobId} ${event.kind}: ${event.message}\n  recovery: ${event.recoveryAction}`);
+  }
+}
+
+export interface SourceJobRunOptions {
+  /** `source_documents.id`. */
+  sourceId: string;
+  provider?: StructuredExtractionProvider;
+  budget?: Partial<ExtractionBudget>;
+  skipWindows?: Array<{ seq: number; reason: string }>;
+  markerDismissals?: MarkerDismissal[];
+  signal?: AbortSignal;
+  owner?: string;
+  leaseMs?: number;
+  /** Overrides and persists `source_processing_jobs.max_attempts` for this job. */
+  maxAttempts?: number;
+  onEvent?: (event: SourcePipelineEvent) => void;
+}
+
+export type SourceExtractionHandoff = Awaited<ReturnType<typeof runSourceExtraction>>;
+
+export interface SourceJobRunResult {
+  ok: boolean;
+  status: 'completed' | 'already-frozen' | 'quarantined' | 'lease-held' | 'blocked';
+  jobId: string;
+  sourceId: string;
+  providerCalls: number;
+  attempts: number;
+  kind?: SourceFailureKind;
+  message?: string;
+  recoveryAction?: string | null;
+  extraction?: SourceExtractionHandoff;
+}
+
+/**
+ * The worker entry point. Claims a lease, runs the extraction, retries the failures that
+ * a retry can fix up to `max_attempts`, and always leaves the job in a state a human can
+ * read. It resolves rather than rejects: the caller cannot accidentally swallow a failure
+ * with `.catch(() => undefined)`, because the failure is in the result and in the event.
+ */
+export async function runSourceExtractionJob(db: DatabaseSync, options: SourceJobRunOptions): Promise<SourceJobRunResult> {
+  const emit = options.onEvent ?? defaultPipelineLogger;
+  const owner = options.owner ?? PROCESS_LEASE_OWNER;
+  const leaseMs = options.leaseMs ?? SOURCE_JOB_LEASE_MS;
+  const source = readSourceDocument(db, options.sourceId);
+  if (!source) {
+    const detail = `Source document ${options.sourceId} was not found; nothing to extract.`;
+    emit({ type: 'skipped', jobId: '', sourceId: options.sourceId, reason: 'no-source', detail });
+    return { ok: false, status: 'blocked', jobId: '', sourceId: options.sourceId, providerCalls: 0, attempts: 0, message: detail };
+  }
+  const jobId = jobIdForSource(source);
+  if (options.maxAttempts && options.maxAttempts > 0) {
+    db.prepare('UPDATE source_processing_jobs SET max_attempts = ? WHERE id = ?').run(options.maxAttempts, jobId);
+  }
+
+  let providerCalls = 0;
+  let attempts = 0;
+  for (;;) {
+    const frozen = readFrozenSourceHandoff(db, source.id);
+    if (frozen) {
+      reconcileJobToFrozenPacket(db, source, frozen);
+      const detail = `Packet ${frozen.packetId} is already frozen for this source; extraction is not re-run and no provider is called.`;
+      emit({ type: 'skipped', jobId, sourceId: source.id, reason: 'already-frozen', detail });
+      return { ok: true, status: 'already-frozen', jobId, sourceId: source.id, providerCalls, attempts, message: detail };
+    }
+    const claim = claimSourceJob(db, { jobId, owner, leaseMs });
+    if (!claim.claimed) {
+      emit({ type: 'skipped', jobId, sourceId: source.id, reason: 'lease-held', detail: claim.detail ?? 'Job could not be claimed.' });
+      return { ok: false, status: 'lease-held', jobId, sourceId: source.id, providerCalls, attempts, message: claim.detail };
+    }
+    attempts = claim.attemptCount;
+    emit({ type: 'claimed', jobId, sourceId: source.id, attempt: claim.attemptCount, maxAttempts: claim.maxAttempts });
+    try {
+      const extraction = await orchestrateSourceExtraction(db, {
+        sourceId: source.id,
+        provider: options.provider,
+        budget: options.budget,
+        skipWindows: options.skipWindows,
+        markerDismissals: options.markerDismissals,
+        signal: options.signal,
+        leaseOwner: owner,
+        leaseMs,
+      });
+      providerCalls += extraction.calls;
+      releaseSourceJobLease(db, jobId);
+      emit({
+        type: 'completed',
+        jobId,
+        sourceId: source.id,
+        packetId: extraction.packetId,
+        changesetId: extraction.changesetId,
+        gateVerdict: extraction.gateVerdict,
+        calls: extraction.calls,
+      });
+      return { ok: true, status: 'completed', jobId, sourceId: source.id, providerCalls, attempts, extraction };
+    } catch (error) {
+      const failure = classifySourceFailure(error);
+      releaseSourceJobLease(db, jobId);
+      const willRetry = failure.retryable && claim.attemptCount < claim.maxAttempts;
+      const recoveryAction = recoveryActionFor(failure, {
+        providerId: options.provider?.identity.providerId,
+        attemptCount: claim.attemptCount,
+        maxAttempts: claim.maxAttempts,
+        willRetry,
+      });
+      emit({
+        type: 'failed',
+        jobId,
+        sourceId: source.id,
+        kind: failure.kind,
+        message: failure.message,
+        recoveryAction,
+        attempt: claim.attemptCount,
+        maxAttempts: claim.maxAttempts,
+        willRetry,
+      });
+      if (!willRetry) {
+        const job = readJob(db, jobId);
+        return {
+          ok: false,
+          status: 'quarantined',
+          jobId,
+          sourceId: source.id,
+          providerCalls,
+          attempts,
+          kind: failure.kind,
+          message: failure.message,
+          recoveryAction: job?.recovery_action ?? recoveryAction,
+        };
+      }
+      markSourceJobForRetry(db, jobId, failure.message, recoveryAction);
+    }
+  }
+}
+
+export interface RetrySourceJobInput {
+  /** `source-job:<projectId>:<contentHash16>`. Either this or `sourceId` is required. */
+  jobId?: string;
+  /** `source_documents.id` (SRC-nnn) or `project_source_intake.id`. */
+  sourceId?: string;
+  provider?: StructuredExtractionProvider;
+  budget?: Partial<ExtractionBudget>;
+  /** Default true: an operator pressing Retry has asserted the cause is fixed. */
+  resetAttempts?: boolean;
+  maxAttempts?: number;
+  owner?: string;
+  leaseMs?: number;
+  signal?: AbortSignal;
+  onEvent?: (event: SourcePipelineEvent) => void;
+}
+
+function resolveJobAndSource(db: DatabaseSync, input: RetrySourceJobInput): { jobId: string; source: SourceDocumentRow | null; job: SourceJobRow | null } {
+  if (input.jobId) {
+    const job = readJob(db, input.jobId) ?? null;
+    const source = job
+      ? (db.prepare('SELECT * FROM source_documents WHERE project_id = ? AND intake_source_id = ?').get(job.project_id, job.source_id) as SourceDocumentRow | undefined) ?? null
+      : null;
+    return { jobId: input.jobId, source, job };
+  }
+  if (!input.sourceId) throw new Error('retrySourceJob requires either a jobId or a sourceId.');
+  const direct = readSourceDocument(db, input.sourceId);
+  const source = direct
+    ?? (db.prepare('SELECT * FROM source_documents WHERE intake_source_id = ? LIMIT 1').get(input.sourceId) as SourceDocumentRow | undefined)
+    ?? null;
+  if (source) return { jobId: jobIdForSource(source), source, job: readJob(db, jobIdForSource(source)) ?? null };
+  const job = db.prepare('SELECT * FROM source_processing_jobs WHERE source_id = ? ORDER BY updated_at DESC LIMIT 1').get(input.sourceId) as SourceJobRow | undefined;
+  return { jobId: job ? String(job.id) : '', source: null, job: job ?? null };
+}
+
+/**
+ * Operator-facing retry for a quarantined or stalled job. Idempotent: a job whose packet
+ * is already frozen is reconciled and returned with **zero** provider calls; a job with no
+ * frozen packet is re-extracted from its stored segments and windows, so no re-upload is
+ * needed and the content-hash dedup is never in the way.
+ */
+export async function retrySourceJob(db: DatabaseSync, input: RetrySourceJobInput): Promise<SourceJobRunResult> {
+  const { jobId, source, job } = resolveJobAndSource(db, input);
+  if (!source) {
+    const message = job
+      ? `Job ${jobId} has no normalised source document; the source must be re-ingested before extraction can run.`
+      : `No source processing job was found for ${input.jobId ?? input.sourceId}.`;
+    input.onEvent?.({ type: 'skipped', jobId, sourceId: input.sourceId ?? '', reason: 'no-source', detail: message });
+    return { ok: false, status: 'blocked', jobId, sourceId: input.sourceId ?? '', providerCalls: 0, attempts: 0, message };
+  }
+  if (input.resetAttempts !== false) {
+    db.prepare('UPDATE source_processing_jobs SET attempt_count = 0 WHERE id = ?').run(jobId);
+  }
+  return runSourceExtractionJob(db, {
+    sourceId: source.id,
+    provider: input.provider,
+    budget: input.budget,
+    maxAttempts: input.maxAttempts,
+    owner: input.owner,
+    leaseMs: input.leaseMs,
+    signal: input.signal,
+    onEvent: input.onEvent,
+  });
+}
+
+/**
+ * Operator-facing "this source carries no project-governance content" path. It produces a
+ * reviewable source-only packet with no model call, and goes through the same job
+ * bookkeeping as an extraction. Wire it to a route next to the retry route.
+ */
 export async function skipSourceAfterComprehension(db: DatabaseSync, input: { sourceId: string; reason: string; markerDismissals?: MarkerDismissal[] }) {
   const reason = input.reason.trim();
   if (!reason) throw new Error('Comprehension skip requires an explicit reason.');
@@ -519,6 +1279,11 @@ export async function skipSourceAfterComprehension(db: DatabaseSync, input: { so
     markerDismissals: input.markerDismissals,
   });
 }
+
+/* ------------------------------------------------------------------------------------ *
+ * Watched Inbox (D3, D11, D12)
+ * ------------------------------------------------------------------------------------ */
+
 export interface WatchedInboxEnqueueResult {
   duplicate?: boolean;
   sourceId?: string;
@@ -539,14 +1304,88 @@ export interface WatchedInboxScannerOptions {
   stabilityMs?: number;
   debounceMs?: number;
   minimumStableScans?: number;
+  /**
+   * Consecutive scans that must produce the same content hash before a file is enqueued.
+   * Two means the bytes are read twice, a poll interval apart, and only enqueued if both
+   * reads agree — a stalled writer cannot get a truncated file filed as an immutable
+   * original (D11).
+   */
+  requiredHashConfirmations?: number;
+  /** Bounded enqueue attempts per file before the watcher stops re-reading it (D3). */
+  maxEnqueueAttempts?: number;
+  failureBackoffMs?: number;
   now?: () => number;
+  onEvents?: (events: WatchedInboxEvent[]) => void;
 }
 
 export interface WatchedInboxEvent {
   path: string;
-  status: 'observed' | 'unstable' | 'enqueued' | 'duplicate' | 'ignored' | 'failed';
+  status: 'observed' | 'unstable' | 'enqueued' | 'duplicate' | 'ignored' | 'failed' | 'abandoned' | 'inbox-missing' | 'inbox-ready';
   contentHash?: string;
   detail?: string;
+}
+
+interface EnqueueFailureState {
+  attempts: number;
+  nextAttemptAt: number;
+  lastMessage: string;
+  abandoned: boolean;
+  reported: boolean;
+}
+
+const ZIP_EOCD_SIGNATURE = Buffer.from([0x50, 0x4b, 0x05, 0x06]);
+const ZIP_LOCAL_SIGNATURE = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+
+function zipCompletenessIssue(bytes: Buffer): string | null {
+  if (bytes.length < 22) return 'the container is shorter than an empty ZIP archive, so the copy is incomplete';
+  if (!bytes.subarray(0, 4).equals(ZIP_LOCAL_SIGNATURE) && !bytes.subarray(0, 4).equals(ZIP_EOCD_SIGNATURE)) {
+    return 'the file does not begin with a ZIP local-file header, so it is not a complete Office container';
+  }
+  const tail = bytes.subarray(Math.max(0, bytes.length - 66_000));
+  const index = tail.lastIndexOf(ZIP_EOCD_SIGNATURE);
+  if (index < 0) return 'the ZIP end-of-central-directory record is missing, so the copy is still in progress or truncated';
+  const eocd = bytes.length - tail.length + index;
+  if (bytes.length - eocd < 22) return 'the ZIP end-of-central-directory record is itself truncated';
+  const commentLength = bytes.readUInt16LE(eocd + 20);
+  if (eocd + 22 + commentLength !== bytes.length) return 'the ZIP end-of-central-directory record does not describe the whole file';
+  const directorySize = bytes.readUInt32LE(eocd + 12);
+  const directoryOffset = bytes.readUInt32LE(eocd + 16);
+  if (directoryOffset !== 0xffff_ffff && directorySize !== 0xffff_ffff && directoryOffset + directorySize > bytes.length) {
+    return 'the ZIP central directory extends past the end of the file, so the copy is truncated';
+  }
+  return null;
+}
+
+/**
+ * Structural completeness, per source type (D11).
+ *
+ * Quiet-period and hash-stability rules only prove that nothing changed while we were
+ * looking. A writer that stalls for several polls defeats both of them, which is how a
+ * truncated document was filed as an immutable original. For every format that carries
+ * its own end-of-file evidence, check it: a truncated `.docx` has no ZIP
+ * end-of-central-directory record, a truncated `.vtt` ends inside a cue, a truncated
+ * `.eml` has no header/body separator. Plain text carries no such evidence, so it relies
+ * on the quiet-period and hash rules alone — which is stated, not hidden.
+ */
+export function sourceCompletenessIssue(fileName: string, bytes: Buffer): string | null {
+  if (bytes.length === 0) return 'the file is empty';
+  const extension = path.extname(fileName).toLowerCase();
+  if (['.docx', '.xlsx', '.pptx', '.zip'].includes(extension)) return zipCompletenessIssue(bytes);
+  if (extension === '.vtt') {
+    const text = bytes.toString('utf8').replace(/^﻿/, '');
+    if (!/^WEBVTT/.test(text.trimStart())) return 'the transcript does not start with the WEBVTT signature, so the copy is incomplete';
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
+    const last = lines.at(-1) ?? '';
+    if (last.includes('-->')) return 'the transcript ends on a cue-timing line with no cue text, so the copy is truncated';
+    if (/^\d{1,2}:\d{2}(:\d{2})?([.,]\d{0,3})?$/.test(last)) return 'the transcript ends inside a timestamp, so the copy is truncated';
+    return null;
+  }
+  if (extension === '.eml') {
+    const text = bytes.toString('utf8');
+    if (!/\r?\n\r?\n/.test(text)) return 'the message has no header/body separator, so the copy is truncated';
+    return null;
+  }
+  return null;
 }
 
 interface SeenFile {
@@ -555,7 +1394,12 @@ interface SeenFile {
   unchangedSince: number;
   stableScans: number;
   lastEnqueuedAt: number | null;
-  lastHash: string | null;
+  /** Hash observed on a previous scan, awaiting confirmation by an identical re-read. */
+  pendingHash: string | null;
+  hashConfirmations: number;
+  failure: EnqueueFailureState | null;
+  /** Bytes refused as structurally incomplete; cleared when the file changes on disk. */
+  rejected: { hash: string; reason: string; reported: boolean } | null;
 }
 
 const ignoredFile = /(^~\$)|(\.(?:tmp|partial|crdownload|download)$)/i;
@@ -574,65 +1418,175 @@ async function listFiles(root: string): Promise<string[]> {
   return files.sort((left, right) => left.localeCompare(right));
 }
 
+function isMissingPathError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
 export class WatchedInboxScanner {
   private readonly seen = new Map<string, SeenFile>();
   private readonly processedHashes = new Set<string>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private scanning = false;
+  private inboxPresent: boolean | null = null;
   private readonly stabilityMs: number;
   private readonly debounceMs: number;
   private readonly minimumStableScans: number;
+  private readonly requiredHashConfirmations: number;
+  private readonly maxEnqueueAttempts: number;
+  private readonly failureBackoffMs: number;
   private readonly now: () => number;
 
   constructor(private readonly options: WatchedInboxScannerOptions) {
-    this.stabilityMs = options.stabilityMs ?? 1_500;
+    this.stabilityMs = options.stabilityMs ?? 5_000;
     this.debounceMs = options.debounceMs ?? 1_000;
     this.minimumStableScans = options.minimumStableScans ?? 2;
+    this.requiredHashConfirmations = Math.max(1, options.requiredHashConfirmations ?? 2);
+    this.maxEnqueueAttempts = Math.max(1, options.maxEnqueueAttempts ?? WATCHED_INBOX_MAX_ENQUEUE_ATTEMPTS);
+    this.failureBackoffMs = options.failureBackoffMs ?? WATCHED_INBOX_FAILURE_BACKOFF_MS;
     this.now = options.now ?? Date.now;
+  }
+
+  /** True once the inbox directory has been seen; false while it is still absent. */
+  get inboxAvailable(): boolean {
+    return this.inboxPresent === true;
   }
 
   async scan(): Promise<WatchedInboxEvent[]> {
     if (this.scanning) return [];
     this.scanning = true;
     const events: WatchedInboxEvent[] = [];
+    const inboxPath = path.resolve(this.options.inboxPath);
     try {
-      const files = await listFiles(path.resolve(this.options.inboxPath));
+      let files: string[];
+      try {
+        files = await listFiles(inboxPath);
+      } catch (error) {
+        if (!isMissingPathError(error)) throw error;
+        // D12: the folder may not exist yet (OneDrive still mounting). Keep polling and
+        // say so, instead of dropping the project silently until the next restart.
+        if (this.inboxPresent !== false) {
+          events.push({ path: inboxPath, status: 'inbox-missing', detail: 'Inbox folder is not present yet; the watcher will keep polling and start ingesting when it appears.' });
+        }
+        this.inboxPresent = false;
+        this.seen.clear();
+        return events;
+      }
+      if (this.inboxPresent === false) {
+        events.push({ path: inboxPath, status: 'inbox-ready', detail: 'Inbox folder appeared; scanning resumed.' });
+      }
+      this.inboxPresent = true;
       const present = new Set(files);
-      for (const knownPath of this.seen.keys()) if (!present.has(knownPath)) this.seen.delete(knownPath);
+      for (const knownPath of [...this.seen.keys()]) if (!present.has(knownPath)) this.seen.delete(knownPath);
       for (const filePath of files) {
         if (ignoredFile.test(path.basename(filePath))) {
           events.push({ path: filePath, status: 'ignored', detail: 'Temporary or incomplete file name.' });
           continue;
         }
-        const before = await stat(filePath);
+        let before: Awaited<ReturnType<typeof stat>>;
+        try {
+          before = await stat(filePath);
+        } catch (error) {
+          if (isMissingPathError(error)) {
+            this.seen.delete(filePath);
+            continue;
+          }
+          throw error;
+        }
         const observedAt = this.now();
         const previous = this.seen.get(filePath);
         if (!previous || previous.size !== before.size || previous.mtimeMs !== before.mtimeMs) {
-          this.seen.set(filePath, { size: before.size, mtimeMs: before.mtimeMs, unchangedSince: observedAt, stableScans: 1, lastEnqueuedAt: previous?.lastEnqueuedAt ?? null, lastHash: null });
-          events.push({ path: filePath, status: 'observed' });
+          this.seen.set(filePath, {
+            size: before.size,
+            mtimeMs: before.mtimeMs,
+            unchangedSince: observedAt,
+            stableScans: 1,
+            lastEnqueuedAt: previous?.lastEnqueuedAt ?? null,
+            pendingHash: null,
+            hashConfirmations: 0,
+            failure: null,
+            rejected: null,
+          });
+          events.push({ path: filePath, status: 'observed', detail: previous ? 'Size or mtime changed; the stability window restarted.' : undefined });
           continue;
         }
         previous.stableScans += 1;
         if (observedAt - previous.unchangedSince < this.stabilityMs || previous.stableScans < this.minimumStableScans) {
-          events.push({ path: filePath, status: 'unstable' });
+          events.push({ path: filePath, status: 'unstable', detail: 'Size and mtime have not been unchanged for long enough.' });
           continue;
         }
-        if (previous.lastEnqueuedAt !== null && observedAt - previous.lastEnqueuedAt < this.debounceMs) {
+        // D3/D11: a file already refused or abandoned for these exact bytes must not be
+        // re-read and re-hashed on every scan. All three gates are checked before any I/O;
+        // any change to size or mtime resets the record above and re-opens the question.
+        if (previous.rejected) continue;
+        if (previous.failure?.abandoned) {
+          if (!previous.failure.reported) {
+            previous.failure.reported = true;
+            events.push({ path: filePath, status: 'abandoned', detail: `Abandoned after ${previous.failure.attempts} failed enqueue attempts: ${previous.failure.lastMessage}. Modify or re-drop the file, or use the Cockpit upload, to try again.` });
+          }
+          continue;
+        }
+        if (previous.failure && observedAt < previous.failure.nextAttemptAt) {
+          events.push({ path: filePath, status: 'unstable', detail: `Backing off for ${previous.failure.nextAttemptAt - observedAt}ms after ${previous.failure.attempts} failed enqueue attempts.` });
+          continue;
+        }
+        if (previous.lastEnqueuedAt !== null && !previous.failure && observedAt - previous.lastEnqueuedAt < this.debounceMs) {
           events.push({ path: filePath, status: 'unstable', detail: 'Debounce interval has not elapsed.' });
           continue;
         }
-        const bytes = await readFile(filePath);
-        const after = await stat(filePath);
-        if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
-          this.seen.set(filePath, { size: after.size, mtimeMs: after.mtimeMs, unchangedSince: observedAt, stableScans: 1, lastEnqueuedAt: previous.lastEnqueuedAt, lastHash: null });
+        let bytes: Buffer;
+        try {
+          bytes = await readFile(filePath);
+        } catch (error) {
+          if (isMissingPathError(error)) {
+            this.seen.delete(filePath);
+            continue;
+          }
+          throw error;
+        }
+        const after = await stat(filePath).catch(() => null);
+        if (!after || after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+          this.seen.set(filePath, {
+            size: after?.size ?? before.size,
+            mtimeMs: after?.mtimeMs ?? before.mtimeMs,
+            unchangedSince: observedAt,
+            stableScans: 1,
+            lastEnqueuedAt: previous.lastEnqueuedAt,
+            pendingHash: null,
+            hashConfirmations: 0,
+            failure: previous.failure,
+            rejected: null,
+          });
           events.push({ path: filePath, status: 'unstable', detail: 'File changed while being read.' });
           continue;
         }
         const contentHash = createHash('sha256').update(bytes).digest('hex');
-        previous.lastHash = contentHash;
-        const alreadyKnown = this.processedHashes.has(contentHash) || Boolean(await this.options.isKnownHash?.(contentHash));
+        // D11: size and mtime can both sit still while a writer is stalled mid-copy, and a
+        // re-stat only catches a change *during* the read. Requiring the same hash from two
+        // reads a poll apart means a truncated file is never filed as an immutable original.
+        if (previous.pendingHash !== contentHash) {
+          previous.pendingHash = contentHash;
+          previous.hashConfirmations = 1;
+        } else {
+          previous.hashConfirmations += 1;
+        }
+        if (previous.hashConfirmations < this.requiredHashConfirmations) {
+          events.push({ path: filePath, status: 'unstable', contentHash, detail: `Content hash confirmed ${previous.hashConfirmations} of ${this.requiredHashConfirmations} times.` });
+          continue;
+        }
+        // D11: quiet bytes are not necessarily whole bytes. A writer that stalls for
+        // several polls passes every timing rule, so the bytes themselves must show that
+        // the file is complete before it can become an immutable original.
+        const completeness = sourceCompletenessIssue(filePath, bytes);
+        if (completeness) {
+          previous.rejected = { hash: contentHash, reason: completeness, reported: true };
+          events.push({ path: filePath, status: 'failed', contentHash, detail: `Refused as an incomplete source: ${completeness}. These bytes will not be filed; the file is re-checked when it changes on disk.` });
+          continue;
+        }
+        const alreadyKnown =this.processedHashes.has(contentHash) || Boolean(await this.options.isKnownHash?.(contentHash));
         if (alreadyKnown) {
           previous.lastEnqueuedAt = observedAt;
+          previous.failure = null;
           this.processedHashes.add(contentHash);
           events.push({ path: filePath, status: 'duplicate', contentHash });
           continue;
@@ -643,10 +1597,24 @@ export class WatchedInboxScanner {
             dataBase64: bytes.toString('base64'),
           });
           previous.lastEnqueuedAt = observedAt;
+          previous.failure = null;
           this.processedHashes.add(contentHash);
           events.push({ path: filePath, status: result.duplicate ? 'duplicate' : 'enqueued', contentHash });
         } catch (error) {
-          events.push({ path: filePath, status: 'failed', contentHash, detail: error instanceof Error ? error.message : 'Inbox enqueue failed.' });
+          const message = error instanceof Error ? error.message : 'Inbox enqueue failed.';
+          const attempts = (previous.failure?.attempts ?? 0) + 1;
+          const abandoned = attempts >= this.maxEnqueueAttempts;
+          const backoff = this.failureBackoffMs * 2 ** (attempts - 1);
+          previous.failure = { attempts, nextAttemptAt: observedAt + backoff, lastMessage: message, abandoned, reported: false };
+          previous.lastEnqueuedAt = observedAt;
+          events.push({
+            path: filePath,
+            status: 'failed',
+            contentHash,
+            detail: abandoned
+              ? `Enqueue failed on attempt ${attempts} of ${this.maxEnqueueAttempts}; no further attempts will be made for these bytes: ${message}`
+              : `Enqueue failed on attempt ${attempts} of ${this.maxEnqueueAttempts}; retrying no sooner than ${backoff}ms: ${message}`,
+          });
         }
       }
       return events;
@@ -655,12 +1623,19 @@ export class WatchedInboxScanner {
     }
   }
 
-  start(intervalMs = 1_000, onEvents?: (events: WatchedInboxEvent[]) => void): void {
+  /** Design §4: a 30-second poll, not the 1-second hot loop this defaulted to. */
+  start(intervalMs = WATCHED_INBOX_POLL_MS, onEvents?: (events: WatchedInboxEvent[]) => void): void {
     if (this.timer) return;
+    const sink = onEvents ?? this.options.onEvents ?? defaultWatcherLogger;
     this.timer = setInterval(() => {
-      void this.scan().then((events) => {
-        if (events.length > 0) onEvents?.(events);
-      });
+      void this.scan().then(
+        (events) => {
+          if (events.length > 0) sink(events);
+        },
+        (error) => {
+          sink([{ path: this.options.inboxPath, status: 'failed', detail: error instanceof Error ? error.message : 'Inbox scan failed.' }]);
+        },
+      );
     }, intervalMs);
     this.timer.unref?.();
   }
@@ -668,5 +1643,13 @@ export class WatchedInboxScanner {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+  }
+}
+
+function defaultWatcherLogger(events: WatchedInboxEvent[]): void {
+  for (const event of events) {
+    if (event.status === 'failed' || event.status === 'abandoned' || event.status === 'inbox-missing') {
+      console.error(`[inbox-watcher] ${event.status} ${event.path}: ${event.detail ?? ''}`);
+    }
   }
 }

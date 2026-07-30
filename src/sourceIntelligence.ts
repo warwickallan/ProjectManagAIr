@@ -6,12 +6,12 @@ import { resolveDate } from './dateResolution.js';
 import { estimateTokens } from './extractionProvider.js';
 import type { GroundedBriefProvider } from './briefProvider.js';
 import { normalizeSource, SOURCE_NORMALISER_VERSION, type NormalizedDocument, type NormalizedSegment } from './sourceNormalizers.js';
-import { isProjectConsultantOwner, PROJECTOR_VERSION, rebuildProjection, readRowEvidence, readTypedDetails, SCORING_VERSION } from './registerProjection.js';
+import { activeScoringVersion, canonicalNormalizedRowJson, canonicalNormalizedValue, canonicalRowJson, canonicalValueJson, needsConsultantAttention, PROJECTOR_VERSION, rebuildProjection, readRowEvidence, readTypedDetails } from './registerProjection.js';
 
 export const PACKET_VERSION = 1;
-export const VALIDATOR_VERSION = 'source-intelligence-validator-v1';
-export const RECONCILIATION_VERSION = 'reconciliation-engine-v1';
-export const DATABASE_SCHEMA_VERSION = '010';
+export const VALIDATOR_VERSION = 'source-intelligence-validator-v2';
+export const RECONCILIATION_VERSION = 'reconciliation-engine-v2';
+export const DATABASE_SCHEMA_VERSION = '011';
 
 const registerNames = ['Decisions', 'Actions', 'Risks_Issues', 'Config_Changes', 'Open_Questions', 'Milestones', 'Entities', 'Sources', 'Uncertainty'] as const;
 type RegisterName = typeof registerNames[number];
@@ -123,10 +123,13 @@ function text(value: unknown): string {
   return String(value).trim();
 }
 
+// Key ordering must be locale independent (C19). `localeCompare` uses the host
+// ICU collation, so two machines with different LANG produced different packet
+// hashes for byte-identical packets, and the determinism claim failed silently.
 function stable(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
   if (value && typeof value === 'object') {
-    return `{${Object.entries(value as JsonObject).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => `${JSON.stringify(key)}:${stable(child)}`).join(',')}}`;
+    return `{${Object.entries(value as JsonObject).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([key, child]) => `${JSON.stringify(key)}:${stable(child)}`).join(',')}}`;
   }
   return JSON.stringify(value);
 }
@@ -135,17 +138,93 @@ function normalizedQuote(value: string): string {
   return value.toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+// Evidence comparison must survive the punctuation that Teams, Word and Outlook
+// actually emit. Curly quotes and dashes are presentation, not content; folding
+// them here is what lets a model quote a transcript accurately without having to
+// reproduce the exact code points.
+function foldEvidence(value: string): string {
+  return value
+    .replace(/[‘’‚‛′]/g, "'")
+    .replace(/[“”„‟″]/g, '"')
+    .replace(/[‐-―−]/g, '-')
+    .replace(/ /g, ' ')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+const EVIDENCE_STOP_WORDS = new Set(['a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'but', 'by', 'for', 'from', 'had', 'has', 'have', 'in', 'into', 'is', 'it', 'its', 'of', 'on', 'or', 'that', 'the', 'their', 'them', 'then', 'there', 'they', 'this', 'to', 'was', 'were', 'will', 'with', 'you', 'your']);
+
+function evidenceTokens(value: string): string[] {
+  return foldEvidence(value).replace(/[^a-z0-9]+/g, ' ').split(' ').filter((token) => token.length > 2 && !EVIDENCE_STOP_WORDS.has(token));
+}
+
+// A quote must carry enough content to constitute evidence. The prior gate
+// accepted `quote: "the"` against an arbitrary fabricated claim, which made the
+// single strongest anti-hallucination control vacuous.
+const MIN_QUOTE_WORDS = 4;
+const MIN_QUOTE_CHARS = 20;
+
+// How far from a marker an item may be anchored and still be said to account
+// for it. Wide enough for the natural case where a commitment is stated in one
+// turn and qualified in the next few; narrow enough that an item elsewhere in
+// the transcript cannot claim it.
+const MARKER_DISCHARGE_RADIUS = 3;
+
+function quoteIsTrivial(quote: string, segmentText: string): boolean {
+  const folded = foldEvidence(quote);
+  if (!folded) return true;
+  // A short segment cannot yield a long quote; accept a quote that is
+  // substantially the whole segment even when the segment itself is terse.
+  const segment = foldEvidence(segmentText);
+  if (segment && folded.length >= segment.length * 0.6 && folded.length >= 8) return false;
+  return folded.split(' ').filter(Boolean).length < MIN_QUOTE_WORDS || folded.length < MIN_QUOTE_CHARS;
+}
+
+function quoteResolves(segments: Array<Record<string, unknown>>, quote: string): boolean {
+  const needle = foldEvidence(quote);
+  if (!needle) return false;
+  // Contiguous match inside a single segment. Matching across the concatenation
+  // of neighbours would let a model stitch a sentence that was never said.
+  return segments.some((segment) => foldEvidence(String(segment.text ?? '')).includes(needle));
+}
+
+// Does the structured claim plausibly come from the cited evidence? This is a
+// weak but real guard against a well-formed quote being attached to an unrelated
+// assertion: the row's own wording must share vocabulary with the segments it
+// cites. Deliberately lenient — legitimate paraphrase and summarisation must
+// pass; only wholly disconnected claims are caught.
+function claimSupport(row: { title: string; summary: string }, segmentTexts: string[]): number {
+  const claim = new Set(evidenceTokens(`${row.title} ${row.summary}`));
+  if (claim.size === 0) return 0;
+  const evidence = new Set(segmentTexts.flatMap((textValue) => evidenceTokens(textValue)));
+  let shared = 0;
+  for (const token of claim) if (evidence.has(token)) shared += 1;
+  return shared;
+}
+
 function truthy(value: unknown): boolean {
   return value === 1 || value === true || ['true', 'yes', '1', 'blocking', 'blocked'].includes(normalizedQuote(String(value ?? '')));
 }
 
+// Window sizing used a second copy of the under-counting estimator; it is now
+// the same conservative estimator the provider and the budget gates use (D6).
 function tokenEstimate(value: string): number {
-  return Math.ceil(value.trim().split(/\s+/).filter(Boolean).length * 1.35);
+  return estimateTokens(value);
 }
 
-function nextSourceId(db: DatabaseSync, projectId: string): string {
-  const existing = db.prepare("SELECT id FROM source_documents WHERE project_id = ? AND id LIKE 'SRC-%' ORDER BY CAST(substr(id, 5) AS INTEGER) DESC LIMIT 1").get(projectId) as { id: string } | undefined;
-  return `SRC-${String(existing ? Number(existing.id.slice(4)) + 1 : 1).padStart(3, '0')}`;
+// Source document identifiers are globally unique but allocated per project
+// (C2). The previous scheme computed the next `SRC-nnn` scoped to the project
+// while the primary key was database-wide, so every project after the first hit
+// a UNIQUE violation on its very first source and could never ingest at all.
+// The distinct `SRCDOC-` prefix also removes the collision with `SRC-nnn`
+// Sources-register row identifiers (C15), which shared one namespace across two
+// independent counters.
+function nextSourceId(db: DatabaseSync, projectId: string, projectCode: string): string {
+  const prefix = `SRCDOC-${projectCode}`;
+  const existing = db.prepare("SELECT id FROM source_documents WHERE project_id = ? AND id LIKE ? ORDER BY CAST(substr(id, ?) AS INTEGER) DESC LIMIT 1").get(projectId, `${prefix}-%`, prefix.length + 2) as { id: string } | undefined;
+  const next = existing ? Number(existing.id.slice(prefix.length + 1)) + 1 : 1;
+  return `${prefix}-${String(next).padStart(3, '0')}`;
 }
 
 function makeWindows(segments: NormalizedSegment[]) {
@@ -173,43 +252,92 @@ function makeWindows(segments: NormalizedSegment[]) {
   return windows;
 }
 
+// Marker detection is both the mandatory-discharge gate and the per-window
+// recall checklist, so it is scored against the folded text (C8): Teams and Word
+// emit U+2019, and every apostrophe-bearing pattern used to be blind to real
+// transcripts. Equally, ordinary prose must not be classified as mandatory
+// governance content — a HIGH marker obliges the extraction to account for it.
+const COMMITMENT_CUE = /\b(?:i(?:'ll| will| shall| need to| have to| am going to| ?'m going to)|we(?:'ll| will| need to| should)|let me|can you|could you|please|action|deadline|due|target|by then|before)\b/;
+const PAST_OR_HYPOTHETICAL = /\b(?:finished|completed|closed|did|was|were|had|already|last (?:week|month|year|time)|yesterday|used to|would have|previously)\b/;
+const CONFIG_OBJECT = /\b(?:box|tick ?box|checkbox|field|setting|settings|config|configuration|flag|option|value|template|permit|permits|register|record|records|status|toggle|parameter|rule|workflow|form|screen|profile|role|permission|module)\b/;
+const DATE_PHRASE = /\b(?:by (?:the )?end of (?:the )?(?:week|month|day)|by (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|next (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month)|\d{4}-\d{2}-\d{2}|\d{1,2}(?:st|nd|rd|th) (?:of )?(?:january|february|march|april|may|june|july|august|september|october|november|december))\b/;
+const SCHEDULED_TIME = /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b[^.?!]{0,40}\b(?:\d{1,2}(?:st|nd|rd|th)|\d{1,2}[:.]\d{2}|\d{1,2} ?(?:am|pm)|(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve) o'clock)\b/;
+
 function preScan(document: NormalizedDocument) {
   const markers: Array<{ id: string; segmentSeq: number; confidence: 'high' | 'medium' | 'low'; markerType: string; matchedText: string }> = [];
-  const high = [
-    { type: 'explicit-action', pattern: /\b(?:that'?s an action|action (?:on|for) (?:me|us|you|yourselves)|i(?:'ll| will| need to) (?:check|confirm|send|update|add|remove|create|suppress|come back|follow up))\b/i },
-    { type: 'explicit-register', pattern: /\b(?:capture|record|add) (?:that|this) (?:for|to|in) (?:the )?(?:decision|action|risk|question|register|log)\b/i },
-    { type: 'explicit-date', pattern: /\b(?:by (?:the )?end of (?:the )?week|by friday|next (?:monday|tuesday|wednesday|thursday|friday)|\d{4}-\d{2}-\d{2})\b/i },
-    { type: 'live-config-act', pattern: /\b(?:i(?:'ll| have| just| am going to)|let me)\b.{0,80}\b(?:add|change|tick|save|suppress|configure|rename|remove)\b/i },
+  const high: Array<{ type: string; test: (folded: string) => RegExpMatchArray | null }> = [
+    {
+      type: 'explicit-action',
+      test: (folded) => folded.match(/\b(?:that's an action|action (?:on|for) (?:me|us|you|yourselves)|i(?:'ll|'ve| will| have| need to| am going to| just)(?: \w+){0,3} (?:check|confirm|send|update|add|added|remove|create|suppress|tick|chase|raise|book|arrange|set up|come back|follow up))\b/),
+    },
+    {
+      type: 'explicit-register',
+      test: (folded) => folded.match(/\b(?:capture|record|add|note|log)(?: that| this| it)? (?:for|to|in|as|against) (?:the )?(?:decision|action|risk|issue|question|register|log|backlog|development)\b|\b(?:ai note|note for development|for the register|for the log|one for the register)\b/),
+    },
+    {
+      // A date only obliges the extraction when someone is committing to it.
+      // "next Wednesday is a bank holiday" is information, not governance.
+      type: 'explicit-date',
+      test: (folded) => (DATE_PHRASE.test(folded) && COMMITMENT_CUE.test(folded) && !PAST_OR_HYPOTHETICAL.test(folded) ? folded.match(DATE_PHRASE) : null),
+    },
+    {
+      // A specific day paired with a specific time is a scheduling commitment
+      // in its own right, per the design's worked examples.
+      type: 'scheduled-time',
+      test: (folded) => (!PAST_OR_HYPOTHETICAL.test(folded) ? folded.match(SCHEDULED_TIME) : null),
+    },
+    {
+      // Live configuration acts need an object that can actually be configured;
+      // "I'll change my mind about the sandwich" is not a change to the system.
+      type: 'live-config-act',
+      test: (folded) => {
+        const match = folded.match(/\b(?:i(?:'ll|'ve| have| just| will| am going to)|let me|we've|we have)\b.{0,80}?\b(?:add|added|change|changed|tick|ticked|save|saved|suppress|suppressed|configure|configured|rename|renamed|remove|removed|switch|switched|enable|enabled|disable|disabled)\b/);
+        return match && CONFIG_OBJECT.test(folded) ? match : null;
+      },
+    },
   ];
-  const medium = [
-    { type: 'commitment-pattern', pattern: /\b(?:we need to|i need to think|i(?:'ll| will) come back|i(?:'ll| will) check)\b/i },
-    { type: 'question-pattern', pattern: /\?$/ },
-    { type: 'constraint-pattern', pattern: /\b(?:can only|cannot|isn'?t able|doesn'?t support|limited to)\b/i },
+  const medium: Array<{ type: string; pattern: RegExp }> = [
+    { type: 'commitment-pattern', pattern: /\b(?:we need to|i need to think|i(?:'ll| will) come back|i(?:'ll| will) check|we should probably|somebody needs to)\b/ },
+    { type: 'question-pattern', pattern: /\?\s*$/ },
+    { type: 'constraint-pattern', pattern: /\b(?:can only|cannot|can't|isn't able|doesn't support|not able to|limited to|no way to)\b/ },
   ];
-  const low = /\b(?:risk|question|issue|concern|cannot|not|noted)\b/i;
+  const low = /\b(?:risk|question|issue|concern|assumption|dependency|blocker)\b/;
   for (const segment of document.segments) {
+    const folded = foldEvidence(segment.text);
     for (const candidate of high) {
-      const match = segment.text.match(candidate.pattern);
+      const match = candidate.test(folded);
       if (match) markers.push({ id: `marker:${segment.seq}:${candidate.type}`, segmentSeq: segment.seq, confidence: 'high', markerType: candidate.type, matchedText: match[0] });
     }
     for (const candidate of medium) {
-      const match = segment.text.match(candidate.pattern);
+      const match = folded.match(candidate.pattern);
       if (match) markers.push({ id: `marker:${segment.seq}:${candidate.type}`, segmentSeq: segment.seq, confidence: 'medium', markerType: candidate.type, matchedText: match[0] });
     }
-    const hint = segment.text.match(low);
+    const hint = folded.match(low);
     if (hint) markers.push({ id: `marker:${segment.seq}:lexical`, segmentSeq: segment.seq, confidence: 'low', markerType: 'lexical-hint', matchedText: hint[0] });
   }
   return markers;
 }
 
 export function registerNormalizedSource(db: DatabaseSync, input: { projectId: string; intakeSourceId: string; fileName: string; immutablePath: string; contentHash: string; bytes?: Buffer; eventDate?: string | null }) {
-  const existing = db.prepare('SELECT id FROM source_documents WHERE project_id = ? AND content_hash = ?').get(input.projectId, input.contentHash) as { id: string } | undefined;
-  if (existing) return { sourceId: existing.id, duplicate: true };
+  const existing = db.prepare('SELECT id, event_date, normaliser_version FROM source_documents WHERE project_id = ? AND content_hash = ?').get(input.projectId, input.contentHash) as { id: string; event_date: string | null; normaliser_version: string } | undefined;
+  if (existing) {
+    return {
+      sourceId: existing.id,
+      duplicate: true as const,
+      eventDate: existing.event_date,
+      // Surfacing a stale normaliser lets the caller offer re-normalisation
+      // rather than silently reusing evidence produced by older parsing rules.
+      staleNormaliser: existing.normaliser_version !== SOURCE_NORMALISER_VERSION,
+      normaliserVersion: existing.normaliser_version,
+    };
+  }
   const bytes = input.bytes ?? readFileSync(input.immutablePath);
   if (hash(bytes) !== input.contentHash) throw new Error('Source bytes do not match the registered intake hash.');
   const document = normalizeSource(input.fileName, bytes, input.eventDate);
   if (document.segments.length === 0) throw new Error('Source normalisation produced no mechanically addressable segments.');
-  const sourceId = nextSourceId(db, input.projectId);
+  const project = db.prepare('SELECT code FROM projects WHERE id = ?').get(input.projectId) as { code: string } | undefined;
+  if (!project) throw new Error('Cannot register a normalised source against an unknown project.');
+  const sourceId = nextSourceId(db, input.projectId, project.code);
   const windows = makeWindows(document.segments);
   const markers = preScan(document);
   const createdAt = nowIso();
@@ -228,20 +356,31 @@ export function registerNormalizedSource(db: DatabaseSync, input: { projectId: s
     }
     const insertMarker = db.prepare('INSERT INTO source_markers (id, source_id, segment_seq, confidence, marker_type, matched_text, discharged_by_item_ref, dismissal_reason) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)');
     for (const marker of markers) insertMarker.run(`${sourceId}:${marker.id}`, sourceId, marker.segmentSeq, marker.confidence, marker.markerType, marker.matchedText);
-    db.prepare("UPDATE source_processing_jobs SET status = 'processing', current_stage = 'extracting', queued_at = COALESCE(queued_at, ?), updated_at = ?, packet_id = NULL, changeset_id = NULL WHERE id = ?").run(createdAt, createdAt, jobId);
+    // The job is queued here, not "processing": no worker has claimed it yet,
+    // and the crash-recovery sweep needs the honest state to reason about leases.
+    db.prepare("UPDATE source_processing_jobs SET status = 'queued', current_stage = 'queued', queued_at = COALESCE(queued_at, ?), updated_at = ?, packet_id = NULL, changeset_id = NULL, error_message = NULL, error_kind = NULL, error_detail_json = NULL, recovery_action = NULL WHERE id = ?").run(createdAt, createdAt, jobId);
     db.exec('COMMIT;');
   } catch (error) {
     db.exec('ROLLBACK;');
     throw error;
   }
-  return { sourceId, duplicate: false, segmentCount: document.segments.length, windowCount: windows.length, markerCounts: { high: markers.filter((item) => item.confidence === 'high').length, medium: markers.filter((item) => item.confidence === 'medium').length, low: markers.filter((item) => item.confidence === 'low').length }, jobId };
+  return { sourceId, duplicate: false, eventDate: document.eventDate, eventDateEvidence: document.eventDateEvidence, segmentCount: document.segments.length, windowCount: windows.length, markerCounts: { high: markers.filter((item) => item.confidence === 'high').length, medium: markers.filter((item) => item.confidence === 'medium').length, low: markers.filter((item) => item.confidence === 'low').length }, jobId };
 }
 
 function packetRows(packet: SourceIntelligencePacket) {
   return registerNames.flatMap((registerName) => packet.sheets[registerName].rows.map((row) => ({ registerName, row })));
 }
 
-export function validatePacket(db: DatabaseSync, rawPacket: unknown) {
+export interface ValidatePacketOptions {
+  // `replay` re-validates a stored packet against the evidence it was frozen
+  // from, without asserting that the register is still at the packet's base
+  // revision. A historically clean packet must not be reported as quarantined
+  // merely because a later changeset moved the register on (C16).
+  mode?: 'freeze' | 'replay';
+}
+
+export function validatePacket(db: DatabaseSync, rawPacket: unknown, options: ValidatePacketOptions = {}) {
+  const mode = options.mode ?? 'freeze';
   const parsed = packetSchema.safeParse(rawPacket);
   if (!parsed.success) {
     return { packet: null, verdict: 'quarantined' as const, issues: parsed.error.issues.map((issue): ValidationIssue => ({ rule: 'schema-strict', severity: 'blocker', message: `${issue.path.join('.')}: ${issue.message}` })) };
@@ -254,8 +393,25 @@ export function validatePacket(db: DatabaseSync, rawPacket: unknown) {
   if (!source || String(source.content_hash) !== packet.source.content_hash) issues.push({ rule: 'source-registration', severity: 'blocker', message: 'Packet source is missing or its content hash does not match.' });
   if (source && String(source.project_id) !== project?.id) issues.push({ rule: 'project-boundary', severity: 'blocker', message: 'Packet source belongs to a different project.' });
 
+  // Source metadata is server-held evidence, not something the packet may
+  // restate differently. A packet claiming a later event date than the stored
+  // source would silently defeat human-edit precedence (B5).
+  if (source) {
+    const storedEventDate = source.event_date ? String(source.event_date) : null;
+    if ((packet.source.event_date ?? null) !== storedEventDate) issues.push({ rule: 'source-event-date', severity: 'blocker', message: `Packet event date ${packet.source.event_date ?? 'null'} does not match the registered source event date ${storedEventDate ?? 'null'}.` });
+    if (String(source.original_file_name) !== packet.source.original_file_name) issues.push({ rule: 'source-metadata', severity: 'blocker', message: 'Packet source file name does not match the registered source.' });
+    if (String(source.source_type) !== packet.source.source_type) issues.push({ rule: 'source-metadata', severity: 'blocker', message: 'Packet source type does not match the registered source.' });
+  }
+
   const currentRevision = project ? Number((db.prepare('SELECT revision FROM project_register_revisions WHERE project_id = ?').get(project.id) as { revision: number } | undefined)?.revision ?? 0) : 0;
-  if (packet.base_register_revision !== currentRevision) issues.push({ rule: 'base-register-revision', severity: 'blocker', message: `Packet revision ${packet.base_register_revision} does not match current revision ${currentRevision}.` });
+  const revisionCurrent = packet.base_register_revision === currentRevision;
+  if (!revisionCurrent && mode === 'freeze') issues.push({ rule: 'base-register-revision', severity: 'blocker', message: `Packet revision ${packet.base_register_revision} does not match current revision ${currentRevision}.` });
+
+  const markerRows = source ? db.prepare('SELECT id, segment_seq, confidence, dismissal_reason FROM source_markers WHERE source_id = ?').all(String(source.id)) as Array<{ id: string; segment_seq: number; confidence: string; dismissal_reason: string | null }> : [];
+  const markerById = new Map(markerRows.map((marker) => [marker.id, marker]));
+  const validDischarges = new Map<string, string>();
+  const anchoredSegmentsByRef = new Map<string, number[]>();
+  const sourceParticipants = source ? (JSON.parse(String(source.participants_json ?? '[]')) as string[]) : [];
 
   const refs = new Set<string>();
   for (const { registerName, row } of packetRows(packet)) {
@@ -264,6 +420,8 @@ export function validatePacket(db: DatabaseSync, rawPacket: unknown) {
     if (row.op === 'add' && (row.proposed_id !== '$ALLOC' || row.target_id !== null)) issues.push({ rule: 'server-id-allocation', severity: 'blocker', message: 'Add operations must use proposed_id $ALLOC and target_id null.', clientRef: row.client_ref });
     if (row.op !== 'add' && !row.target_id) issues.push({ rule: 'target-required', severity: 'blocker', message: `${row.op} requires target_id.`, clientRef: row.client_ref });
     if (row.derivation === 'inference' && !row.reasoning) issues.push({ rule: 'inference-reasoning', severity: 'blocker', message: 'Inference items require explicit reasoning.', clientRef: row.client_ref });
+    const citedSegmentTexts: string[] = [];
+    const anchoredSeqs: number[] = [];
     for (const anchor of row.anchors) {
       const segments = db.prepare('SELECT * FROM source_segments WHERE source_id = ? AND seq BETWEEN ? AND ? ORDER BY seq').all(packet.source.source_id, anchor.segment_seq - 1, anchor.segment_seq + 1) as Array<Record<string, unknown>>;
       const exact = segments.find((segment) => Number(segment.seq) === anchor.segment_seq);
@@ -271,12 +429,71 @@ export function validatePacket(db: DatabaseSync, rawPacket: unknown) {
         issues.push({ rule: 'anchor-resolution', severity: 'blocker', message: `Segment ${anchor.segment_seq} does not exist.`, clientRef: row.client_ref });
         continue;
       }
-      if (anchor.speaker && normalizedQuote(String(exact.speaker ?? '')) !== normalizedQuote(anchor.speaker)) issues.push({ rule: 'anchor-speaker', severity: 'blocker', message: `Anchor speaker does not match segment ${anchor.segment_seq}.`, clientRef: row.client_ref });
+      anchoredSeqs.push(anchor.segment_seq);
+      for (const segment of segments) citedSegmentTexts.push(String(segment.text ?? ''));
+      if (anchor.speaker && foldEvidence(String(exact.speaker ?? '')) !== foldEvidence(anchor.speaker)) issues.push({ rule: 'anchor-speaker', severity: 'blocker', message: `Anchor speaker does not match segment ${anchor.segment_seq}.`, clientRef: row.client_ref });
       if (anchor.t_ms !== null && exact.t_start_ms !== null && Math.abs(Number(exact.t_start_ms) - anchor.t_ms) > 30000) issues.push({ rule: 'anchor-time', severity: 'blocker', message: `Anchor time is more than 30 seconds from segment ${anchor.segment_seq}.`, clientRef: row.client_ref });
-      if (row.derivation === 'fact') {
-        if (!anchor.quote) issues.push({ rule: 'fact-quote', severity: 'blocker', message: 'Fact anchors require a verbatim quote.', clientRef: row.client_ref });
-        else if (!segments.some((segment) => normalizedQuote(String(segment.text)).includes(normalizedQuote(anchor.quote ?? '')))) issues.push({ rule: 'quote-verification', severity: 'blocker', message: `Quote was not found in segment ${anchor.segment_seq} or an adjacent segment.`, clientRef: row.client_ref });
+
+      // Quote semantics, explicitly (B1, B2):
+      //  - a `fact` anchor MUST carry a verbatim quote, and it must resolve;
+      //  - an `inference` anchor MAY omit a quote (the claim is reasoned, not
+      //    stated) but ANY quote it does supply must resolve exactly as
+      //    strictly — an unverified quote must never be presented as evidence;
+      //  - a quote too short to constitute evidence is rejected outright.
+      if (row.derivation === 'fact' && !anchor.quote) {
+        issues.push({ rule: 'fact-quote', severity: 'blocker', message: 'Fact anchors require a verbatim quote.', clientRef: row.client_ref });
+      } else if (anchor.quote) {
+        if (quoteIsTrivial(anchor.quote, String(exact.text ?? ''))) {
+          issues.push({ rule: 'quote-triviality', severity: 'blocker', message: `Quote for segment ${anchor.segment_seq} is too short to constitute evidence; quote at least ${MIN_QUOTE_WORDS} words.`, clientRef: row.client_ref });
+        } else if (!quoteResolves(segments, anchor.quote)) {
+          issues.push({ rule: 'quote-verification', severity: 'blocker', message: `Quote was not found verbatim in segment ${anchor.segment_seq} or an adjacent segment.`, clientRef: row.client_ref });
+        }
       }
+    }
+
+    // The cited evidence must plausibly support the structured claim. A
+    // perfectly verbatim quote attached to an unrelated assertion is still a
+    // fabrication.
+    // `Sources` rows describe the artefact itself — their title is the file
+    // name by contract — so vocabulary overlap with the transcript is not
+    // expected. `Entities` rows name a participant or organisation, so they get
+    // a name-presence check instead of a vocabulary check.
+    if (anchoredSeqs.length > 0 && registerName !== 'Sources') {
+      if (registerName === 'Entities') {
+        const haystack = new Set([...citedSegmentTexts.flatMap((textValue) => evidenceTokens(textValue)), ...sourceParticipants.flatMap((name) => evidenceTokens(name))]);
+        const nameTokens = evidenceTokens(row.title);
+        const folded = [...citedSegmentTexts, ...sourceParticipants].map(foldEvidence).join(' ');
+        const present = nameTokens.length > 0 ? nameTokens.some((token) => haystack.has(token)) : folded.includes(foldEvidence(row.title));
+        if (!present) {
+          issues.push({ rule: 'entity-support', severity: 'blocker', message: 'Entity name does not appear in the segments it cites or among the source participants.', clientRef: row.client_ref });
+        }
+      } else if (claimSupport(row, citedSegmentTexts) === 0) {
+        issues.push({
+          rule: 'claim-support',
+          severity: row.derivation === 'fact' ? 'blocker' : 'warning',
+          message: 'Row shares no substantive vocabulary with the segments it cites.',
+          clientRef: row.client_ref,
+        });
+      }
+    }
+    anchoredSegmentsByRef.set(row.client_ref, anchoredSeqs);
+
+    // HIGH-marker discharge must be earned, not echoed (B3). A discharging item
+    // has to be anchored in the neighbourhood of the marker it claims to
+    // account for; previously any row could discharge any marker by repeating
+    // an identifier it had been handed in the prompt.
+    for (const markerId of row.discharges_markers) {
+      const marker = markerById.get(markerId);
+      if (!marker) {
+        issues.push({ rule: 'marker-unknown', severity: 'blocker', message: `Row discharges unknown marker ${markerId}.`, clientRef: row.client_ref });
+        continue;
+      }
+      const near = anchoredSeqs.some((seq) => Math.abs(seq - Number(marker.segment_seq)) <= MARKER_DISCHARGE_RADIUS);
+      if (!near) {
+        issues.push({ rule: 'marker-discharge-locality', severity: 'blocker', message: `Row claims to discharge marker ${markerId} at segment ${marker.segment_seq} but is not anchored within ${MARKER_DISCHARGE_RADIUS} segments of it.`, clientRef: row.client_ref });
+        continue;
+      }
+      if (!validDischarges.has(markerId)) validDischarges.set(markerId, row.client_ref);
     }
     if (row.op !== 'add' && row.target_id && project) {
       const target = db.prepare('SELECT register_name FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(project.id, row.target_id) as { register_name: string } | undefined;
@@ -290,23 +507,55 @@ export function validatePacket(db: DatabaseSync, rawPacket: unknown) {
     if (!coverage) issues.push({ rule: 'category-coverage', severity: 'blocker', message: `Category ${name} has no coverage status.` });
     else if (coverage.status === 'none-found' && !coverage.explanation) issues.push({ rule: 'category-explanation', severity: 'blocker', message: `Category ${name} is none-found without an explanation.` });
   }
-  const expectedWindows = source ? db.prepare('SELECT seq FROM source_windows WHERE source_id = ?').all(String(source.id)) as Array<{ seq: number }> : [];
-  const coveredWindows = new Set(packet.coverage.windows.map((entry) => Number(entry.key)));
-  for (const window of expectedWindows) if (!coveredWindows.has(window.seq)) issues.push({ rule: 'window-coverage', severity: 'blocker', message: `Source window ${window.seq} has no coverage status.` });
+  // Window coverage is a gate, not a checklist of keys (B4). A packet in which
+  // every window reported `failed`, or reported `reviewed` with no items and no
+  // explanation, used to validate clean.
+  const expectedWindows = source ? db.prepare('SELECT seq, start_seq, end_seq FROM source_windows WHERE source_id = ?').all(String(source.id)) as Array<{ seq: number; start_seq: number; end_seq: number }> : [];
+  const windowCoverage = new Map(packet.coverage.windows.map((entry) => [Number(entry.key), entry]));
+  const allAnchoredSeqs = [...anchoredSegmentsByRef.values()].flat();
+  for (const window of expectedWindows) {
+    const entry = windowCoverage.get(window.seq);
+    if (!entry) {
+      issues.push({ rule: 'window-coverage', severity: 'blocker', message: `Source window ${window.seq} has no coverage status.` });
+      continue;
+    }
+    if (entry.status === 'failed') {
+      issues.push({ rule: 'window-failed', severity: 'blocker', message: `Source window ${window.seq} was not successfully reviewed${entry.explanation ? `: ${entry.explanation}` : '.'}` });
+      continue;
+    }
+    if (entry.item_count === 0 && !entry.explanation) {
+      issues.push({ rule: 'window-empty-unexplained', severity: 'blocker', message: `Source window ${window.seq} reported ${entry.status} with no items and no explanation.` });
+    }
+    const anchoredHere = allAnchoredSeqs.filter((seq) => seq >= window.start_seq && seq <= window.end_seq).length;
+    // A window cannot have yielded more items than the packet anchors into it.
+    if (entry.item_count > anchoredHere) {
+      issues.push({ rule: 'window-item-count', severity: 'blocker', message: `Source window ${window.seq} claims ${entry.item_count} items but only ${anchoredHere} packet rows are anchored inside it.` });
+    }
+  }
+  for (const key of windowCoverage.keys()) {
+    if (!expectedWindows.some((window) => window.seq === key)) issues.push({ rule: 'window-unknown', severity: 'blocker', message: `Coverage reports window ${key}, which does not exist for this source.` });
+  }
   if (packet.sheets.Sources.rows.length === 0) issues.push({ rule: 'source-row', severity: 'blocker', message: 'Packet has no Sources register row.' });
   if ((source ? JSON.parse(String(source.participants_json ?? '[]')) as unknown[] : []).length > 1 && packet.sheets.Entities.rows.length === 0 && !categories.get('Entities')?.explanation) issues.push({ rule: 'entity-coverage', severity: 'blocker', message: 'Multi-speaker source has zero entities without explanation.' });
   if (packet.sheets.Uncertainty.rows.length === 0 && !categories.get('Uncertainty')?.explanation) issues.push({ rule: 'uncertainty-coverage', severity: 'blocker', message: 'Uncertainty ledger is empty without explanation.' });
 
-  const highMarkers = source ? db.prepare("SELECT id FROM source_markers WHERE source_id = ? AND confidence = 'high'").all(String(source.id)) as Array<{ id: string }> : [];
-  const discharged = new Set(packetRows(packet).flatMap(({ row }) => row.discharges_markers));
-  for (const marker of highMarkers) {
-    const stored = db.prepare('SELECT dismissal_reason FROM source_markers WHERE id = ?').get(marker.id) as { dismissal_reason: string | null } | undefined;
-    if (!discharged.has(marker.id) && !stored?.dismissal_reason) issues.push({ rule: 'high-marker-discharge', severity: 'blocker', message: `HIGH marker ${marker.id} is neither linked nor explicitly dismissed.` });
+  // Only discharges that passed the locality check above count.
+  for (const marker of markerRows.filter((entry) => entry.confidence === 'high')) {
+    if (!validDischarges.has(marker.id) && !marker.dismissal_reason) issues.push({ rule: 'high-marker-discharge', severity: 'blocker', message: `HIGH marker ${marker.id} is neither validly linked nor explicitly dismissed.` });
   }
 
+  // Provenance must come from a run that actually produced output (B7). The
+  // prior gate accepted a `status = 'failed'` run — exactly the shape of a
+  // transport failure that returned no model output at all — as trusted
+  // evidence for a frozen packet.
   for (const runId of packet.execution.runs) {
     const run = db.prepare('SELECT * FROM extraction_runs WHERE id = ? AND source_id = ?').get(runId, packet.source.source_id) as Record<string, unknown> | undefined;
-    if (!run || !run.provider_id || !run.model_label || !run.skill_sha256 || !run.prompt_sha256) issues.push({ rule: 'execution-provenance', severity: 'blocker', message: `Execution run ${runId} is missing trusted provider provenance.` });
+    if (!run || !run.provider_id || !run.model_label || !run.skill_sha256 || !run.prompt_sha256) {
+      issues.push({ rule: 'execution-provenance', severity: 'blocker', message: `Execution run ${runId} is missing trusted provider provenance.` });
+      continue;
+    }
+    if (String(run.status) !== 'completed') issues.push({ rule: 'execution-status', severity: 'blocker', message: `Execution run ${runId} has status ${String(run.status)}; only a completed run may support a frozen packet.` });
+    if (!run.output_sha256) issues.push({ rule: 'execution-output', severity: 'blocker', message: `Execution run ${runId} recorded no model output.` });
   }
   const totalRuns = packet.execution.runs.map((id) => db.prepare('SELECT input_tokens, output_tokens, source_tokens, duration_ms FROM extraction_runs WHERE id = ?').get(id) as Record<string, unknown> | undefined).filter(Boolean) as Array<Record<string, unknown>>;
   const calls = totalRuns.length;
@@ -318,35 +567,163 @@ export function validatePacket(db: DatabaseSync, rawPacket: unknown) {
   if (calls > 6 || repetition > 2) issues.push({ rule: 'cost-drift', severity: 'warning', message: `Extraction cost is approaching its acceptance limit.` });
 
   const verdict = issues.some((issue) => issue.severity === 'blocker') ? 'quarantined' : issues.some((issue) => issue.severity === 'warning') ? 'warnings' : 'clean';
-  return { packet, verdict, issues, metrics: { calls, inputTokens, outputTokens: totalRuns.reduce((total, run) => total + Number(run.output_tokens), 0), sourceTokenRepetition: Number(repetition.toFixed(3)), durationMs: totalRuns.reduce((total, run) => total + Number(run.duration_ms), 0) } };
+  return {
+    packet,
+    verdict,
+    issues,
+    revisionCurrent,
+    metrics: {
+      calls,
+      inputTokens,
+      outputTokens: totalRuns.reduce((total, run) => total + Number(run.output_tokens), 0),
+      sourceTokenRepetition: Number(repetition.toFixed(3)),
+      durationMs: totalRuns.reduce((total, run) => total + Number(run.duration_ms), 0),
+      highMarkers: markerRows.filter((entry) => entry.confidence === 'high').length,
+      highMarkersDischarged: validDischarges.size,
+      highMarkersDismissed: markerRows.filter((entry) => entry.confidence === 'high' && entry.dismissal_reason).length,
+      anchoredRows: anchoredSegmentsByRef.size,
+    },
+  };
 }
 
-function sourceDateConflict(db: DatabaseSync, projectId: string, targetId: string, row: SourceIntelligencePacket['sheets']['Actions']['rows'][number], eventDate: string | null) {
-  if (!eventDate) return false;
-  const fields: Record<string, unknown> = { title: row.title, summary: row.summary, status: row.status, owner: row.owner, due_date: row.due_date_raw, ...row.details };
-  return Object.keys(fields).some((field) => Boolean(db.prepare('SELECT 1 FROM register_row_events WHERE project_id = ? AND external_register_id = ? AND field = ? AND occurred_at > ? LIMIT 1').get(projectId, targetId, field, `${eventDate}T23:59:59.999Z`)));
+type PacketRow = SourceIntelligencePacket['sheets']['Actions']['rows'][number];
+
+// For `update`-family operations, a null value means "this source did not speak
+// to this field", not "clear it" (C13). Explicitly clearing a field is done with
+// an empty string. Without this distinction a source that changed only a summary
+// nulled the row's owner, because the schema defaults every unmentioned field to
+// null.
+function assertedFields(row: PacketRow): Record<string, unknown> {
+  const candidate: Record<string, unknown> = {
+    title: row.title,
+    summary: row.summary,
+    status: row.status,
+    record_type: row.record_type,
+    owner: row.owner,
+    due_date_raw: row.due_date_raw,
+    source_ref: row.source_ref,
+    related_refs: row.related_refs,
+    supersedes: row.supersedes,
+    details: row.details,
+  };
+  if (row.op === 'add') return candidate;
+  const asserted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(candidate)) {
+    if (value === null) continue;
+    if (Array.isArray(value) && value.length === 0) continue;
+    if (key === 'details' && Object.keys(value as JsonObject).length === 0) continue;
+    asserted[key] = value;
+  }
+  return asserted;
+}
+
+// The instant after which a human edit outranks this source. When the source
+// carries an event date we use the end of that day; when it does not — which is
+// every transcript with no recoverable date — we fall back to the moment the
+// source was ingested, because a human edit recorded after ingest unambiguously
+// postdates the source. The previous code returned `false` outright on a null
+// event date, which disabled human-edit protection entirely (B5).
+function humanPrecedenceInstant(source: { event_date: string | null; created_at: string }): string {
+  return source.event_date ? `${source.event_date}T23:59:59.999Z` : source.created_at;
+}
+
+// Precedence is checked per field, not per row (B6): a newer human note on
+// `owner` must not block an extracted update to `mitigation`. Only fields this
+// packet actually asserts a change to can be contested.
+function contestedFields(db: DatabaseSync, projectId: string, targetId: string, row: PacketRow, instant: string): string[] {
+  const asserted = assertedFields(row);
+  const stored = db.prepare('SELECT raw_row_json FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(projectId, targetId) as { raw_row_json: string } | undefined;
+  const existing = stored ? (JSON.parse(stored.raw_row_json) as JsonObject) : {};
+  const existingDetails = (existing.details ?? {}) as JsonObject;
+  // The comparison baseline is the CURRENT projected state, which already
+  // incorporates human events — not the canonical row, which still holds the
+  // pre-edit value. Comparing against the canonical row would let a source
+  // silently revert a human edit simply by restating the value the human
+  // replaced.
+  const projected = db.prepare('SELECT status, owner, due_date, resolution FROM register_row_state WHERE project_id = ? AND external_register_id = ?').get(projectId, targetId) as Record<string, unknown> | undefined;
+  const currentOf = (field: string, fallback: unknown): unknown => (projected && field in projected && projected[field] !== null && projected[field] !== undefined ? projected[field] : fallback);
+
+  // Only fields whose value this source actually CHANGES can be contested. The
+  // schema forces `title`, `summary` and `status` to be present on every row, so
+  // presence alone would make a status conflict unavoidable even when the source
+  // proposes the value already in effect.
+  const changed = new Set<string>();
+  for (const [key, value] of Object.entries(asserted)) {
+    if (key === 'details') continue;
+    const field = key === 'due_date_raw' ? 'due_date' : key;
+    if (canonicalValueJson(value) === canonicalValueJson(currentOf(field, existing[key]))) continue;
+    changed.add(field);
+  }
+  for (const [key, value] of Object.entries((asserted.details ?? {}) as JsonObject)) {
+    if (canonicalValueJson(value) === canonicalValueJson(currentOf(key, existingDetails[key]))) continue;
+    changed.add(key);
+  }
+  const statement = db.prepare('SELECT 1 FROM register_row_events WHERE project_id = ? AND external_register_id = ? AND field = ? AND occurred_at > ? LIMIT 1');
+  return [...changed].sort().filter((field) => Boolean(statement.get(projectId, targetId, field, instant)));
+}
+
+// Deterministic near-duplicate detection for additions (B8). The
+// `possible_duplicate` lane was referenced by two rejection guards and the UI
+// but had no producer at all, so a transcript and its follow-up email each
+// created a separate register row for the same commitment with no reviewer
+// signal. Pure function of stored state and packet content — no clock, no
+// randomness, no model involvement.
+const DUPLICATE_TITLE_SIMILARITY = 0.7;
+
+function duplicateCandidate(db: DatabaseSync, projectId: string, registerName: RegisterName, row: PacketRow): string | null {
+  const candidateTokens = new Set(evidenceTokens(row.title));
+  if (candidateTokens.size === 0) return null;
+  const existing = db.prepare("SELECT external_register_id, title FROM project_register_rows WHERE project_id = ? AND register_name = ? AND record_status NOT IN ('superseded', 'rejected') ORDER BY external_register_id").all(projectId, registerName) as Array<{ external_register_id: string; title: string }>;
+  let best: { id: string; score: number } | null = null;
+  for (const candidate of existing) {
+    const tokens = new Set(evidenceTokens(String(candidate.title)));
+    if (tokens.size === 0) continue;
+    let shared = 0;
+    for (const token of candidateTokens) if (tokens.has(token)) shared += 1;
+    const score = (2 * shared) / (candidateTokens.size + tokens.size);
+    // Ties resolve to the lowest external id because the query is ordered.
+    if (score >= DUPLICATE_TITLE_SIMILARITY && (!best || score > best.score)) best = { id: String(candidate.external_register_id), score };
+  }
+  return best ? best.id : null;
 }
 
 function deterministicOps(db: DatabaseSync, projectId: string, packet: SourceIntelligencePacket) {
+  const source = db.prepare('SELECT event_date, created_at FROM source_documents WHERE id = ?').get(packet.source.source_id) as { event_date: string | null; created_at: string } | undefined;
+  // No weaker fallback: a missing source row must not silently disable
+  // human-edit precedence. `validatePacket` already blocks this, and a second,
+  // laxer copy of the removed defect sitting behind one gate is not acceptable.
+  if (!source) throw new Error('Cannot reconcile a packet whose source document is not registered.');
+  const instant = humanPrecedenceInstant(source);
   return packetRows(packet).map(({ registerName, row }, index) => {
     let op: string = row.op;
     let reason: string | null = null;
+    let contested: string[] = [];
+    let duplicateOf: string | null = null;
     if (row.op !== 'add' && row.target_id) {
       const target = db.prepare('SELECT register_name FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(projectId, row.target_id) as { register_name: string } | undefined;
       if (!target || target.register_name !== registerName) {
         op = 'unverified_link';
         reason = 'Target does not exist in the same project and register.';
-      } else if (sourceDateConflict(db, projectId, row.target_id, row, packet.source.event_date)) {
-        op = 'conflict';
-        reason = 'A newer human field event outranks this source assertion.';
+      } else {
+        contested = contestedFields(db, projectId, row.target_id, row, instant);
+        if (contested.length > 0) {
+          op = 'conflict';
+          reason = `A newer human field event outranks this source assertion on: ${contested.join(', ')}.`;
+        }
+      }
+    } else if (row.op === 'add') {
+      duplicateOf = duplicateCandidate(db, projectId, registerName, row);
+      if (duplicateOf) {
+        op = 'possible_duplicate';
+        reason = `Substantively similar to existing ${registerName} row ${duplicateOf}; adjudicate before adding a second record.`;
       }
     }
     const current = row.target_id ? db.prepare('SELECT raw_row_json FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(projectId, row.target_id) as { raw_row_json: string } | undefined : undefined;
-    const proposed = { title: row.title, summary: row.summary, status: row.status, record_type: row.record_type, owner: row.owner, due_date_raw: row.due_date_raw, source_ref: row.source_ref, related_refs: row.related_refs, supersedes: row.supersedes, details: row.details };
+    const proposed = { ...assertedFields(row), discharges_markers: row.discharges_markers };
     return {
       seq: index + 1, op, registerName, clientRef: row.client_ref, targetExternalId: row.target_id,
       proposedRow: proposed,
-      fieldDiff: current ? { before: JSON.parse(current.raw_row_json) as unknown, after: proposed, reason } : { before: null, after: proposed, reason },
+      fieldDiff: current ? { before: JSON.parse(current.raw_row_json) as unknown, after: proposed, reason, contestedFields: contested, duplicateOf } : { before: null, after: proposed, reason, contestedFields: contested, duplicateOf },
       anchors: row.anchors, confidence: row.confidence, derivation: row.derivation,
     };
   });
@@ -362,19 +739,45 @@ export function freezePacketAndCreateChangeset(db: DatabaseSync, rawPacket: unkn
   const packetId = `packet:${project.id}:${packetHash.slice(0, 20)}`;
   const changesetId = `changeset:${project.id}:${packetHash.slice(0, 20)}`;
   const ops = deterministicOps(db, project.id, packet);
-  const deterministicHash = hash(stable({ baseRegisterRevision: packet.base_register_revision, ops, versions: { validator: VALIDATOR_VERSION, reconciliation: RECONCILIATION_VERSION, projector: PROJECTOR_VERSION, scoring: SCORING_VERSION } }));
+  const deterministicHash = hash(stable({ baseRegisterRevision: packet.base_register_revision, ops, versions: { validator: VALIDATOR_VERSION, reconciliation: RECONCILIATION_VERSION, projector: PROJECTOR_VERSION, scoring: activeScoringVersion(db) } }));
   const assembledAt = nowIso();
+
+  // Freezing is idempotent (C1). Re-submitting a packet that has already been
+  // frozen must return the existing handoff untouched. The previous code
+  // unconditionally deleted and re-inserted every operation as `pending`, which
+  // destroyed the reviewer's decisions while leaving `review_status` at
+  // `ready-to-apply` — so the subsequent apply selected zero accepted
+  // operations, wrote an empty import run, bumped the register revision, marked
+  // the changeset applied and reported success. Reviewed content vanished with
+  // an audit trail that read "applied".
+  const alreadyFrozen = db.prepare('SELECT id FROM extraction_packets WHERE project_id = ? AND packet_sha256 = ?').get(project.id, packetHash) as { id: string } | undefined;
+  if (alreadyFrozen) {
+    const existing = db.prepare('SELECT * FROM register_changesets WHERE id = ?').get(changesetId) as Record<string, unknown> | undefined;
+    return {
+      packetId: String(alreadyFrozen.id),
+      packetHash,
+      changesetId,
+      deterministicHash: existing ? String(existing.deterministic_hash) : deterministicHash,
+      gateVerdict: existing ? String(existing.gate_verdict) : validation.verdict,
+      validation,
+      alreadyFrozen: true as const,
+      reviewStatus: existing ? String(existing.review_status) : null,
+    };
+  }
+
   db.exec('BEGIN IMMEDIATE;');
   try {
     const firstRun = db.prepare('SELECT skill_sha256, prompt_sha256 FROM extraction_runs WHERE id = ?').get(packet.execution.runs[0]) as { skill_sha256: string; prompt_sha256: string };
     db.prepare('INSERT INTO extraction_packets (id, source_id, project_id, packet_contract_version, source_normaliser_version, database_schema_version, validator_version, reconciliation_engine_version, current_state_projector_version, scoring_configuration_version, skill_sha256, prompt_sha256, packet_sha256, packet_json, assembled_at, validation_status, validation_report_json, base_register_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, packet_sha256) DO NOTHING')
-      .run(packetId, packet.source.source_id, project.id, PACKET_VERSION, SOURCE_NORMALISER_VERSION, DATABASE_SCHEMA_VERSION, VALIDATOR_VERSION, RECONCILIATION_VERSION, PROJECTOR_VERSION, SCORING_VERSION, firstRun.skill_sha256, firstRun.prompt_sha256, packetHash, packetJson, assembledAt, validation.verdict, JSON.stringify({ issues: validation.issues, metrics: validation.metrics }), packet.base_register_revision);
+      .run(packetId, packet.source.source_id, project.id, PACKET_VERSION, SOURCE_NORMALISER_VERSION, DATABASE_SCHEMA_VERSION, VALIDATOR_VERSION, RECONCILIATION_VERSION, PROJECTOR_VERSION, activeScoringVersion(db), firstRun.skill_sha256, firstRun.prompt_sha256, packetHash, packetJson, assembledAt, validation.verdict, JSON.stringify({ issues: validation.issues, metrics: validation.metrics }), packet.base_register_revision);
     const coverage = db.prepare('INSERT OR REPLACE INTO packet_coverage (packet_id, scope, key, status, item_count, explanation) VALUES (?, ?, ?, ?, ?, ?)');
     for (const entry of packet.coverage.windows) coverage.run(packetId, 'window', entry.key, entry.status, entry.item_count, entry.explanation);
     for (const entry of packet.coverage.categories) coverage.run(packetId, 'category', entry.key, entry.status, entry.item_count, entry.explanation);
     db.prepare('INSERT INTO register_changesets (id, packet_id, project_id, source_id, created_at, gate_verdict, gate_report_json, review_status, applied_at, base_register_revision, deterministic_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(id) DO UPDATE SET gate_verdict = excluded.gate_verdict, gate_report_json = excluded.gate_report_json, deterministic_hash = excluded.deterministic_hash')
       .run(changesetId, packetId, project.id, packet.source.source_id, assembledAt, validation.verdict, JSON.stringify(validation), validation.verdict === 'quarantined' ? 'quarantined' : 'pending', packet.base_register_revision, deterministicHash);
-    db.prepare('DELETE FROM register_change_ops WHERE changeset_id = ?').run(changesetId);
+    // Only untouched operations may be replaced; migration 011 enforces the same
+    // rule with a trigger so no future writer can bypass it.
+    db.prepare("DELETE FROM register_change_ops WHERE changeset_id = ? AND status = 'pending'").run(changesetId);
     const insertOp = db.prepare('INSERT INTO register_change_ops (id, changeset_id, seq, op, register_name, client_ref, target_external_id, allocated_external_id, proposed_row_json, field_diff_json, anchors_json, confidence, derivation, status) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)');
     for (const op of ops) insertOp.run(`${changesetId}:op:${String(op.seq).padStart(3, '0')}`, changesetId, op.seq, op.op, op.registerName, op.clientRef, op.targetExternalId, stable(op.proposedRow), stable(op.fieldDiff), stable(op.anchors), op.confidence, op.derivation, 'pending');
     const jobId = `source-job:${project.id}:${packet.source.content_hash.slice(0, 16)}`;
@@ -416,7 +819,12 @@ export function reviewChangeset(db: DatabaseSync, changesetId: string, input: { 
 const prefixes: Record<RegisterName, string> = { Decisions: 'D', Actions: 'A', Risks_Issues: 'R', Config_Changes: 'C', Open_Questions: 'Q', Milestones: 'M', Entities: 'E', Sources: 'SRC', Uncertainty: 'U' };
 
 function allocateId(db: DatabaseSync, projectId: string, projectCode: string, registerName: RegisterName): string {
-  const prefix = prefixes[registerName] === 'SRC' ? 'SRC' : `${projectCode}-${prefixes[registerName]}`;
+  // Every register identifier is project-qualified, Sources included. Sources
+  // rows previously allocated a bare `SRC-nnn`, which becomes a database-wide
+  // namespace once projected into `project_sources`, so the second project to
+  // apply a changeset collided with the first and rolled back — the C2 defect
+  // displaced from ingest to apply.
+  const prefix = `${projectCode}-${prefixes[registerName]}`;
   const stored = db.prepare('SELECT next_seq FROM id_allocations WHERE project_id = ? AND prefix = ?').get(projectId, prefix) as { next_seq: number } | undefined;
   let sequence = stored?.next_seq;
   if (!sequence) {
@@ -438,7 +846,7 @@ function writeTyped(db: DatabaseSync, registerName: RegisterName, rowId: string,
   else if (registerName === 'Uncertainty') db.prepare('INSERT OR REPLACE INTO register_uncertainty (register_row_id, project_id, external_register_id, why_uncertain, resolve_by, status) VALUES (?, ?, ?, ?, ?, ?)').run(rowId, projectId, externalId, text(detail.why_uncertain) || title, text(detail.resolve_by) || null, status);
 }
 
-function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode: string; packetId: string; packetHash: string; sourceId: string; importRunId: string; timestamp: string }, op: Record<string, unknown>) {
+function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode: string; packetId: string; packetHash: string; sourceId: string; importRunId: string; timestamp: string; refMap: Map<string, string>; verifiedQuotes: Set<string> }, op: Record<string, unknown>) {
   const registerName = String(op.register_name) as RegisterName;
   const proposed = JSON.parse(String(op.proposed_row_json)) as JsonObject;
   const targetId = op.target_external_id ? String(op.target_external_id) : null;
@@ -448,26 +856,50 @@ function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode:
       .run(randomUUID(), context.projectId, targetId, context.timestamp, String(op.reviewer ?? 'reviewer'), 'reaffirm', 'Source reaffirmed the existing record.', context.packetId, context.sourceId);
     return targetId;
   }
-  const externalId = op.op === 'add' || op.op === 'supersede' ? allocateId(db, context.projectId, context.projectCode, registerName) : targetId;
+  const externalId = context.refMap.get(String(op.client_ref)) ?? targetId;
   if (!externalId) throw new Error('Apply operation has no target or allocated ID.');
   const existing = db.prepare('SELECT * FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(context.projectId, externalId) as Record<string, unknown> | undefined;
-  const raw = existing ? { ...(JSON.parse(String(existing.raw_row_json)) as JsonObject), ...proposed } : proposed;
+  // `proposed` carries only the fields this source actually asserted, so an
+  // update genuinely patches the row instead of nulling everything the source
+  // did not mention (C13).
+  const raw = existing ? { ...(JSON.parse(String(existing.raw_row_json)) as JsonObject), ...proposed } : { ...proposed };
+  delete raw.discharges_markers;
+  // Intra-packet references arrive as client refs and must resolve to the
+  // durable identifiers allocated in this same transaction (C14). Previously
+  // they were persisted verbatim, leaving every cross-reference dangling.
+  const resolveRefs = (value: unknown): string[] => (Array.isArray(value) ? value.map((entry) => context.refMap.get(String(entry)) ?? String(entry)) : []);
+  const relatedIds = resolveRefs(proposed.related_refs);
+  const supersedesIds = resolveRefs(proposed.supersedes);
+  raw.related_refs = relatedIds;
+  raw.supersedes = supersedesIds;
   if (op.op === 'resolve') raw.status = 'resolved';
   const due = resolveDate(proposed.due_date_raw, (db.prepare('SELECT event_date FROM source_documents WHERE id = ?').get(context.sourceId) as { event_date: string | null }).event_date);
   const rowId = `register:${context.projectId}:${externalId}`;
   db.prepare(`INSERT INTO project_register_rows (id, project_id, register_name, external_register_id, title, summary, record_status, record_type, owner, due_date, source_ref, source_anchor, original_status_wording, related_ids_json, supersession_ids_json, work_package_tags_json, import_run_id, source_id, original_row_number, original_tab_name, raw_row_json, normalized_row_json, created_at, updated_at, derivation, confidence, first_seen_source_id, last_updated_source_id, due_date_raw, due_date_confidence)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(project_id, external_register_id) DO UPDATE SET title = excluded.title, summary = excluded.summary, record_status = excluded.record_status, record_type = excluded.record_type, owner = excluded.owner, due_date = excluded.due_date, source_ref = excluded.source_ref, original_status_wording = excluded.original_status_wording, related_ids_json = excluded.related_ids_json, supersession_ids_json = excluded.supersession_ids_json, import_run_id = excluded.import_run_id, source_id = excluded.source_id, raw_row_json = excluded.raw_row_json, normalized_row_json = excluded.normalized_row_json, updated_at = excluded.updated_at, derivation = excluded.derivation, confidence = excluded.confidence, last_updated_source_id = excluded.last_updated_source_id, due_date_raw = excluded.due_date_raw, due_date_confidence = excluded.due_date_confidence`)
-    .run(rowId, context.projectId, registerName, externalId, String(proposed.title), String(proposed.summary ?? ''), String(raw.status ?? 'open'), proposed.record_type ? String(proposed.record_type) : null, proposed.owner ? String(proposed.owner) : null, due.date, proposed.source_ref ? String(proposed.source_ref) : context.sourceId, null, String(raw.status ?? 'open'), JSON.stringify(proposed.related_refs ?? []), JSON.stringify(proposed.supersedes ?? []), '[]', context.importRunId, context.sourceId, null, registerName, stable(raw), stable(Object.fromEntries(Object.entries(raw).map(([key, value]) => [key, normalizedQuote(String(value ?? ''))]))), context.timestamp, context.timestamp, String(op.derivation), String(op.confidence), existing?.first_seen_source_id ? String(existing.first_seen_source_id) : context.sourceId, context.sourceId, proposed.due_date_raw ? String(proposed.due_date_raw) : null, due.confidence);
+    .run(rowId, context.projectId, registerName, externalId, String(raw.title), String(raw.summary ?? ''), String(raw.status ?? 'open'), raw.record_type ? String(raw.record_type) : null, raw.owner ? String(raw.owner) : null, due.date, raw.source_ref ? String(raw.source_ref) : context.sourceId, null, String(raw.status ?? 'open'), JSON.stringify(relatedIds), JSON.stringify(supersedesIds), '[]', context.importRunId, context.sourceId, null, registerName, canonicalRowJson(raw), canonicalNormalizedRowJson(raw), context.timestamp, context.timestamp, String(op.derivation), String(op.confidence), existing?.first_seen_source_id ? String(existing.first_seen_source_id) : context.sourceId, context.sourceId, raw.due_date_raw ? String(raw.due_date_raw) : null, due.confidence);
   db.prepare('DELETE FROM project_register_row_fields WHERE register_row_id = ?').run(rowId);
   const insertField = db.prepare('INSERT INTO project_register_row_fields (id, register_row_id, project_id, register_name, external_register_id, field_name, original_value_json, normalized_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
-  for (const [field, value] of Object.entries(raw)) insertField.run(randomUUID(), rowId, context.projectId, registerName, externalId, field, stable(value), normalizedQuote(String(value ?? '')));
-  writeTyped(db, registerName, rowId, context.projectId, externalId, proposed.details as JsonObject, String(proposed.title), String(raw.status ?? 'open'));
+  // Import and pipeline now serialise identically (C11); previously the pipeline
+  // wrote "[object object]" for every details field, so live field parity drifted
+  // the moment a changeset applied.
+  for (const [field, value] of Object.entries(raw)) insertField.run(randomUUID(), rowId, context.projectId, registerName, externalId, field, canonicalValueJson(value), canonicalNormalizedValue(value));
+  writeTyped(db, registerName, rowId, context.projectId, externalId, (raw.details ?? {}) as JsonObject, String(raw.title), String(raw.status ?? 'open'));
   db.prepare('DELETE FROM register_row_anchors WHERE project_id = ? AND external_register_id = ? AND source_id = ?').run(context.projectId, externalId, context.sourceId);
+  const insertAnchor = db.prepare('INSERT INTO register_row_anchors (id, project_id, external_register_id, source_id, segment_id, speaker, t_ms, quote, verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
   for (const anchor of JSON.parse(String(op.anchors_json)) as Array<{ segment_seq: number; speaker: string | null; t_ms: number | null; quote: string | null }>) {
-    db.prepare('INSERT INTO register_row_anchors (id, project_id, external_register_id, source_id, segment_id, speaker, t_ms, quote, verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)')
-      .run(randomUUID(), context.projectId, externalId, context.sourceId, `${context.sourceId}:seg:${String(anchor.segment_seq).padStart(5, '0')}`, anchor.speaker, anchor.t_ms, anchor.quote);
+    // `verified` records whether this quote was mechanically confirmed against
+    // the source, not whether we would like it to have been (B1). It was
+    // previously hardcoded to 1, so an inference row's unchecked quote was
+    // presented to the consultant as verified evidence.
+    const verified = anchor.quote && context.verifiedQuotes.has(`${anchor.segment_seq}:${foldEvidence(anchor.quote)}`) ? 1 : 0;
+    insertAnchor.run(randomUUID(), context.projectId, externalId, context.sourceId, `${context.sourceId}:seg:${String(anchor.segment_seq).padStart(5, '0')}`, anchor.speaker, anchor.t_ms, anchor.quote, verified);
   }
+  // Persist which register item accounted for each HIGH marker, so the discharge
+  // is answerable after the fact rather than being a transient gate result (B3).
+  const dischargeStatement = db.prepare('UPDATE source_markers SET discharged_by_item_ref = ? WHERE id = ? AND source_id = ?');
+  for (const markerId of (Array.isArray(proposed.discharges_markers) ? proposed.discharges_markers : []) as string[]) dischargeStatement.run(externalId, String(markerId), context.sourceId);
   if (op.op === 'supersede' && targetId) {
     db.prepare("UPDATE project_register_rows SET record_status = 'superseded', supersession_ids_json = ? WHERE project_id = ? AND external_register_id = ?").run(JSON.stringify([externalId]), context.projectId, targetId);
   }
@@ -484,14 +916,35 @@ export function applyReviewedChangeset(db: DatabaseSync, changesetId: string) {
   const packet = db.prepare('SELECT * FROM extraction_packets WHERE id = ?').get(String(changeset.packet_id)) as Record<string, unknown>;
   const project = db.prepare('SELECT code FROM projects WHERE id = ?').get(String(changeset.project_id)) as { code: string };
   const ops = db.prepare("SELECT * FROM register_change_ops WHERE changeset_id = ? AND status = 'accepted' ORDER BY seq").all(changesetId) as Array<Record<string, unknown>>;
+  if (ops.length === 0) throw new Error('A changeset with no accepted operations cannot be applied; reject it instead of recording an empty apply.');
   const timestamp = nowIso();
   const importRunId = `register-import:${changeset.project_id}:${String(packet.packet_sha256).slice(0, 16)}`;
+  // Quotes are re-verified mechanically at apply time so the `verified` flag
+  // stored on each anchor reflects the source, not the packet's assertion.
+  const verifiedQuotes = new Set<string>();
+  for (const op of ops) {
+    for (const anchor of JSON.parse(String(op.anchors_json)) as Array<{ segment_seq: number; quote: string | null }>) {
+      if (!anchor.quote) continue;
+      const segments = db.prepare('SELECT text FROM source_segments WHERE source_id = ? AND seq BETWEEN ? AND ?').all(String(changeset.source_id), anchor.segment_seq - 1, anchor.segment_seq + 1) as Array<Record<string, unknown>>;
+      if (quoteResolves(segments, anchor.quote)) verifiedQuotes.add(`${anchor.segment_seq}:${foldEvidence(anchor.quote)}`);
+    }
+  }
   db.exec('BEGIN IMMEDIATE;');
   try {
     db.prepare(`INSERT OR IGNORE INTO project_register_import_runs (id, project_id, packet_type, packet_version, project_code, source_workbook_name, source_workbook_hash, benchmark_json_hash, status, started_at, completed_at, records_total, records_imported, blocking_errors_json, verification_status, raw_packet_json)
       VALUES (?, ?, 'project_register_delta', 1, ?, NULL, NULL, ?, 'completed', ?, ?, ?, ?, '[]', 'human-reviewed', ?)`)
       .run(importRunId, String(changeset.project_id), project.code, String(packet.packet_sha256), timestamp, timestamp, ops.length, ops.length, String(packet.packet_json));
-    for (const op of ops) upsertFact(db, { projectId: String(changeset.project_id), projectCode: project.code, packetId: String(packet.id), packetHash: String(packet.packet_sha256), sourceId: String(changeset.source_id), importRunId, timestamp }, op);
+    // Two passes: allocate every durable identifier first, so intra-packet
+    // references can resolve to identifiers allocated later in the same
+    // changeset (C14). Allocation happens inside this transaction, so a failure
+    // rolls the sequence back with everything else.
+    const refMap = new Map<string, string>();
+    for (const op of ops) {
+      const clientRef = String(op.client_ref);
+      if (op.op === 'add' || op.op === 'supersede') refMap.set(clientRef, allocateId(db, String(changeset.project_id), project.code, String(op.register_name) as RegisterName));
+      else if (op.target_external_id) refMap.set(clientRef, String(op.target_external_id));
+    }
+    for (const op of ops) upsertFact(db, { projectId: String(changeset.project_id), projectCode: project.code, packetId: String(packet.id), packetHash: String(packet.packet_sha256), sourceId: String(changeset.source_id), importRunId, timestamp, refMap, verifiedQuotes }, op);
     db.prepare('INSERT INTO project_register_revisions (project_id, revision, updated_at) VALUES (?, 1, ?) ON CONFLICT(project_id) DO UPDATE SET revision = revision + 1, updated_at = excluded.updated_at').run(String(changeset.project_id), timestamp);
     rebuildProjection(db, String(changeset.project_id), timestamp);
     db.prepare("UPDATE register_changesets SET review_status = 'applied', applied_at = ? WHERE id = ?").run(timestamp, changesetId);
@@ -509,16 +962,28 @@ export function replayPacket(db: DatabaseSync, packetId: string) {
   const started = performance.now();
   const stored = db.prepare('SELECT * FROM extraction_packets WHERE id = ?').get(packetId) as Record<string, unknown> | undefined;
   if (!stored) throw new Error('Extraction packet not found.');
-  const packet = JSON.parse(String(stored.packet_json)) as unknown;
-  const validation = validatePacket(db, packet);
+  const packetJson = String(stored.packet_json);
+  // Replay must first prove the artefact is the one that was frozen (C4).
+  // Nothing previously compared the stored bytes against the stored hash, so a
+  // tampered or corrupted `packet_json` replayed silently while the recorded
+  // SHA-256 still asserted the original.
+  const storedHash = String(stored.packet_sha256);
+  const recomputedHash = hash(packetJson);
+  if (recomputedHash !== storedHash) throw new Error(`Stored packet has been altered: recorded SHA-256 ${storedHash} but stored bytes hash to ${recomputedHash}.`);
+  const packet = JSON.parse(packetJson) as unknown;
+  const validation = validatePacket(db, packet, { mode: 'replay' });
   if (!validation.packet) throw new Error('Stored packet no longer satisfies its recorded contract.');
+  // The canonical re-serialisation must also reproduce the frozen bytes, which
+  // proves the serialiser itself is still deterministic on this host.
+  const canonicalHash = hash(stable(validation.packet));
+  if (canonicalHash !== storedHash) throw new Error(`Canonical re-serialisation of the stored packet does not reproduce its frozen hash (${canonicalHash} vs ${storedHash}).`);
   const projectId = String(stored.project_id);
   const ops = deterministicOps(db, projectId, validation.packet);
-  const changesetHash = hash(stable({ baseRegisterRevision: validation.packet.base_register_revision, ops, versions: { validator: VALIDATOR_VERSION, reconciliation: RECONCILIATION_VERSION, projector: PROJECTOR_VERSION, scoring: SCORING_VERSION } }));
+  const changesetHash = hash(stable({ baseRegisterRevision: validation.packet.base_register_revision, ops, versions: { validator: VALIDATOR_VERSION, reconciliation: RECONCILIATION_VERSION, projector: PROJECTOR_VERSION, scoring: activeScoringVersion(db) } }));
   const registerState = db.prepare('SELECT * FROM project_register_rows WHERE project_id = ? ORDER BY register_name, external_register_id').all(projectId);
   const projection = db.prepare('SELECT * FROM register_row_state WHERE project_id = ? ORDER BY register_name, external_register_id').all(projectId);
   const scores = db.prepare('SELECT * FROM register_row_scores WHERE project_id = ? ORDER BY external_register_id').all(projectId);
-  return { packetId, providerCalls: 0, durationMs: Math.round((performance.now() - started) * 1000) / 1000, changesetHash, registerStateHash: hash(stable(registerState)), projectionHash: hash(stable(projection)), scoresHash: hash(stable(scores)), validationVerdict: validation.verdict };
+  return { packetId, providerCalls: 0, durationMs: Math.round((performance.now() - started) * 1000) / 1000, changesetHash, packetHashVerified: true, registerStateHash: hash(stable(registerState)), projectionHash: hash(stable(projection)), scoresHash: hash(stable(scores)), validationVerdict: validation.verdict, revisionCurrent: validation.revisionCurrent };
 }
 
 function readChangeset(db: DatabaseSync, row: Record<string, unknown>) {
@@ -546,7 +1011,12 @@ export function readSourceIntelligence(db: DatabaseSync, projectId: string) {
 
 export function computeProjectOverview(db: DatabaseSync, projectId: string) {
   const pin = db.prepare('SELECT mode FROM project_overview_pins WHERE project_id = ?').get(projectId) as { mode: string | null } | undefined;
-  const latestChangeset = db.prepare("SELECT * FROM register_changesets WHERE project_id = ? AND (applied_at >= datetime('now', '-1 day') OR acknowledged_at IS NULL) ORDER BY created_at DESC LIMIT 1").get(projectId) as Record<string, unknown> | undefined;
+  // A changeset leads the overview until the consultant acknowledges it (C9).
+  // `acknowledged_at` had no writer at all, so the predicate was always true and
+  // the overview was permanently latched to `changes` — `meeting` and
+  // `needs-warwick` could never be selected again once a project had ever
+  // processed a source.
+  const latestChangeset = db.prepare("SELECT * FROM register_changesets WHERE project_id = ? AND acknowledged_at IS NULL AND review_status <> 'quarantined' ORDER BY created_at DESC LIMIT 1").get(projectId) as Record<string, unknown> | undefined;
   const meeting = db.prepare("SELECT external_register_id FROM register_row_state WHERE project_id = ? AND register_name = 'Milestones' AND due_date BETWEEN date('now') AND date('now', '+1 day') LIMIT 1").get(projectId);
   const computedMode = latestChangeset ? 'changes' : meeting ? 'meeting' : 'needs-warwick';
   const leadMode = pin?.mode ?? computedMode;
@@ -556,8 +1026,10 @@ export function computeProjectOverview(db: DatabaseSync, projectId: string) {
     WHERE r.project_id = ? ORDER BY sc.score DESC, r.external_register_id LIMIT 200`).all(projectId) as Array<Record<string, unknown>>;
   const open = rows.filter((row) => !/resolved|closed|complete|superseded|rejected|ratified/i.test(String(row.status)));
   const lenses: Record<string, Array<Record<string, unknown>>> = {
-    needsWarwick: open.filter((row) => isProjectConsultantOwner(db, projectId, row.owner) && ['Now', 'Soon'].includes(String(row.band))),
-    needsCustomer: open.filter((row) => row.owner && !isProjectConsultantOwner(db, projectId, row.owner)),
+    // Unowned high-priority rows are the consultant's problem by definition;
+    // the previous filter dropped every one of them (C10).
+    needsWarwick: open.filter((row) => needsConsultantAttention(db, projectId, row.owner, String(row.band))),
+    needsCustomer: open.filter((row) => row.owner && !needsConsultantAttention(db, projectId, row.owner, String(row.band))),
     topRisksIssues: open.filter((row) => row.register_name === 'Risks_Issues'),
     decisionsRequired: open.filter((row) => row.register_name === 'Decisions' && /awaiting|pending|proposed/i.test(String(row.status))),
     blockingQuestions: open.filter((row) => row.register_name === 'Open_Questions' && Boolean((JSON.parse(String(row.inputs_json)) as JsonObject).blocking)),
@@ -568,6 +1040,13 @@ export function computeProjectOverview(db: DatabaseSync, projectId: string) {
   };
   const compact = (row: Record<string, unknown>) => ({ id: String(row.external_register_id), registerName: String(row.register_name), title: String(row.title), summary: String(row.summary), status: String(row.status), owner: row.owner ? String(row.owner) : null, dueDate: row.due_date ? String(row.due_date) : null, score: Number(row.score), band: String(row.band), scoreInputs: JSON.parse(String(row.inputs_json)) as JsonObject });
   return { leadMode, computedMode, pinnedMode: pin?.mode ?? null, modes: { changes: { available: Boolean(latestChangeset), changesetId: latestChangeset ? String(latestChangeset.id) : null }, meeting: { available: Boolean(meeting) }, needsWarwick: { available: true } }, lenses: Object.fromEntries(Object.entries(lenses).map(([key, value]) => [key, value.slice(0, 40).map(compact)])) };
+}
+
+export function acknowledgeChangeset(db: DatabaseSync, changesetId: string, actor = 'Warwick') {
+  const changeset = db.prepare('SELECT project_id, acknowledged_at FROM register_changesets WHERE id = ?').get(changesetId) as { project_id: string; acknowledged_at: string | null } | undefined;
+  if (!changeset) throw new Error('Changeset not found.');
+  if (!changeset.acknowledged_at) db.prepare('UPDATE register_changesets SET acknowledged_at = ?, acknowledged_by = ? WHERE id = ?').run(nowIso(), actor, changesetId);
+  return computeProjectOverview(db, String(changeset.project_id));
 }
 
 export function pinOverviewMode(db: DatabaseSync, projectId: string, mode: 'changes' | 'meeting' | 'needs-warwick' | null, actor = 'Warwick') {
@@ -672,6 +1151,24 @@ export async function buildConsultantBrief(db: DatabaseSync, projectId: string, 
     return buildDeterministicBrief(db, projectId, mode);
   }
 }
+// A structural heading names a section; it does not assert anything about the
+// project. Anything else in heading position is a claim and must be cited.
+const STRUCTURAL_HEADINGS = new Set([
+  'needs warwick', 'needs you', 'top risks and issues', 'risks and issues', 'decisions required',
+  'blocking questions', 'due next', 'uncertain or conflicting', 'changes since last source',
+  'meeting order', 'challenges', 'summary', 'overview', 'actions', 'decisions', 'risks', 'questions',
+  'milestones', 'next steps', 'recommended order', 'open questions', 'entities', 'sources', 'uncertainty',
+]);
+
+export function isStructuralHeading(line: string): boolean {
+  const label = line.replace(/^#{1,6}\s*/, '').replace(/[:.]\s*$/, '').trim().toLowerCase();
+  if (STRUCTURAL_HEADINGS.has(label)) return true;
+  // A short noun-phrase label with no finite verb and no sentence punctuation is
+  // still structural; a sentence is not.
+  const words = label.split(/\s+/).filter(Boolean);
+  return words.length > 0 && words.length <= 4 && !/[.!?;]/.test(label) && !/\b(?:is|are|was|were|has|have|will|must|should|slipped|needs|remains|requires)\b/.test(label);
+}
+
 export function validateBriefCitations(markdown: string, selectedIds: string[]) {
   const selected = new Set(selectedIds);
   const kept: string[] = [];
@@ -679,7 +1176,11 @@ export function validateBriefCitations(markdown: string, selectedIds: string[]) 
   let removed = 0;
   const invalidCitations = new Set<string>();
   for (const line of markdown.split(/\r?\n/)) {
-    if (!line.trim() || /^#{1,6}\s/.test(line)) { kept.push(line); continue; }
+    if (!line.trim()) { kept.push(line); continue; }
+    // Headings are exempt only when they are structural section labels (C12).
+    // A blanket heading exemption let an entire brief of uncited factual claims
+    // render as grounded and verified, because every line began with `##`.
+    if (/^#{1,6}\s/.test(line) && isStructuralHeading(line)) { kept.push(line); continue; }
     factual += 1;
     const citations = [...line.matchAll(/\[([A-Z][A-Z0-9-]*-\d+|SRC-\d+)\]/g)].map((match) => match[1]);
     const invalid = citations.filter((id) => !selected.has(id));

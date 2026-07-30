@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useApi, type ProjectResponse } from './api';
 import { AIChatPanel } from './AIChatPanel';
-import { ActivityList, AttentionList, EmptyState, ErrorState, FreshnessNotice, LoadingState, PageIntro, ProgressBar, Section, StatusChip, formatDate, formatDateTime, humanize } from './components';
+import { ActivityList, AttentionList, EmptyState, ErrorState, FreshnessNotice, LoadingState, PageIntro, ProgressBar, Section, SourceProcessingAlerts, SourceProcessingNotice, StatusChip, formatDate, formatDateTime, humanize, sourceProcessingView } from './components';
 
 type Project = ProjectResponse['project'];
 type JsonRecord = Record<string, unknown>;
@@ -335,13 +335,29 @@ function RegisterComparison({ project, compact = false }: { project: Project; co
   </Section>;
 }
 
+/**
+ * A metric with no denominator renders `n/a`, never `0.000` and never `1.000`.
+ * The harness now reports the honest `null` in `metrics`; the flat `precision` /
+ * `recall` fields it keeps for backwards compatibility carry `0` for
+ * "not measurable", which would read on screen as a catastrophic score.
+ */
+function metricLabel(value: number | null | undefined, applicable?: boolean): string {
+  if (value === null || value === undefined || applicable === false) return 'n/a';
+  return value.toFixed(3);
+}
+
 function BlindComparisonReport({ report }: { report: Project['blindExtractionComparisonReports'][number] }) {
-  const summary = report.summary as { totals?: { expectedRows?: number; extractedRows?: number; exactMatches?: number; semanticMatches?: number; missingItems?: number; additionalItems?: number; precision?: number; recall?: number }; registers?: Array<{ registerName: string; expectedRows: number; extractedRows: number; exactMatches: number; semanticMatches: number; missingItems: string[]; additionalItems: string[]; fieldLevelMismatches: number; statusDifferences: number; sourceAnchorDifferences: number; workPackageTagDifferences: number; precision: number; recall: number }> };
+  type Metrics = { precision?: number | null; registerRowRecall?: number | null; distinctFactRecall?: number | null };
+  const summary = report.summary as {
+    totals?: { expectedRows?: number; extractedRows?: number; exactMatches?: number; semanticMatches?: number; missingItems?: number; additionalItems?: number; precision?: number; recall?: number; metrics?: Metrics };
+    registers?: Array<{ registerName: string; expectedRows: number; extractedRows: number; exactMatches: number; semanticMatches: number; missingItems: string[]; additionalItems: string[]; fieldLevelMismatches: number; statusDifferences: number; sourceAnchorDifferences: number; workPackageTagDifferences: number; precision: number; recall: number; applicable?: boolean; metrics?: Metrics }>;
+  };
   const totals = summary.totals;
+  const totalMetrics = totals?.metrics;
   return <div className="blind-report">
     <div className="record-line"><div><p className="record-type">Sealed benchmark comparison . {formatDateTime(report.createdAt)}</p><h3>Benchmark-Informed Extraction Comparison</h3></div><StatusChip value={report.comparisonStatus} /></div>
-    {totals ? <div className="metric-grid compact"><div><strong>{totals.expectedRows ?? 0}</strong><small>Expected rows</small></div><div><strong>{totals.extractedRows ?? 0}</strong><small>Extracted rows</small></div><div><strong>{totals.exactMatches ?? 0}</strong><small>Exact</small></div><div><strong>{totals.semanticMatches ?? 0}</strong><small>Semantic</small></div><div><strong>{totals.precision ?? 0}</strong><small>Precision</small></div><div><strong>{totals.recall ?? 0}</strong><small>Recall</small></div></div> : null}
-    {summary.registers ? <RecordTable label="Benchmark-informed extraction comparison" columns={['Register', 'Expected', 'Extracted', 'Exact', 'Semantic', 'Missing', 'Additional', 'Field mismatches', 'Status', 'Anchor', 'WP', 'Precision', 'Recall']} rows={summary.registers.map((row) => [humanize(row.registerName), String(row.expectedRows), String(row.extractedRows), String(row.exactMatches), String(row.semanticMatches), String(row.missingItems.length), String(row.additionalItems.length), String(row.fieldLevelMismatches), String(row.statusDifferences), String(row.sourceAnchorDifferences), String(row.workPackageTagDifferences), row.precision.toFixed(3), row.recall.toFixed(3)])} /> : null}
+    {totals ? <div className="metric-grid compact"><div><strong>{totals.expectedRows ?? 0}</strong><small>Expected rows</small></div><div><strong>{totals.extractedRows ?? 0}</strong><small>Extracted rows</small></div><div><strong>{totals.exactMatches ?? 0}</strong><small>Exact</small></div><div><strong>{totals.semanticMatches ?? 0}</strong><small>Semantic</small></div><div><strong>{totalMetrics ? metricLabel(totalMetrics.precision) : metricLabel(totals.precision)}</strong><small>Precision</small></div><div><strong>{totalMetrics ? metricLabel(totalMetrics.registerRowRecall) : metricLabel(totals.recall)}</strong><small>Row recall</small></div><div><strong>{metricLabel(totalMetrics?.distinctFactRecall)}</strong><small>Fact recall</small></div></div> : null}
+    {summary.registers ? <RecordTable label="Benchmark-informed extraction comparison" columns={['Register', 'Expected', 'Extracted', 'Exact', 'Semantic', 'Missing', 'Additional', 'Field mismatches', 'Status', 'Anchor', 'WP', 'Precision', 'Row recall', 'Fact recall']} rows={summary.registers.map((row) => [humanize(row.registerName), String(row.expectedRows), String(row.extractedRows), String(row.exactMatches), String(row.semanticMatches), String(row.missingItems.length), String(row.additionalItems.length), String(row.fieldLevelMismatches), String(row.statusDifferences), String(row.sourceAnchorDifferences), String(row.workPackageTagDifferences), row.metrics ? metricLabel(row.metrics.precision) : metricLabel(row.precision, row.applicable), row.metrics ? metricLabel(row.metrics.registerRowRecall) : metricLabel(row.recall, row.applicable), metricLabel(row.metrics?.distinctFactRecall)])} /> : null}
     <details className="report-details"><summary>Detailed difference report</summary><pre>{report.reportMarkdown}</pre></details>
   </div>;
 }
@@ -373,6 +389,7 @@ function ProjectInbox({ projectId, userId, sources, proposals, sourceIntelligenc
   return <Section id="inbox" title="Project Inbox" kicker="Source intake and review" count={sources.length + proposals.filter((proposal) => proposal.status === 'proposed').length + pendingIntelligence}>
     <div className={`drop-zone ${dragging ? 'dragging' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); void upload(event.dataTransfer.files); }}><input id="source-picker" className="sr-only" type="file" multiple onChange={(event) => { if (event.target.files) void upload(event.target.files); }} /><label className="button" htmlFor="source-picker">Choose files</label><p>Drop VTT, TXT, EML or DOCX source files here. Originals are retained immutably before extraction and review.</p></div>
     {message ? <p className="inline-note">{message}</p> : null}{error ? <p className="form-error" role="alert">{error}</p> : null}
+    <SourceProcessingAlerts sources={sources} />
     {sourceIntelligence ? <ReviewLanes projectId={projectId} userId={userId} intelligence={sourceIntelligence} onChanged={onChanged} /> : null}
     {proposals.length ? <details className="legacy-proposals"><summary>Legacy source proposals ({proposals.length})</summary><div className="stacked-records">{proposals.map((proposal) => <article className="stacked-record" key={proposal.id}><div className="record-line"><div><h3>{proposal.payload.sourceMetadata.originalFileName}</h3><p>{proposal.payload.items.length} legacy proposed item(s)</p></div><StatusChip value={proposal.status} /></div><ul className="proposal-list">{proposal.payload.items.map((item) => <li key={item.id}><strong>{humanize(item.type)}</strong><span>{item.title}</span></li>)}</ul>{proposal.status === 'proposed' ? <p className="inline-note">Read-only historical proposal. Use governed changesets for review and apply.</p> : null}</article>)}</div></details> : null}
     <h3 className="subhead">Sources</h3><SourceList sources={sources} />
@@ -454,7 +471,10 @@ function SourceList({ sources }: { sources: Project['inboxSources'] }) {
   const [openError, setOpenError] = useState('');
   async function openSource(filePath: string) { try { setOpenError(''); await postJson('/api/files/open', 'POST', { path: filePath }); } catch (caught) { setOpenError(caught instanceof Error ? caught.message : 'Could not open original file.'); } }
   if (sources.length === 0) return <EmptyState>No sources have been taken into this project yet.</EmptyState>;
-  return <div className="stacked-records">{openError ? <p className="form-error" role="alert">{openError}</p> : null}{sources.map((source) => <article className="stacked-record" key={source.id}><div className="record-line"><div><h3>{source.originalFileName}</h3><p>{safePathLabel(source.currentExternalPath)}</p></div><StatusChip value={source.processingStatus} /></div><dl className="inline-details"><div><dt>Type</dt><dd>{source.sourceType}</dd></div><div><dt>Hash</dt><dd>{source.contentHash}</dd></div><div><dt>Received</dt><dd>{formatDateTime(source.originalReceivedAt)}</dd></div><div><dt>Processor</dt><dd>{source.processorProvider}</dd></div></dl><button className="inline-button" onClick={() => openSource(source.currentExternalPath)}>Open original</button></article>)}</div>;
+  return <div className="stacked-records">{openError ? <p className="form-error" role="alert">{openError}</p> : null}{sources.map((source) => {
+    const processing = sourceProcessingView(source);
+    return <article className="stacked-record" key={source.id}><div className="record-line"><div><h3>{source.originalFileName}</h3><p>{safePathLabel(source.currentExternalPath)}</p></div><StatusChip value={processing.chipValue} label={processing.chipLabel} /></div><dl className="inline-details"><div><dt>Type</dt><dd>{source.sourceType}</dd></div><div><dt>Hash</dt><dd>{source.contentHash}</dd></div><div><dt>Received</dt><dd>{formatDateTime(source.originalReceivedAt)}</dd></div><div><dt>Processor</dt><dd>{source.processorProvider}</dd></div><div><dt>Stage</dt><dd>{processing.stage ?? 'Not recorded'}</dd></div><div><dt>Last change</dt><dd>{formatDateTime(source.updatedAt)}</dd></div></dl><SourceProcessingNotice source={source} /><button className="inline-button" onClick={() => openSource(source.currentExternalPath)}>Open original</button></article>;
+  })}</div>;
 }
 
 function PlaceholderSection({ id, title }: { id: string; title: string }) { return <Section id={id} title={title} kicker="SQLite-backed workspace" count={0}><EmptyState>This workspace tab is ready for approved source-derived records.</EmptyState></Section>; }

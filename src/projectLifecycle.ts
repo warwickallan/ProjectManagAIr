@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { accessSync, existsSync, mkdirSync, readFileSync, rmSync, rmdirSync, writeFileSync } from 'node:fs';
+import { accessSync, existsSync, mkdirSync, readFileSync, rmSync, rmdirSync, statSync, writeFileSync } from 'node:fs';
 import { access, readFile, stat, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
@@ -137,13 +137,165 @@ function assertInside(root: string, candidate: string) {
   if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('Resolved path escapes the configured projects root');
 }
 
+function isInside(root: string, candidate: string) {
+  const relative = path.relative(root, candidate);
+  return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+/**
+ * Windows MAX_PATH is 260 characters and `writeFileSync` fails with ENOENT well
+ * before anything explains why. A realistic OneDrive root plus a 120-character
+ * project folder plus the deepest storage subfolder plus a 120-character file
+ * base already exceeds it, so every long path is budgeted against this ceiling
+ * rather than trusted to fit. The budget is enforced on every platform so the
+ * behaviour is testable and so a Windows user never receives a repository that
+ * only works on the developer's machine.
+ */
+const defaultPathBudget = 240;
+const minimumFileNameBudget = 24;
+const minimumFolderNameBudget = 8;
+const deepestStorageSubPath = Math.max(
+  ...Object.values(storageMapping).map((value) => value.length),
+  path.join('00_Inbox', 'Unsorted').length,
+);
+
+function pathBudget(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.PROJECTMANAGAIR_MAX_PATH_BUDGET);
+  return Number.isInteger(raw) && raw >= 96 ? raw : defaultPathBudget;
+}
+
+/** Longest project folder name that still leaves room for the deepest artifact path. */
+function folderNameBudget(root: string): number {
+  return pathBudget() - root.length - 1 - (deepestStorageSubPath + 1) - (minimumFileNameBudget + 1);
+}
+
+function boundedFolderName(root: string, rawName: string): string {
+  const budget = folderNameBudget(root);
+  if (budget < minimumFolderNameBudget) {
+    throw new Error(`The configured projects root is too long: a project folder plus its deepest storage subfolder would exceed the ${pathBudget()}-character path budget. Choose a shorter root.`);
+  }
+  const safe = safeName(rawName);
+  return safe.length <= budget ? safe : safeName(safe.slice(0, budget));
+}
+
+const dangerousPosixRoots = new Set(['/', '/Applications', '/Library', '/System', '/Users', '/Volumes', '/bin', '/boot', '/dev', '/etc', '/home', '/lib', '/lib32', '/lib64', '/media', '/mnt', '/opt', '/private', '/proc', '/root', '/run', '/sbin', '/srv', '/sys', '/usr', '/var']);
+// Written with forward slashes; the candidate is normalised to match. Keeping
+// literal `\\`-separated Windows paths out of the source also keeps this file
+// clean under the repository's own data-boundary scan.
+const dangerousWindowsRoots = new Set(['/windows', '/winnt', '/program files', '/program files (x86)', '/programdata', '/users', '/$recycle.bin', '/system volume information', '/perflogs', '/recovery']);
+/** Repository subdirectories that may legitimately hold a scratch projects root (all git-ignored). */
+const repositoryScratchDirectories = new Set(['artifacts', 'data', '.data', '.runtime', 'test-results']);
+
+function rootValidationError(message: string): Error & { statusCode: number } {
+  const error = new Error(message) as Error & { statusCode: number };
+  // Express's default error handler honours `statusCode`, so a rejected root
+  // surfaces as a 400 rather than an opaque 500.
+  error.statusCode = 400;
+  return error;
+}
+
+/**
+ * D8.2 — `projectsRoot` arrives from an unauthenticated local HTTP route and is
+ * persisted to the live local configuration file, so it is validated here
+ * rather than trusted. Returns the normalised absolute root.
+ */
+export function validateProjectsRoot(candidate: string): string {
+  const raw = String(candidate ?? '').trim();
+  if (!raw) throw rootValidationError('A projects root is required.');
+  if (raw.includes('\0')) throw rootValidationError('The projects root contains an invalid character.');
+  const looksAbsolute = path.isAbsolute(raw) || /^[A-Za-z]:[\\/]/.test(raw) || /^\\\\[^\\]/.test(raw);
+  if (!looksAbsolute) throw rootValidationError('The projects root must be an absolute path.');
+  if (process.platform === 'win32' && !/^[A-Za-z]:[\\/]/.test(raw) && !/^\\\\[^\\]/.test(raw)) {
+    throw rootValidationError('The projects root must start with a drive letter or a UNC share.');
+  }
+
+  const resolved = normalizeRoot(raw);
+  const comparable = resolved.replace(/[\\/]+$/, '');
+  if (comparable === '' || /^[A-Za-z]:$/.test(comparable)) {
+    throw rootValidationError('The projects root must not be a filesystem root.');
+  }
+  const separator = String.fromCharCode(92);
+  const withoutDrive = comparable.replace(/^[A-Za-z]:/, '').split(separator).join('/').toLowerCase();
+  if (dangerousPosixRoots.has(comparable) || dangerousWindowsRoots.has(withoutDrive)) {
+    throw rootValidationError('The projects root must not be a system location.');
+  }
+  if (withoutDrive.startsWith('/windows/') || withoutDrive.startsWith('/winnt/')) {
+    throw rootValidationError('The projects root must not be inside the Windows directory.');
+  }
+
+  if (resolved === repoRoot) throw rootValidationError('The projects root must not be the Project ManagAIr repository.');
+  if (isInside(repoRoot, resolved)) {
+    const firstSegment = path.relative(repoRoot, resolved).split(/[\\/]/)[0].toLowerCase();
+    if (!repositoryScratchDirectories.has(firstSegment)) {
+      throw rootValidationError('The projects root must not be inside the Project ManagAIr repository. Live project data belongs outside Git.');
+    }
+  }
+
+  let stats;
+  try {
+    stats = statSync(resolved);
+  } catch {
+    throw rootValidationError('The projects root does not exist.');
+  }
+  if (!stats.isDirectory()) throw rootValidationError('The projects root is not a directory.');
+  try {
+    accessSync(resolved, constants.R_OK | constants.W_OK);
+  } catch {
+    throw rootValidationError('The projects root is not readable and writable.');
+  }
+  if (folderNameBudget(resolved) < minimumFolderNameBudget) {
+    throw rootValidationError(`The projects root is too long. It must leave room for a project folder and its storage subfolders within the ${pathBudget()}-character path budget.`);
+  }
+  return resolved;
+}
+
+/**
+ * D7 — the live local configuration file has already been destroyed once by a
+ * test run, so the guard must not hang off a single ambient variable.
+ *
+ * `NODE_ENV` is only defaulted to `test` by Vitest when it is UNSET. Anyone who
+ * exports `NODE_ENV=development` in their shell (or a CI job that sets it)
+ * silently re-arms the clobber. So the guard consults several independent
+ * signals, and any one of them is enough to block:
+ *
+ *   1. `PROJECTMANAGAIR_LOCAL_CONFIG_MODE=blocked` — explicit opt-out, set for
+ *      every Vitest run by `vite.config.ts` (`test.env`).
+ *   2. `NODE_ENV=test` — also pinned by `vite.config.ts` (`test.env`) so it can
+ *      no longer be lost to an ambient value.
+ *   3. `VITEST` / `VITEST_WORKER_ID` / `VITEST_POOL_ID` — set by the Vitest
+ *      worker itself, independently of any config file, so the guard still
+ *      holds if `vite.config.ts` is edited or a different config is used.
+ *   4. `npm_lifecycle_event` starting with `test` — covers `npm test` wrappers.
+ *
+ * `PROJECTMANAGAIR_LOCAL_CONFIG_MODE=allow` is the explicit opt-in escape
+ * hatch, but it deliberately does NOT override signals 3 and 4: an in-process
+ * Vitest worker can never write the file, whatever else is configured.
+ */
+const vitestSignalVariables = ['VITEST', 'VITEST_WORKER_ID', 'VITEST_POOL_ID'] as const;
+
+export function localConfigWriteDecision(env: NodeJS.ProcessEnv = process.env): { allowed: boolean; reason: string } {
+  const vitestSignal = vitestSignalVariables.find((name) => String(env[name] ?? '').trim() !== '');
+  if (vitestSignal) return { allowed: false, reason: `blocked: ${vitestSignal} is set (Vitest worker)` };
+  const lifecycle = String(env.npm_lifecycle_event ?? '').trim().toLowerCase();
+  if (lifecycle.startsWith('test')) return { allowed: false, reason: `blocked: npm_lifecycle_event=${lifecycle}` };
+  const mode = String(env.PROJECTMANAGAIR_LOCAL_CONFIG_MODE ?? '').trim().toLowerCase();
+  if (mode === 'blocked') return { allowed: false, reason: 'blocked: PROJECTMANAGAIR_LOCAL_CONFIG_MODE=blocked' };
+  if (mode === 'allow') return { allowed: true, reason: 'allowed: PROJECTMANAGAIR_LOCAL_CONFIG_MODE=allow' };
+  if (String(env.NODE_ENV ?? '').trim().toLowerCase() === 'test') return { allowed: false, reason: 'blocked: NODE_ENV=test' };
+  return { allowed: true, reason: 'allowed: no test-runner signal detected' };
+}
+
+export function isLocalConfigAccessAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+  return localConfigWriteDecision(env).allowed;
+}
+
 function readLocalConfigFile(): { projectsRoot?: string; projectFolderNamingFormat?: string } {
-  if (process.env.NODE_ENV === 'test' || !existsSync(localConfigPath)) return {};
+  if (!isLocalConfigAccessAllowed() || !existsSync(localConfigPath)) return {};
   return JSON.parse(readFileSync(localConfigPath, 'utf8')) as { projectsRoot?: string; projectFolderNamingFormat?: string };
 }
 
 function writeLocalConfigFile(settings: { projectsRoot: string | null; projectFolderNamingFormat: string }) {
-  if (process.env.NODE_ENV === 'test') return;
+  if (!isLocalConfigAccessAllowed()) return;
   mkdirSync(path.dirname(localConfigPath), { recursive: true });
   writeFileSync(localConfigPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
 }
@@ -223,7 +375,13 @@ export async function readStorageSettings(db: DatabaseSync): Promise<ProjectStor
 }
 
 export async function updateStorageSettings(db: DatabaseSync, input: { projectsRoot?: string; projectFolderNamingFormat?: string }) {
-  const root = input.projectsRoot?.trim() ? normalizeRoot(input.projectsRoot) : null;
+  // An absent `projectsRoot` key means "leave the configured root alone"; only
+  // an explicitly empty value clears it. A partial body must never silently
+  // unconfigure the live root.
+  const current = db.prepare("SELECT projects_root FROM project_storage_settings WHERE id = 'local'").get() as { projects_root: string | null } | undefined;
+  const root = input.projectsRoot === undefined
+    ? (current?.projects_root?.trim() || null)
+    : (input.projectsRoot.trim() ? validateProjectsRoot(input.projectsRoot) : null);
   const naming = input.projectFolderNamingFormat?.trim() || defaultNamingFormat;
   writeLocalConfigFile({ projectsRoot: root, projectFolderNamingFormat: naming });
   const timestamp = nowIso();
@@ -255,7 +413,7 @@ export function createProject(db: DatabaseSync, input: CreateProjectInput) {
   accessSync(settingsRoot, constants.R_OK | constants.W_OK);
   const settings = db.prepare("SELECT project_folder_naming_format FROM project_storage_settings WHERE id = 'local'").get() as { project_folder_naming_format: string };
   const projectId = slug(input.code);
-  const folderName = safeName((settings.project_folder_naming_format || defaultNamingFormat).replaceAll('{code}', input.code.trim()).replaceAll('{name}', input.name.trim()));
+  const folderName = boundedFolderName(settingsRoot, (settings.project_folder_naming_format || defaultNamingFormat).replaceAll('{code}', input.code.trim()).replaceAll('{name}', input.name.trim()));
   const externalPath = path.join(settingsRoot, folderName);
   assertInside(settingsRoot, externalPath);
   const inboxPath = path.join(externalPath, '00_Inbox', 'Unsorted');
@@ -279,10 +437,22 @@ export function createProject(db: DatabaseSync, input: CreateProjectInput) {
   }
 }
 
-function fileNameFor(originalName: string, hash: string) {
-  const ext = path.extname(originalName);
-  const base = safeName(path.basename(originalName, ext));
-  return `${base}-${hash.slice(0, 12)}${ext}`;
+/**
+ * Builds `<base>-<hash12><ext>` bounded so that `directory` + separator + the
+ * result stays inside the path budget. The 12-character hash and the extension
+ * are never truncated — the hash is what makes the filed name unique and the
+ * extension is what the normaliser dispatches on — so only the base shrinks.
+ */
+function fileNameFor(directory: string, originalName: string, hash: string) {
+  const ext = path.extname(originalName).slice(0, 12);
+  const suffix = `-${hash.slice(0, 12)}${ext}`;
+  const available = pathBudget() - directory.length - 1 - suffix.length;
+  if (available < 1) {
+    throw new Error(`The destination folder is too deep to file "${path.basename(originalName)}" within the ${pathBudget()}-character path budget. Choose a shorter projects root or project name.`);
+  }
+  const limit = Math.min(120, available);
+  const base = safeName(path.basename(originalName, path.extname(originalName))).slice(0, limit);
+  return `${base}${suffix}`;
 }
 
 export async function intakeProjectSource(db: DatabaseSync, projectId: string, file: IntakeFileInput) {
@@ -297,7 +467,7 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
 
   const inboxPath = path.join(pPath, '00_Inbox', 'Unsorted');
   mkdirSync(inboxPath, { recursive: true });
-  const target = path.join(inboxPath, fileNameFor(file.name, contentHash));
+  const target = path.join(inboxPath, fileNameFor(inboxPath, file.name, contentHash));
   assertInside(root, target);
   writeFileSync(target, bytes);
   let intakeRecordCommitted = false;
@@ -365,7 +535,7 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
       throw error;
     }
   }
-  return { sourceId, proposedChangeId: proposedId, duplicate: false, processingStatus: status, extractedCount: payload.items.length };
+  return { sourceId, proposedChangeId: proposedId, duplicate: false, eventDate: null, processingStatus: status, extractedCount: payload.items.length };
 }
 
 export function recordBlindExtractionPacket(db: DatabaseSync, projectId: string, input: BlindExtractionInput) {
@@ -380,25 +550,45 @@ export function recordBlindExtractionPacket(db: DatabaseSync, projectId: string,
   if (!Array.isArray(input.frozenPacket.items)) throw new Error('Frozen packet items must be an array.');
   if (input.frozenPacket.sourceMetadata.contentHash !== sourceHash) throw new Error('Frozen packet source hash does not match the submitted source file.');
 
-  const filedSource = fileProjectArtifact(db, projectId, 'transcripts', input.sourceFile.name, sourceBytes);
   const packetJson = JSON.stringify(input.frozenPacket);
   const packetHash = createHash('sha256').update(packetJson).digest('hex');
   if (input.frozenPacket.packetHash && input.frozenPacket.packetHash !== packetHash) throw new Error('Frozen packet hash does not match the submitted packet.');
   const timestamp = nowIso();
-  const sourceId = `source:${projectId}:${sourceHash.slice(0, 16)}`;
   const jobId = `source-job:${projectId}:${packetHash.slice(0, 16)}`;
   const proposedId = `proposed:${projectId}:${packetHash.slice(0, 16)}`;
   const writeId = `ai-write:${projectId}:${packetHash.slice(0, 16)}`;
   const extractedIds = input.frozenPacket.items.map((candidate) => candidate.id);
-  const existing = db.prepare('SELECT id FROM proposed_changes WHERE id = ?').get(proposedId) as { id: string } | undefined;
-  if (existing) {
-    return { sourceId, proposedChangeId: proposedId, duplicate: true, packetHash, sourceHash, filedSource: filedSource.relativePath, extractedCount: extractedIds.length };
+
+  // D9 residual — the intake row is keyed on `(project_id, content_hash)`, not
+  // on this synthetic id. If the same transcript already arrived through the
+  // Cockpit intake route or the watcher, the upsert keeps the ORIGINAL row and
+  // every follow-on insert must reference that row's id. Referencing the
+  // synthetic id produced `FOREIGN KEY constraint failed` and an opaque 500.
+  const existingIntake = db.prepare('SELECT id FROM project_source_intake WHERE project_id = ? AND content_hash = ?').get(projectId, sourceHash) as { id: string } | undefined;
+  const sourceId = existingIntake?.id ?? `source:${projectId}:${sourceHash.slice(0, 16)}`;
+
+  const duplicate = db.prepare('SELECT id FROM proposed_changes WHERE id = ?').get(proposedId) as { id: string } | undefined;
+  if (duplicate) {
+    const alreadyFiled = fileProjectArtifact(db, projectId, 'transcripts', input.sourceFile.name, sourceBytes);
+    return { sourceId, proposedChangeId: proposedId, duplicate: true, packetHash, sourceHash, filedSource: alreadyFiled.relativePath, extractedCount: extractedIds.length };
   }
+
+  // D9 residual — the immutable original used to be written before the
+  // transaction, so a rollback left an orphan file in `01_Sources_Immutable`
+  // with no database row referencing it. It is still written first (the DB
+  // records its path), but a rollback now removes anything this call created.
+  const filedSource = fileProjectArtifact(db, projectId, 'transcripts', input.sourceFile.name, sourceBytes);
+  const provider = `${input.frozenPacket.provider}${input.frozenPacket.model ? `/${input.frozenPacket.model}` : ''}`;
 
   db.exec('BEGIN IMMEDIATE;');
   try {
-    db.prepare('INSERT INTO project_source_intake (id, project_id, original_file_name, original_received_at, content_hash, source_type, current_external_path, previous_external_path, processing_status, processor_provider, extracted_item_ids_json, review_state, verification_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, content_hash) DO UPDATE SET current_external_path = excluded.current_external_path, processing_status = excluded.processing_status, processor_provider = excluded.processor_provider, extracted_item_ids_json = excluded.extracted_item_ids_json, review_state = excluded.review_state, verification_state = excluded.verification_state, updated_at = excluded.updated_at')
-      .run(sourceId, projectId, input.sourceFile.name, timestamp, sourceHash, sourceType, filedSource.destinationPath, null, 'awaiting_review', `${input.frozenPacket.provider}${input.frozenPacket.model ? `/${input.frozenPacket.model}` : ''}`, JSON.stringify(extractedIds), 'proposed', 'pending', timestamp, timestamp);
+    if (existingIntake) {
+      db.prepare('UPDATE project_source_intake SET original_file_name = ?, content_hash = ?, source_type = ?, previous_external_path = current_external_path, current_external_path = ?, processing_status = ?, processor_provider = ?, extracted_item_ids_json = ?, review_state = ?, verification_state = ?, updated_at = ? WHERE id = ?')
+        .run(input.sourceFile.name, sourceHash, sourceType, filedSource.destinationPath, 'awaiting_review', provider, JSON.stringify(extractedIds), 'proposed', 'pending', timestamp, sourceId);
+    } else {
+      db.prepare('INSERT INTO project_source_intake (id, project_id, original_file_name, original_received_at, content_hash, source_type, current_external_path, previous_external_path, processing_status, processor_provider, extracted_item_ids_json, review_state, verification_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(sourceId, projectId, input.sourceFile.name, timestamp, sourceHash, sourceType, filedSource.destinationPath, null, 'awaiting_review', provider, JSON.stringify(extractedIds), 'proposed', 'pending', timestamp, timestamp);
+    }
     db.prepare('INSERT INTO source_processing_jobs (id, source_id, project_id, provider, status, started_at, completed_at, error_message, structured_output_contract, proposed_change_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(jobId, sourceId, projectId, input.frozenPacket.provider, 'completed', timestamp, timestamp, null, 'projectmanagair-blind-ptw-extraction-v1', proposedId);
     db.prepare('INSERT INTO proposed_changes (id, project_id, source_id, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)')
@@ -414,6 +604,7 @@ export function recordBlindExtractionPacket(db: DatabaseSync, projectId: string,
     db.exec('COMMIT;');
   } catch (error) {
     db.exec('ROLLBACK;');
+    if (filedSource.created) rmSync(filedSource.destinationPath, { force: true });
     throw error;
   }
   return { sourceId, proposedChangeId: proposedId, duplicate: false, packetHash, sourceHash, filedSource: filedSource.relativePath, extractedCount: extractedIds.length };
@@ -434,13 +625,75 @@ export function rejectProposedChange(db: DatabaseSync, proposedChangeId: string,
   if (String(proposal.status) === 'rejected') return { proposedChangeId, rejected: true, alreadyRejected: true };
   throw new Error('Legacy proposals are read-only historical records. Use governed Source Intelligence changesets for review.');
 }
-export function openOriginalPath(db: DatabaseSync, filePath: string) {
+export interface DesktopLauncher {
+  command: string;
+  args: (target: string) => string[];
+}
+
+/** File types that the desktop shell would execute rather than display. */
+const executableExtensions = new Set(['.exe', '.com', '.bat', '.cmd', '.ps1', '.psm1', '.vbs', '.vbe', '.js', '.jse', '.wsf', '.wsh', '.msi', '.msp', '.scr', '.cpl', '.hta', '.reg', '.lnk', '.pif', '.jar', '.sh', '.appref-ms', '.url']);
+
+/**
+ * Resolves the platform's file launcher, or `null` when this host has none.
+ * `PATH` is probed synchronously so a host without a launcher fails with a
+ * readable error instead of an asynchronous `'error'` event.
+ */
+export function resolveDesktopLauncher(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): DesktopLauncher | null {
+  if (platform === 'win32') {
+    const comSpec = env.ComSpec ?? env.COMSPEC ?? 'cmd';
+    return { command: comSpec, args: (target) => ['/c', 'start', '', target] };
+  }
+  const candidates = platform === 'darwin' ? ['open'] : ['xdg-open', 'gio', 'gnome-open', 'kde-open'];
+  const searchPath = String(env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  for (const candidate of candidates) {
+    if (searchPath.some((directory) => existsSync(path.join(directory, candidate)))) {
+      return candidate === 'gio'
+        ? { command: 'gio', args: (target) => ['open', target] }
+        : { command: candidate, args: (target) => [target] };
+    }
+  }
+  return null;
+}
+
+export interface OpenOriginalPathOptions {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  spawnImpl?: typeof spawn;
+}
+
+export function openOriginalPath(db: DatabaseSync, filePath: string, options: OpenOriginalPathOptions = {}) {
   const root = configuredRoot(db);
   const resolved = path.resolve(filePath);
+  // Kept from the original: the target must live under the configured root.
   assertInside(root, resolved);
   if (!existsSync(resolved)) throw new Error('File does not exist.');
-  spawn('cmd', ['/c', 'start', '', resolved], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
-  return { opened: true };
+  if (!statSync(resolved).isFile()) throw new Error('Only files can be opened.');
+  const extension = path.extname(resolved).toLowerCase();
+  if (executableExtensions.has(extension)) {
+    // The projects root is operator-configurable and is fed by a watched inbox,
+    // so a dropped script must never be handed to the shell.
+    throw new Error(`Refusing to launch an executable file type (${extension || 'no extension'}).`);
+  }
+
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const launcher = resolveDesktopLauncher(platform, env);
+  if (!launcher) {
+    throw new Error(`No desktop file launcher is available on this host (${platform}). Open the file from the projects folder directly.`);
+  }
+
+  const spawnFn = options.spawnImpl ?? spawn;
+  const child = spawnFn(launcher.command, launcher.args(resolved), { detached: true, stdio: 'ignore', windowsHide: true });
+  // An 'error' event with no listener is rethrown as an uncaught exception and
+  // kills the server process. One request on a host whose launcher disappeared
+  // between the PATH probe and the spawn used to be a process kill.
+  child.on('error', (error: NodeJS.ErrnoException) => {
+    // Deliberately logs the launcher and error code only: the data boundary
+    // forbids logging original filenames.
+    console.warn(`[projectmanagair] desktop launcher "${launcher.command}" failed: ${error?.code ?? error?.message ?? 'unknown error'}`);
+  });
+  child.unref();
+  return { opened: true, launcher: launcher.command };
 }
 export function fileProjectArtifact(db: DatabaseSync, projectId: string, destinationKey: keyof typeof storageMapping, originalName: string, bytes: Buffer) {
   const root = configuredRoot(db);
@@ -449,8 +702,11 @@ export function fileProjectArtifact(db: DatabaseSync, projectId: string, destina
   assertInside(root, destinationDir);
   mkdirSync(destinationDir, { recursive: true });
   const hash = createHash('sha256').update(bytes).digest('hex');
-  const destinationPath = path.join(destinationDir, fileNameFor(originalName, hash));
+  const destinationPath = path.join(destinationDir, fileNameFor(destinationDir, originalName, hash));
   assertInside(root, destinationPath);
-  if (!existsSync(destinationPath)) writeFileSync(destinationPath, bytes);
-  return { destinationPath, hash, relativePath: path.relative(pPath, destinationPath) };
+  // `created` lets a caller that files an artifact ahead of a transaction undo
+  // the write on rollback without deleting a file some earlier run filed.
+  const created = !existsSync(destinationPath);
+  if (created) writeFileSync(destinationPath, bytes);
+  return { destinationPath, hash, relativePath: path.relative(pPath, destinationPath), created };
 }
