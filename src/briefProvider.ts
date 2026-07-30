@@ -135,7 +135,10 @@ export class ClaudeCodeGroundedBriefProvider implements GroundedBriefProvider {
       const run = await runCliCommand({
         providerId: this.identity.providerId,
         command: this.executable,
-        args: ['-p', request.prompt],
+        // Prompt on stdin, not argv: a bounded brief prompt can still reach
+        // tens of kilobytes and argv has a hard limit (E2BIG).
+        args: ['-p'],
+        input: request.prompt,
         signal,
         timeoutMs: this.timeoutMs,
       });

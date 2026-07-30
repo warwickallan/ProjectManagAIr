@@ -3,14 +3,16 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import {
-  SOURCE_EXTRACTION_SKILL,
   SOURCE_INTELLIGENCE_CATEGORIES,
+  assembleExtractionPrompt,
   buildStructuredExtractionPrompt,
   estimateTokens,
   isProviderError,
+  resolveExtractionSkill,
   sha256,
   type CoverageStatus,
   type ExtractionCoverage,
+  type ExtractionMarkerInput,
   type ExtractionWindowInput,
   type ProviderErrorKind,
   type ProviderUsage,
@@ -21,6 +23,7 @@ import {
   type StructuredExtractionRequest,
 } from './extractionProvider.js';
 import { intakeProjectSource, type IntakeFileInput } from './projectLifecycle.js';
+import { ensureSkillRegistrySynced, packetSkillProvenance, publicSkillProvenance, recordExtractionRunProvenance, resolveSkillForRun, runProvenanceOf } from './skillRegistry.js';
 import {
   freezePacketAndCreateChangeset,
   registerNormalizedSource,
@@ -47,6 +50,9 @@ export const WATCHED_INBOX_FAILURE_BACKOFF_MS = 60_000;
 
 /** Identifies this process as a lease holder without recording anything host-identifying. */
 const PROCESS_LEASE_OWNER = `worker:${process.pid}:${randomUUID().slice(0, 8)}`;
+
+/** Share of emitted rows that may conflict across overlapping calls before the pass is rejected. */
+const MAX_MERGE_CONFLICT_RATIO = 0.1;
 
 export interface ExtractionBudget {
   maxCalls: number;
@@ -190,9 +196,33 @@ export function planExtractionSlices(windows: ExtractionWindowInput[], budget: E
   return slices;
 }
 
+/**
+ * Markers that are carried into the prompt.
+ *
+ * HIGH markers are a hard gate: `validatePacket` quarantines any packet where a HIGH marker is
+ * neither validly discharged nor explicitly dismissed, so withholding them grades the model on a
+ * checklist it never saw. MEDIUM markers are not a gate but are the per-window recall hints the
+ * design intends the model to sweep, and they are cheap relative to their effect on recall.
+ *
+ * LOW markers are excluded on purpose. `preScan` emits one for any segment containing
+ * risk/question/issue/concern/assumption/dependency/blocker, which on a real transcript is a large
+ * fraction of all segments; they are deliberately never a gate, they carry no information the model
+ * cannot read off the segment text it already has, and shipping them would spend budget on noise
+ * that dilutes the HIGH checklist.
+ *
+ * Markers already carrying a dismissal reason are omitted: the operator has discharged them out of
+ * band, so asking the model to account for them again is wasted budget.
+ */
+const PROMPTED_MARKER_CONFIDENCES = ['high', 'medium'] as const;
+
 function readWindow(db: DatabaseSync, sourceId: string, row: SourceWindowRow): ExtractionWindowInput {
   const segments = db.prepare('SELECT seq, text, speaker, t_start_ms FROM source_segments WHERE source_id = ? AND seq BETWEEN ? AND ? ORDER BY seq')
     .all(sourceId, row.start_seq, row.end_seq) as Array<{ seq: number; text: string; speaker: string | null; t_start_ms: number | null }>;
+  const markers = db.prepare(`SELECT id, segment_seq, confidence
+      FROM source_markers
+      WHERE source_id = ? AND segment_seq BETWEEN ? AND ? AND confidence IN ('high', 'medium') AND dismissal_reason IS NULL
+      ORDER BY segment_seq, id`)
+    .all(sourceId, row.start_seq, row.end_seq) as Array<{ id: string; segment_seq: number; confidence: string }>;
   return {
     id: row.id,
     seq: row.seq,
@@ -205,6 +235,13 @@ function readWindow(db: DatabaseSync, sourceId: string, row: SourceWindowRow): E
       speaker: segment.speaker === null ? null : String(segment.speaker),
       tStartMs: segment.t_start_ms === null ? null : Number(segment.t_start_ms),
     })),
+    markers: markers
+      .filter((marker) => (PROMPTED_MARKER_CONFIDENCES as readonly string[]).includes(String(marker.confidence)))
+      .map((marker) => ({
+        id: String(marker.id),
+        seq: Number(marker.segment_seq),
+        confidence: String(marker.confidence) as ExtractionMarkerInput['confidence'],
+      })),
   };
 }
 
@@ -655,6 +692,19 @@ export function startSourceJobSweeper(db: DatabaseSync, options: {
  * Orchestration
  * ------------------------------------------------------------------------------------ */
 
+/**
+ * Attach the versioned skill provenance to a run row.
+ *
+ * Recorded per run: skill id, skill version, prompt-template version and packet
+ * contract version, alongside the skill and prompt hashes the row already
+ * carried. With provider and model that is the full answer to "what asked for
+ * this, and under which contract".
+ */
+function recordRunProvenance(db: DatabaseSync, resolved: Parameters<typeof runProvenanceOf>[0], runId: string): string {
+  recordExtractionRunProvenance(db, runId, runProvenanceOf(resolved));
+  return runId;
+}
+
 function insertRun(db: DatabaseSync, input: {
   source: SourceDocumentRow;
   projectId: string;
@@ -820,12 +870,23 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
       sourceTokenRepetition: 0,
       durationMs: Date.now() - started,
       suggestedMarkerDismissals: [] as Array<{ markerId: string; reason: string }>,
+      // No provider call was made, so no extraction skill was in force on this pass. The
+      // contract that produced the frozen packet is recorded on its runs, not re-asserted here.
+      skill: null as { sha256: string; origin: 'built-in' | 'external-file'; path: string | null; characters: number } | null,
       alreadyFrozen: true as const,
     };
   }
 
   const budget = resolvedBudget(source.source_type, Number(source.word_count), options.budget);
-  const skillSha256 = sha256(SOURCE_EXTRACTION_SKILL);
+  // The recorded hash is the hash of the text actually sent, whether that is the built-in
+  // constant or an external skill document injected by path. Resolved once so every call in
+  // this extraction is provably graded against the same contract.
+  // The instructional contract comes from the versioned registry, not from a
+  // constant in this file: revisions are created, pinned, promoted and rolled
+  // back as data. What we ACCEPT stays fixed in code.
+  ensureSkillRegistrySynced(db);
+  const resolvedSkill = resolveSkillForRun(db, project.id, { legacySkill: resolveExtractionSkill() });
+  const skillSha256 = resolvedSkill.sha256;
   const skipReasons = new Map((options.skipWindows ?? []).map((entry) => [entry.seq, entry.reason.trim()]));
   if ([...skipReasons.values()].some((reason) => !reason)) throw new Error('Skipped windows require an explicit comprehension reason.');
   if (options.markerDismissals?.length) dismissSourceMarkers(db, source.id, options.markerDismissals);
@@ -880,8 +941,9 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
       existingRows,
       callIndex: slice.callIndex,
     };
-    const prompt = buildStructuredExtractionPrompt(partialRequest);
-    const promptSha256 = sha256(prompt);
+    const assembled = assembleExtractionPrompt(partialRequest, resolvedSkill);
+    const prompt = assembled.prompt;
+    const promptSha256 = assembled.promptSha256;
     const request: StructuredExtractionRequest = { ...partialRequest, prompt, promptSha256, skillSha256 };
     const projectedInput = totalInputTokens + estimateTokens(prompt);
     const projectedRepetition = (totalSourceTokens + slice.estimatedSourceTokens) / sourceTokens;
@@ -897,7 +959,7 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
       totalInputTokens += result.usage.inputTokens;
       totalSourceTokens += result.usage.sourceTokens;
       const outputJson = stable(result.output);
-      const runId = insertRun(db, {
+      const runId = recordRunProvenance(db, resolvedSkill, insertRun(db, {
         source,
         projectId: project.id,
         providerId: provider!.identity.providerId,
@@ -910,7 +972,7 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
         status: 'completed',
         error: null,
         outputSha256: sha256(outputJson),
-      });
+      }));
       runIds.push(runId);
       completedRunRecorded = true;
       outputs.push(result.output);
@@ -921,7 +983,7 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
     } catch (error) {
       const failure = classifySourceFailure(error);
       if (!completedRunRecorded) {
-        insertRun(db, {
+        recordRunProvenance(db, resolvedSkill, insertRun(db, {
           source,
           projectId: project.id,
           providerId: provider!.identity.providerId,
@@ -934,7 +996,7 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
           status: 'failed',
           error: failure.message,
           outputSha256: null,
-        });
+        }));
       }
       if (!(error && typeof error === 'object' && recordedFailures.has(error as object))) {
         recordSourceFailure(db, source, error, provider!.identity.providerId);
@@ -958,7 +1020,7 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
       })),
     };
     const outputJson = stable(output);
-    runIds.push(insertRun(db, {
+    runIds.push(recordRunProvenance(db, resolvedSkill, insertRun(db, {
       source,
       projectId: project.id,
       providerId: 'deterministic-comprehension-skip',
@@ -972,18 +1034,33 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
       error: null,
       outputSha256: sha256(outputJson),
       stage: 'comprehension-skip',
-    }));
+    })));
     outputs.push(output);
   }
 
+  // Windows overlap, so the same statement legitimately reaches two calls. An
+  // identical restatement dedupes silently; a CONFLICTING restatement of the same
+  // client_ref is a real disagreement about what the source says, and neither
+  // variant may be quietly preferred. Both are excluded and recorded, so the
+  // reviewer sees a gap rather than an arbitrary winner. Aborting the whole pass
+  // instead — which is what this did — discarded every other row in a
+  // twenty-five-minute extraction over one duplicated reference.
   const rowsByRef = new Map<string, { registerName: SourceIntelligenceCategory; row: SourcePacketRow; serialized: string }>();
+  const conflictingRefs = new Set<string>();
   for (const entry of outputs.flatMap((output) => output.rows)) {
     const serialized = stable(entry);
     const existing = rowsByRef.get(entry.row.client_ref);
-    if (existing && existing.serialized !== serialized) {
-      throw failWith(db, source, 'malformed-output', `Provider emitted conflicting rows for client_ref ${entry.row.client_ref}.`, provider?.identity.providerId);
-    }
-    rowsByRef.set(entry.row.client_ref, { ...entry, serialized });
+    if (existing && existing.serialized !== serialized) conflictingRefs.add(entry.row.client_ref);
+    else if (!existing) rowsByRef.set(entry.row.client_ref, { ...entry, serialized });
+  }
+  const mergeConflicts = [...conflictingRefs].sort().map((clientRef) => ({
+    clientRef,
+    reason: 'Overlapping extraction calls proposed different content for the same client_ref; every variant was excluded because neither can be preferred without a human decision.',
+  }));
+  for (const clientRef of conflictingRefs) rowsByRef.delete(clientRef);
+  const totalEmitted = outputs.reduce((count, output) => count + output.rows.length, 0);
+  if (totalEmitted > 0 && conflictingRefs.size / totalEmitted > MAX_MERGE_CONFLICT_RATIO) {
+    throw failWith(db, source, 'malformed-output', `${conflictingRefs.size} of ${totalEmitted} emitted rows conflicted across overlapping calls, above the ${Math.round(MAX_MERGE_CONFLICT_RATIO * 100)}% limit.`, provider?.identity.providerId);
   }
   const rows = [...rowsByRef.values()].map(({ registerName, row }) => ({ registerName, row }));
   const windowCoverageByKey = new Map<string, ExtractionCoverage>();
@@ -1019,7 +1096,32 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
     },
     execution: { runs: runIds },
   };
-  const handoff = freezePacketAndCreateChangeset(db, packet);
+  // Marker dismissal is one of the two ways the design lets a HIGH marker be
+  // accounted for, but the model's dismissals previously never reached the
+  // database before the gate read it — so option (b) was a guaranteed
+  // quarantine and the only survivable answer was to discharge everything.
+  // Model dismissals are recorded as PROPOSALS, clearly attributed, and the
+  // validator caps how much of the checklist may be answered this way.
+  // Rows the provider emitted that failed row-level validation were dropped, not
+  // repaired. They are counted and reported so the loss is visible rather than
+  // being mistaken for a source that simply said less.
+  const rejectedRows = outputs.flatMap((output) => output.rejectedRows ?? []);
+  const proposedDismissals = outputs.flatMap((output) => output.markerDismissals ?? []);
+  if (proposedDismissals.length > 0) {
+    dismissSourceMarkers(db, source.id, proposedDismissals.map((dismissal) => ({
+      markerId: dismissal.markerId,
+      reason: `model-proposed (${provider?.identity.providerId ?? 'unknown'}): ${dismissal.reason.trim()}`,
+    })));
+  }
+  const handoff = freezePacketAndCreateChangeset(db, packet, {
+    // Everything the provider emitted that did not survive into the packet is
+    // reported with the packet, so a reviewer sees what was lost and why.
+    providerAnomalies: [
+      ...rejectedRows.map((entry) => ({ kind: 'rejected-row' as const, detail: `Row ${entry.index}${entry.registerName ? ` (${entry.registerName})` : ''} was excluded: ${entry.reason}` })),
+      ...mergeConflicts.map((entry) => ({ kind: 'merge-conflict' as const, detail: `client_ref ${entry.clientRef}: ${entry.reason}` })),
+    ],
+    skillProvenance: packetSkillProvenance(db, runIds),
+  });
   finaliseJobAfterFreeze(db, source, handoff.gateVerdict);
   return {
     ...handoff,
@@ -1030,7 +1132,17 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
     inputTokens: totalInputTokens,
     sourceTokenRepetition: Number((totalSourceTokens / sourceTokens).toFixed(3)),
     durationMs: Date.now() - started,
-    suggestedMarkerDismissals: outputs.flatMap((output) => output.markerDismissals ?? []),
+    suggestedMarkerDismissals: proposedDismissals,
+    rejectedRows,
+    mergeConflicts,
+    // Which contract this pass was actually graded against. Never the text itself: an external
+    // skill document is customer material and must not reach a log, a response or the database.
+    skill: {
+      ...publicSkillProvenance(resolvedSkill),
+      // `origin` predates the registry and is retained so existing consumers and
+      // acceptance evidence keep reading the same field.
+      origin: resolvedSkill.source === 'external-path' ? 'external-file' : resolvedSkill.source,
+    },
     alreadyFrozen: false as const,
   };
 }

@@ -14,6 +14,7 @@ import { recordRegisterEvent } from './src/registerProjection.js';
 import { acknowledgeChangeset, applyReviewedChangeset, buildConsultantBrief, freezePacketAndCreateChangeset, pinOverviewMode, readSourceIntelligence, replayPacket, reviewChangeset } from './src/sourceIntelligence.js';
 import { createLifecycleSourceEnqueuer, retrySourceJob, runSourceExtractionJob, skipSourceAfterComprehension, startSourceJobSweeper, WatchedInboxScanner } from './src/sourcePipeline.js';
 import { createLocalOriginGuard } from './src/httpSecurity.js';
+import { ensureSkillRegistrySynced, pinProjectSkill, promoteSkillRevision, readSkillAuditTrail, readSkillPin, readSkillRevisions, rollbackSkillRevision, unpinProjectSkill } from './src/skillRegistry.js';
 import { ClaudeCodeStructuredExtractionProvider } from './src/extractionProvider.js';
 import { ClaudeCodeGroundedBriefProvider } from './src/briefProvider.js';
 
@@ -275,6 +276,25 @@ app.post('/api/inbox/:graphId/read-state', asyncRoute(async (request, response) 
 }));
 app.post('/api/inbox/:graphId/delete', asyncRoute(async (request, response) => response.json(await moveMessageToDeletedItems(db(), String(request.params.graphId)))));
 
+app.get('/api/extraction-skills', (request, response) => response.json({ revisions: readSkillRevisions(db(), typeof request.query.skillId === 'string' ? request.query.skillId : undefined) }));
+app.get('/api/extraction-skills/audit', (request, response) => response.json({ events: readSkillAuditTrail(db(), { skillId: typeof request.query.skillId === 'string' ? request.query.skillId : undefined, projectId: typeof request.query.projectId === 'string' ? request.query.projectId : undefined }) }));
+app.post('/api/extraction-skills/promote', asyncRoute(async (request, response) => {
+  const body = request.body as { skillId?: string; version?: string; actor?: string; note?: string };
+  if (!body.version) { response.status(400).json({ error: 'version is required.' }); return; }
+  response.json(promoteSkillRevision(db(), { skillId: body.skillId, version: body.version, actor: String(body.actor ?? 'current-user'), note: body.note }));
+}));
+app.post('/api/extraction-skills/rollback', asyncRoute(async (request, response) => {
+  const body = request.body as { skillId?: string; toVersion?: string; actor?: string; note?: string };
+  if (!body.toVersion) { response.status(400).json({ error: 'toVersion is required.' }); return; }
+  response.json(rollbackSkillRevision(db(), { skillId: body.skillId, toVersion: body.toVersion, actor: String(body.actor ?? 'current-user'), note: body.note }));
+}));
+app.get('/api/projects/:projectId/extraction-skill', (request, response) => response.json({ pin: readSkillPin(db(), String(request.params.projectId)) }));
+app.post('/api/projects/:projectId/extraction-skill/pin', asyncRoute(async (request, response) => {
+  const body = request.body as { skillId?: string; version?: string; actor?: string; note?: string };
+  if (!body.version) { response.status(400).json({ error: 'version is required.' }); return; }
+  response.json(pinProjectSkill(db(), { projectId: String(request.params.projectId), skillId: body.skillId, version: body.version, actor: String(body.actor ?? 'current-user'), note: body.note }));
+}));
+app.post('/api/projects/:projectId/extraction-skill/unpin', asyncRoute(async (request, response) => response.json(unpinProjectSkill(db(), { projectId: String(request.params.projectId), skillId: (request.body as { skillId?: string }).skillId, actor: String((request.body as { actor?: string }).actor ?? 'current-user') }))));
 app.get('/api/ai/providers', (_, response) => response.json({ providers: probeAIProviders() }));
 app.post('/api/ai/chat', asyncRoute(async (request, response) => response.json(await sendChatMessage(db(), request.body))));
 
@@ -300,6 +320,7 @@ if (production) {
   app.use(vite.middlewares);
 }
 
+if (!demoMode) ensureSkillRegistrySynced(db());
 startInboxWatchers();
 
 // Crash recovery: reclaim any job whose lease expired while the process was

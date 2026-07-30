@@ -369,6 +369,10 @@ function parseExpected(raw: string): ExpectedRecord[] {
   return rows;
 }
 
+function registerFromName(name: string): RegisterName | null {
+  return registerNames.includes(name as RegisterName) ? (name as RegisterName) : null;
+}
+
 function registerForExtracted(item: JsonObject): RegisterName | null {
   const explicit = rowValue(item, ['registerName', 'register_name']);
   if (registerNames.includes(explicit as RegisterName)) return explicit as RegisterName;
@@ -379,8 +383,57 @@ function registerForExtracted(item: JsonObject): RegisterName | null {
   return itemTypeToRegister[type] ?? null;
 }
 
+/**
+ * Read a governed Source Intelligence packet (`sheets.<Register>.rows[]`) into the
+ * same comparable shape as the legacy blind-extraction packet (`items[]`).
+ *
+ * The acceptance instrument has to grade what the pipeline actually produces. The
+ * register is known from the sheet it came from rather than guessed from a `type`
+ * field, and anchors come from `anchors[].segment_seq`.
+ */
+function parseGovernedPacket(packet: JsonObject): { sourceHash: string; provider: string; model: string; generatedAt: string; rows: ExtractedRecord[] } {
+  const sheets = asObject(packet.sheets, 'Governed packet sheets');
+  const source = asObject(packet.source, 'Governed packet source');
+  const rows: ExtractedRecord[] = [];
+  for (const [sheetName, rawSheet] of Object.entries(sheets)) {
+    const registerName = registerFromName(sheetName);
+    if (!registerName) continue;
+    const sheet = asObject(rawSheet, `Governed packet sheet ${sheetName}`);
+    const sheetRows = Array.isArray(sheet.rows) ? sheet.rows : [];
+    for (const rawRow of sheetRows) {
+      const row = asObject(rawRow, `Governed packet row in ${sheetName}`);
+      const title = rowValue(row, ['title']);
+      const summary = rowValue(row, ['summary']);
+      const anchors = canonicalAnchors(row);
+      rows.push({
+        // `proposed_id` is deliberately `$ALLOC` until apply, so the stable
+        // handle for comparison purposes is the packet-unique client_ref.
+        id: rowValue(row, ['client_ref']),
+        registerName,
+        title,
+        status: rowValue(row, ['status']),
+        sourceRef: rowValue(row, ['source_ref']),
+        anchor: anchors[0] ?? '',
+        anchors,
+        workPackageId: '',
+        workPackageName: '',
+        row,
+        text: [title, summary].filter(Boolean).join(' '),
+      } satisfies ExtractedRecord);
+    }
+  }
+  return {
+    sourceHash: rowValue(source, ['content_hash']),
+    provider: rowValue(packet, ['provider']) || 'governed-source-intelligence',
+    model: rowValue(packet, ['model']) || '',
+    generatedAt: rowValue(packet, ['generatedAt', 'assembled_at']),
+    rows,
+  };
+}
+
 function parseFrozen(raw: string): { sourceHash: string; provider: string; model: string; generatedAt: string; rows: ExtractedRecord[] } {
   const packet = asObject(JSON.parse(raw) as unknown, 'Frozen extraction packet');
+  if (packet.sheets && typeof packet.sheets === 'object') return parseGovernedPacket(packet);
   const items = packet.items;
   if (!Array.isArray(items)) throw new Error('Frozen extraction packet items must be an array.');
   return {

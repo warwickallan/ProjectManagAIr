@@ -42,10 +42,16 @@ const packetRowSchema = z.object({
   client_ref: z.string().min(1),
   op: z.enum(['add', 'update', 'resolve', 'supersede', 'reaffirm']),
   target_id: z.string().min(1).nullable(),
-  proposed_id: z.string().min(1),
+  // Only an `add` allocates; every other operation targets an existing row, so
+  // `proposed_id` is legitimately absent there. Requiring a non-empty string
+  // forced a model to invent a value for a field that has no meaning.
+  proposed_id: z.string().min(1).nullable().default(null),
   title: z.string().min(1),
   summary: z.string().default(''),
-  status: z.string().min(1).default('open'),
+  // A source that states no status must be able to say so. For an `add` the
+  // stored record status falls back to `open`; for the update family a null is
+  // simply not asserted and the stored value stands.
+  status: z.string().min(1).nullable().default(null),
   record_type: z.string().nullable().default(null),
   owner: z.string().nullable().default(null),
   due_date_raw: z.string().nullable().default(null),
@@ -170,6 +176,10 @@ const MIN_QUOTE_CHARS = 20;
 // turn and qualified in the next few; narrow enough that an item elsewhere in
 // the transcript cannot claim it.
 const MARKER_DISCHARGE_RADIUS = 3;
+
+// The share of HIGH markers a single pass may answer by dismissal rather than by
+// producing a register item.
+const MAX_MODEL_DISMISSAL_RATIO = 0.3;
 
 function quoteIsTrivial(quote: string, segmentText: string): boolean {
   const folded = foldEvidence(quote);
@@ -367,6 +377,40 @@ export function registerNormalizedSource(db: DatabaseSync, input: { projectId: s
   return { sourceId, duplicate: false, eventDate: document.eventDate, eventDateEvidence: document.eventDateEvidence, segmentCount: document.segments.length, windowCount: windows.length, markerCounts: { high: markers.filter((item) => item.confidence === 'high').length, medium: markers.filter((item) => item.confidence === 'medium').length, low: markers.filter((item) => item.confidence === 'low').length }, jobId };
 }
 
+/**
+ * Deliberately discard a normalised source so it can be re-registered under the
+ * current normaliser.
+ *
+ * Evidence is immutable, but it is not permanent: when the normaliser changes,
+ * the honest options are to keep serving evidence produced by superseded parsing
+ * rules or to re-derive it. This is the second, and it is refused outright once
+ * any changeset from that source has been applied, because at that point the
+ * evidence underwrites canonical register state.
+ */
+export function renormalizeSource(db: DatabaseSync, sourceId: string, options: { bytes?: Buffer; eventDate?: string | null } = {}) {
+  const source = db.prepare('SELECT id, project_id, intake_source_id, content_hash, original_file_name, immutable_path, normaliser_version FROM source_documents WHERE id = ?').get(sourceId) as Record<string, unknown> | undefined;
+  if (!source) throw new Error('Source document not found.');
+  const applied = db.prepare("SELECT count(*) count FROM register_changesets WHERE source_id = ? AND review_status = 'applied'").get(sourceId) as { count: number };
+  if (applied.count > 0) throw new Error('This source underwrites applied register state and cannot be re-normalised; ingest a corrected source instead.');
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    db.prepare('DELETE FROM source_documents WHERE id = ?').run(sourceId);
+    db.exec('COMMIT;');
+  } catch (error) {
+    db.exec('ROLLBACK;');
+    throw error;
+  }
+  return registerNormalizedSource(db, {
+    projectId: String(source.project_id),
+    intakeSourceId: String(source.intake_source_id ?? ''),
+    fileName: String(source.original_file_name),
+    immutablePath: String(source.immutable_path),
+    contentHash: String(source.content_hash),
+    bytes: options.bytes,
+    eventDate: options.eventDate,
+  });
+}
+
 function packetRows(packet: SourceIntelligencePacket) {
   return registerNames.flatMap((registerName) => packet.sheets[registerName].rows.map((row) => ({ registerName, row })));
 }
@@ -418,6 +462,7 @@ export function validatePacket(db: DatabaseSync, rawPacket: unknown, options: Va
     if (refs.has(row.client_ref)) issues.push({ rule: 'unique-client-ref', severity: 'blocker', message: `Duplicate client_ref ${row.client_ref}.`, clientRef: row.client_ref });
     refs.add(row.client_ref);
     if (row.op === 'add' && (row.proposed_id !== '$ALLOC' || row.target_id !== null)) issues.push({ rule: 'server-id-allocation', severity: 'blocker', message: 'Add operations must use proposed_id $ALLOC and target_id null.', clientRef: row.client_ref });
+    if (row.op !== 'add' && row.proposed_id !== null && row.proposed_id !== row.target_id) issues.push({ rule: 'server-id-allocation', severity: 'blocker', message: `${row.op} operations must leave proposed_id null or equal to target_id; identifiers are allocated server-side.`, clientRef: row.client_ref });
     if (row.op !== 'add' && !row.target_id) issues.push({ rule: 'target-required', severity: 'blocker', message: `${row.op} requires target_id.`, clientRef: row.client_ref });
     if (row.derivation === 'inference' && !row.reasoning) issues.push({ rule: 'inference-reasoning', severity: 'blocker', message: 'Inference items require explicit reasoning.', clientRef: row.client_ref });
     const citedSegmentTexts: string[] = [];
@@ -540,8 +585,21 @@ export function validatePacket(db: DatabaseSync, rawPacket: unknown, options: Va
   if (packet.sheets.Uncertainty.rows.length === 0 && !categories.get('Uncertainty')?.explanation) issues.push({ rule: 'uncertainty-coverage', severity: 'blocker', message: 'Uncertainty ledger is empty without explanation.' });
 
   // Only discharges that passed the locality check above count.
-  for (const marker of markerRows.filter((entry) => entry.confidence === 'high')) {
+  const highMarkerRows = markerRows.filter((entry) => entry.confidence === 'high');
+  for (const marker of highMarkerRows) {
     if (!validDischarges.has(marker.id) && !marker.dismissal_reason) issues.push({ rule: 'high-marker-discharge', severity: 'blocker', message: `HIGH marker ${marker.id} is neither validly linked nor explicitly dismissed.` });
+  }
+  // Dismissal is a legitimate answer for a genuine false positive, but it must
+  // not become the cheap way to clear the checklist. A model-proposed dismissal
+  // still faces the human in the review lane; the cap is what stops a pass from
+  // dismissing its way to a clean verdict.
+  const dismissedHigh = highMarkerRows.filter((entry) => entry.dismissal_reason && !validDischarges.has(entry.id));
+  const modelProposed = dismissedHigh.filter((entry) => String(entry.dismissal_reason).startsWith('model-proposed'));
+  if (highMarkerRows.length > 0 && modelProposed.length / highMarkerRows.length > MAX_MODEL_DISMISSAL_RATIO) {
+    issues.push({ rule: 'marker-dismissal-rate', severity: 'blocker', message: `${modelProposed.length} of ${highMarkerRows.length} HIGH markers were dismissed rather than accounted for, above the ${Math.round(MAX_MODEL_DISMISSAL_RATIO * 100)}% limit.` });
+  }
+  if (modelProposed.length > 0) {
+    issues.push({ rule: 'marker-dismissal-review', severity: 'warning', message: `${modelProposed.length} HIGH marker dismissals are model-proposed and need explicit human confirmation: ${modelProposed.map((entry) => entry.id).join(', ')}.` });
   }
 
   // Provenance must come from a run that actually produced output (B7). The
@@ -580,7 +638,8 @@ export function validatePacket(db: DatabaseSync, rawPacket: unknown, options: Va
       durationMs: totalRuns.reduce((total, run) => total + Number(run.duration_ms), 0),
       highMarkers: markerRows.filter((entry) => entry.confidence === 'high').length,
       highMarkersDischarged: validDischarges.size,
-      highMarkersDismissed: markerRows.filter((entry) => entry.confidence === 'high' && entry.dismissal_reason).length,
+      highMarkersDismissed: dismissedHigh.length,
+      highMarkersDismissedByModel: modelProposed.length,
       anchoredRows: anchoredSegmentsByRef.size,
     },
   };
@@ -729,10 +788,39 @@ function deterministicOps(db: DatabaseSync, projectId: string, packet: SourceInt
   });
 }
 
-export function freezePacketAndCreateChangeset(db: DatabaseSync, rawPacket: unknown) {
+export interface ProviderAnomaly {
+  kind: 'rejected-row' | 'merge-conflict';
+  detail: string;
+}
+
+export interface FreezeOptions {
+  /**
+   * Everything the provider emitted that did not survive into the packet.
+   *
+   * These are recorded in the packet's validation report as warnings so the loss
+   * is visible to the reviewer. A dropped row must never be mistaken for a source
+   * that simply said less, and the unknown field that caused the drop is carried
+   * verbatim in the detail.
+   */
+  providerAnomalies?: ProviderAnomaly[];
+  skillProvenance?: { skillId: string | null; skillVersion: string | null; promptTemplateVersion: string | null };
+}
+
+export function freezePacketAndCreateChangeset(db: DatabaseSync, rawPacket: unknown, options: FreezeOptions = {}) {
   const validation = validatePacket(db, rawPacket);
   if (!validation.packet) throw new Error(`Packet schema validation failed: ${validation.issues.map((issue) => issue.message).join('; ')}`);
   const packet = validation.packet;
+  const anomalies = options.providerAnomalies ?? [];
+  for (const anomaly of anomalies) {
+    validation.issues.push({ rule: `provider-${anomaly.kind}`, severity: 'warning', message: anomaly.detail });
+  }
+  // A packet that lost rows is not a clean packet. Recompute the verdict so the
+  // gate report and the review lane both reflect the loss.
+  const gateVerdict = validation.issues.some((issue) => issue.severity === 'blocker')
+    ? 'quarantined'
+    : validation.issues.some((issue) => issue.severity === 'warning')
+      ? 'warnings'
+      : 'clean';
   const project = db.prepare('SELECT id FROM projects WHERE code = ?').get(packet.project_code) as { id: string };
   const packetJson = stable(packet);
   const packetHash = hash(packetJson);
@@ -768,13 +856,13 @@ export function freezePacketAndCreateChangeset(db: DatabaseSync, rawPacket: unkn
   db.exec('BEGIN IMMEDIATE;');
   try {
     const firstRun = db.prepare('SELECT skill_sha256, prompt_sha256 FROM extraction_runs WHERE id = ?').get(packet.execution.runs[0]) as { skill_sha256: string; prompt_sha256: string };
-    db.prepare('INSERT INTO extraction_packets (id, source_id, project_id, packet_contract_version, source_normaliser_version, database_schema_version, validator_version, reconciliation_engine_version, current_state_projector_version, scoring_configuration_version, skill_sha256, prompt_sha256, packet_sha256, packet_json, assembled_at, validation_status, validation_report_json, base_register_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, packet_sha256) DO NOTHING')
-      .run(packetId, packet.source.source_id, project.id, PACKET_VERSION, SOURCE_NORMALISER_VERSION, DATABASE_SCHEMA_VERSION, VALIDATOR_VERSION, RECONCILIATION_VERSION, PROJECTOR_VERSION, activeScoringVersion(db), firstRun.skill_sha256, firstRun.prompt_sha256, packetHash, packetJson, assembledAt, validation.verdict, JSON.stringify({ issues: validation.issues, metrics: validation.metrics }), packet.base_register_revision);
+    db.prepare('INSERT INTO extraction_packets (id, source_id, project_id, packet_contract_version, source_normaliser_version, database_schema_version, validator_version, reconciliation_engine_version, current_state_projector_version, scoring_configuration_version, skill_sha256, prompt_sha256, packet_sha256, packet_json, assembled_at, validation_status, validation_report_json, base_register_revision, skill_id, skill_version, prompt_template_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, packet_sha256) DO NOTHING')
+      .run(packetId, packet.source.source_id, project.id, PACKET_VERSION, SOURCE_NORMALISER_VERSION, DATABASE_SCHEMA_VERSION, VALIDATOR_VERSION, RECONCILIATION_VERSION, PROJECTOR_VERSION, activeScoringVersion(db), firstRun.skill_sha256, firstRun.prompt_sha256, packetHash, packetJson, assembledAt, gateVerdict, JSON.stringify({ issues: validation.issues, metrics: validation.metrics, providerAnomalies: anomalies }), packet.base_register_revision, options.skillProvenance?.skillId ?? null, options.skillProvenance?.skillVersion ?? null, options.skillProvenance?.promptTemplateVersion ?? null);
     const coverage = db.prepare('INSERT OR REPLACE INTO packet_coverage (packet_id, scope, key, status, item_count, explanation) VALUES (?, ?, ?, ?, ?, ?)');
     for (const entry of packet.coverage.windows) coverage.run(packetId, 'window', entry.key, entry.status, entry.item_count, entry.explanation);
     for (const entry of packet.coverage.categories) coverage.run(packetId, 'category', entry.key, entry.status, entry.item_count, entry.explanation);
     db.prepare('INSERT INTO register_changesets (id, packet_id, project_id, source_id, created_at, gate_verdict, gate_report_json, review_status, applied_at, base_register_revision, deterministic_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(id) DO UPDATE SET gate_verdict = excluded.gate_verdict, gate_report_json = excluded.gate_report_json, deterministic_hash = excluded.deterministic_hash')
-      .run(changesetId, packetId, project.id, packet.source.source_id, assembledAt, validation.verdict, JSON.stringify(validation), validation.verdict === 'quarantined' ? 'quarantined' : 'pending', packet.base_register_revision, deterministicHash);
+      .run(changesetId, packetId, project.id, packet.source.source_id, assembledAt, gateVerdict, JSON.stringify({ ...validation, verdict: gateVerdict, providerAnomalies: anomalies }), gateVerdict === 'quarantined' ? 'quarantined' : 'pending', packet.base_register_revision, deterministicHash);
     // Only untouched operations may be replaced; migration 011 enforces the same
     // rule with a trigger so no future writer can bypass it.
     db.prepare("DELETE FROM register_change_ops WHERE changeset_id = ? AND status = 'pending'").run(changesetId);
@@ -782,13 +870,13 @@ export function freezePacketAndCreateChangeset(db: DatabaseSync, rawPacket: unkn
     for (const op of ops) insertOp.run(`${changesetId}:op:${String(op.seq).padStart(3, '0')}`, changesetId, op.seq, op.op, op.registerName, op.clientRef, op.targetExternalId, stable(op.proposedRow), stable(op.fieldDiff), stable(op.anchors), op.confidence, op.derivation, 'pending');
     const jobId = `source-job:${project.id}:${packet.source.content_hash.slice(0, 16)}`;
     db.prepare("UPDATE source_processing_jobs SET status = ?, current_stage = ?, completed_at = CASE WHEN ? = 'quarantined' THEN ? ELSE completed_at END, updated_at = ?, packet_id = ?, changeset_id = ?, error_message = ? WHERE id = ?")
-      .run(validation.verdict === 'quarantined' ? 'quarantined' : 'awaiting_review', validation.verdict === 'quarantined' ? 'quarantined' : 'awaiting_review', validation.verdict, assembledAt, assembledAt, packetId, changesetId, validation.verdict === 'quarantined' ? validation.issues.filter((issue) => issue.severity === 'blocker').map((issue) => issue.message).join('; ') : null, jobId);
+      .run(gateVerdict === 'quarantined' ? 'quarantined' : 'awaiting_review', gateVerdict === 'quarantined' ? 'quarantined' : 'awaiting_review', gateVerdict, assembledAt, assembledAt, packetId, changesetId, gateVerdict === 'quarantined' ? validation.issues.filter((issue) => issue.severity === 'blocker').map((issue) => issue.message).join('; ') : null, jobId);
     db.exec('COMMIT;');
   } catch (error) {
     db.exec('ROLLBACK;');
     throw error;
   }
-  return { packetId, packetHash, changesetId, deterministicHash, gateVerdict: validation.verdict, validation };
+  return { packetId, packetHash, changesetId, deterministicHash, gateVerdict, validation };
 }
 
 export function reviewChangeset(db: DatabaseSync, changesetId: string, input: { decision: 'accept' | 'reject'; reviewer: string; note?: string | null; opIds?: string[]; batch?: boolean }) {

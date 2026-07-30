@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join as pathJoin } from 'node:path';
 import { z } from 'zod';
+import { DEFAULT_EXTRACTION_SKILL_ID, loadSeedSkillBody, type ResolvedSkillForRun } from './skillRegistry.js';
 import type { SourceIntelligencePacket } from './sourceIntelligence.js';
 
 export const SOURCE_INTELLIGENCE_CATEGORIES = [
@@ -31,6 +34,23 @@ export interface ExtractionSegmentInput {
   tStartMs: number | null;
 }
 
+/**
+ * A pre-detected governance cue the packet validator will grade the extraction against.
+ *
+ * The payload is deliberately three fields. `marker_type` is the literal suffix of `id`
+ * (`…:marker:412:explicit-action`) and `matched_text` is a substring of the segment text the
+ * model already has at `seq`, so carrying either would repeat, once per marker and once per
+ * call, information already in the prompt. On a 2,159-segment transcript that redundancy
+ * measured ~15,800 tokens against a 200,000-token budget. Key names mirror the segment payload
+ * (`seq`, not `segmentSeq`). `id` is verbatim because `discharges_markers` is matched byte-for-byte.
+ */
+export interface ExtractionMarkerInput {
+  id: string;
+  /** The segment the cue was detected in; a discharging row must anchor within 3 of it. */
+  seq: number;
+  confidence: 'high' | 'medium' | 'low';
+}
+
 export interface ExtractionWindowInput {
   id: string;
   seq: number;
@@ -38,6 +58,11 @@ export interface ExtractionWindowInput {
   endSeq: number;
   tokenEstimate: number;
   segments: ExtractionSegmentInput[];
+  /**
+   * Markers whose segment falls inside this window. Optional so that callers building a
+   * synthetic window need not fabricate one; absent and empty are serialised identically.
+   */
+  markers?: ExtractionMarkerInput[];
 }
 
 export interface ExistingRegisterRowInput {
@@ -83,6 +108,11 @@ export interface StructuredExtractionOutput {
   windowCoverage: ExtractionCoverage[];
   categoryCoverage: ExtractionCoverage[];
   markerDismissals?: Array<{ markerId: string; reason: string }>;
+  /**
+   * Rows that failed row-level validation and were dropped rather than repaired.
+   * Never silently discarded: recorded against the run and surfaced to the reviewer.
+   */
+  rejectedRows?: RejectedProviderRow[];
 }
 
 /**
@@ -580,12 +610,72 @@ export interface StructuredExtractionProvider {
   extract(request: StructuredExtractionRequest, signal?: AbortSignal): Promise<StructuredExtractionResult>;
 }
 
-export const SOURCE_EXTRACTION_SKILL = `Project ManagAIr Source Intelligence extraction v1.
-Interpret only the supplied source segments and current register index.
-Return proposals, never final state. New rows use proposed_id "$ALLOC".
-Every fact has a mechanically resolvable segment anchor and verbatim quote.
-Review every requested category and window, including explicit none-found coverage.
-Do not invent provider identity, durable IDs, source text, dates, owners or status.`;
+/**
+ * The extraction contract, stated as instructions — the shipped seed revision.
+ *
+ * The text itself now lives in `skills/source-extraction/<version>.md` as a versioned data
+ * asset, not in this file: see `src/skillRegistry.ts`. This constant is the default a caller
+ * gets when it names no revision, and it is exactly the body of the seed revision, so the
+ * built-in path and the registry path cannot drift apart.
+ *
+ * The text is hashed into `extraction_runs.skill_sha256`, so it is the recorded provenance of
+ * every pass: it must say exactly what `validatePacket` enforces and nothing it does not.
+ * A revision can change what we ask for; it can never change what we accept.
+ */
+export const SOURCE_EXTRACTION_SKILL: string = loadSeedSkillBody(DEFAULT_EXTRACTION_SKILL_ID);
+
+/**
+ * Environment variable naming a file whose contents replace the built-in skill.
+ *
+ * The organisation's own extraction skill is customer-adjacent and deliberately not committed,
+ * so it is injected by path at run time. The file is read here and hashed here, and its contents
+ * are never logged, echoed into an error message, or written to the run row — only its hash,
+ * length and origin are recorded.
+ */
+export const EXTRACTION_SKILL_PATH_ENV = 'PROJECTMANAGAIR_EXTRACTION_SKILL_PATH';
+
+export interface ResolvedExtractionSkill {
+  /** The skill text that will actually be sent to the provider. */
+  text: string;
+  /** sha256 of `text` — this is what belongs in extraction_runs.skill_sha256. */
+  sha256: string;
+  origin: 'built-in' | 'external-file';
+  /** Absolute or configured path when `origin` is `external-file`, otherwise null. */
+  path: string | null;
+  characters: number;
+}
+
+/**
+ * Resolve the extraction skill actually in force. The recorded hash is always the hash of the
+ * text used, never of the built-in constant, so a run's provenance cannot claim a contract the
+ * model was not given. A configured but unreadable or empty file is a hard error rather than a
+ * silent fallback: falling back would record one skill and honestly hash another.
+ */
+export function resolveExtractionSkill(env: NodeJS.ProcessEnv = process.env): ResolvedExtractionSkill {
+  const configured = (env[EXTRACTION_SKILL_PATH_ENV] ?? '').trim();
+  if (!configured) {
+    return {
+      text: SOURCE_EXTRACTION_SKILL,
+      sha256: sha256(SOURCE_EXTRACTION_SKILL),
+      origin: 'built-in',
+      path: null,
+      characters: SOURCE_EXTRACTION_SKILL.length,
+    };
+  }
+  let text: string;
+  try {
+    text = readFileSync(configured, 'utf8');
+  } catch (error) {
+    // The message names the path and the errno only. The file may not exist, but if it does
+    // its contents must not leak through a thrown error.
+    const code = (error as NodeJS.ErrnoException).code ?? 'read failure';
+    throw new Error(`${EXTRACTION_SKILL_PATH_ENV} points at ${configured}, which could not be read (${code}).`);
+  }
+  if (!text.trim()) {
+    throw new Error(`${EXTRACTION_SKILL_PATH_ENV} points at ${configured}, which is empty; extraction has no contract to hash.`);
+  }
+  return { text, sha256: sha256(text), origin: 'external-file', path: configured, characters: text.length };
+}
 
 export function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
@@ -625,18 +715,63 @@ export function charFloorTokens(value: string): number {
   return Math.ceil((value ?? '').length / 4);
 }
 
+// Key ordering must be host independent: the prompt is hashed into `prompt_sha256`, and
+// `localeCompare` uses the host ICU collation, so two machines with different LANG produced
+// different prompt hashes for byte-identical requests. Compare by UTF-16 code unit instead,
+// matching the packet serialiser in sourceIntelligence.ts.
 function stable(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
   if (value && typeof value === 'object') {
     return `{${Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
       .map(([key, child]) => `${JSON.stringify(key)}:${stable(child)}`)
       .join(',')}}`;
   }
   return JSON.stringify(value);
 }
 
-export function buildStructuredExtractionPrompt(input: Omit<StructuredExtractionRequest, 'prompt' | 'promptSha256' | 'skillSha256'>): string {
+/**
+ * The version of the prompt *assembly*, as distinct from the version of the skill text.
+ *
+ * It names the shape of the assembled prompt — which blocks appear, in what order, with what
+ * scaffolding — and must be bumped whenever that shape changes, because the shape is as much
+ * a determinant of what a model returns as the instructions are. It is recorded on every run
+ * (`extraction_runs.prompt_template_version`), so a change in extraction behaviour can be
+ * attributed to the template or to the skill rather than guessed at.
+ *
+ * A skill revision declares which template it was written against, in its front matter.
+ */
+export const PROMPT_TEMPLATE_VERSIONS = ['source-extraction-prompt-v2'] as const;
+export type PromptTemplateVersion = typeof PROMPT_TEMPLATE_VERSIONS[number];
+export const CURRENT_PROMPT_TEMPLATE_VERSION: PromptTemplateVersion = 'source-extraction-prompt-v2';
+
+export type StructuredExtractionPromptInput = Omit<StructuredExtractionRequest, 'prompt' | 'promptSha256' | 'skillSha256'>;
+
+/**
+ * Assemble the prompt for one call.
+ *
+ * Deterministic and host independent by construction: code-unit key ordering (never
+ * `localeCompare`), no clock, no locale, no environment read. The same skill text and the
+ * same input assemble a byte-identical prompt on any host, which is what makes
+ * `prompt_sha256` an honest provenance record rather than a machine fingerprint.
+ */
+export function buildStructuredExtractionPrompt(
+  input: StructuredExtractionPromptInput,
+  skill: string = SOURCE_EXTRACTION_SKILL,
+  promptTemplateVersion: string = CURRENT_PROMPT_TEMPLATE_VERSION,
+): string {
+  if (!(PROMPT_TEMPLATE_VERSIONS as readonly string[]).includes(promptTemplateVersion)) {
+    // A skill revision naming a template this build does not implement must fail loudly:
+    // silently assembling the current shape would record a template version we did not use.
+    throw new Error(`Unknown prompt template version "${promptTemplateVersion}"; this build implements ${PROMPT_TEMPLATE_VERSIONS.join(', ')}.`);
+  }
+  // A window with no markers omits the key entirely rather than serialising `[]` or, worse,
+  // the literal `undefined` that `stable` would emit for an explicitly-undefined property.
+  const windows = input.windows.map((window) => {
+    if (window.markers && window.markers.length > 0) return window;
+    const { markers: _omitted, ...rest } = window;
+    return rest;
+  });
   const request = {
     contract: {
       rows: {
@@ -645,10 +780,10 @@ export function buildStructuredExtractionPrompt(input: Omit<StructuredExtraction
           client_ref: 'unique within packet',
           op: ['add', 'update', 'resolve', 'supersede', 'reaffirm'],
           target_id: 'required except add',
-          proposed_id: '$ALLOC for add',
+          proposed_id: '$ALLOC for add, null otherwise',
           title: 'non-empty',
           summary: 'string',
-          status: 'source wording normalized conservatively',
+          status: 'source wording normalized conservatively, or null when unstated',
           record_type: 'string or null',
           owner: 'string or null',
           due_date_raw: 'source wording or null',
@@ -659,19 +794,55 @@ export function buildStructuredExtractionPrompt(input: Omit<StructuredExtraction
           derivation: ['fact', 'inference'],
           reasoning: 'required for inference',
           confidence: ['high', 'medium', 'low', 'unknown'],
-          discharges_markers: [],
+          discharges_markers: ['marker id from windows[].markers, anchored within 3 segments'],
           details: {},
         },
       },
       coverage: {
         windows: 'one entry per requested window seq',
         categories: 'one entry per requested category',
-        statuses: ['reviewed', 'populated', 'none-found', 'uncertain', 'failed', 'no-governance-content'],
+        statuses: ['reviewed', 'populated', 'none-found', 'uncertain', 'no-governance-content'],
+      },
+      markers: {
+        shape: { id: 'echo verbatim in discharges_markers', seq: 'segment the cue was detected in', confidence: ['high', 'medium'] },
+        high: 'must be discharged by a row anchored within 3 segments, or listed in markerDismissals',
       },
     },
-    task: input,
+    task: { ...input, windows },
   };
-  return `${SOURCE_EXTRACTION_SKILL}\nReturn one JSON object only with keys rows, windowCoverage, categoryCoverage and optional markerDismissals.\n${stable(request)}`;
+  return `${skill}\nReturn one JSON object only with keys rows, windowCoverage, categoryCoverage and optional markerDismissals.\n${stable(request)}`;
+}
+
+/** Everything one call needs, plus the complete provenance of how it was assembled. */
+export interface AssembledExtractionPrompt {
+  prompt: string;
+  promptSha256: string;
+  skillSha256: string;
+  skillId: string;
+  skillVersion: string;
+  promptTemplateVersion: string;
+  packetContractVersion: number;
+}
+
+/**
+ * Assemble the prompt for a resolved registry revision and return the whole provenance record
+ * with it, so a caller cannot record one revision while sending another. The skill body is used
+ * here and discarded; only hashes and versions leave this function.
+ */
+export function assembleExtractionPrompt(
+  input: StructuredExtractionPromptInput,
+  skill: Pick<ResolvedSkillForRun, 'text' | 'sha256' | 'skillId' | 'version' | 'promptTemplateVersion' | 'packetContractVersion'>,
+): AssembledExtractionPrompt {
+  const prompt = buildStructuredExtractionPrompt(input, skill.text, skill.promptTemplateVersion);
+  return {
+    prompt,
+    promptSha256: sha256(prompt),
+    skillSha256: skill.sha256,
+    skillId: skill.skillId,
+    skillVersion: skill.version,
+    promptTemplateVersion: skill.promptTemplateVersion,
+    packetContractVersion: skill.packetContractVersion,
+  };
 }
 
 function normalizeUsage(usage: ProviderUsage): ProviderUsage {
@@ -724,10 +895,13 @@ const providerRowSchema = z.object({
   client_ref: z.string().min(1),
   op: z.enum(['add', 'update', 'resolve', 'supersede', 'reaffirm']),
   target_id: z.string().min(1).nullable(),
-  proposed_id: z.string().min(1),
+  // Mirrors packetRowSchema: null for every operation except `add`.
+  proposed_id: z.string().min(1).nullable().default(null),
   title: z.string().min(1),
   summary: z.string().default(''),
-  status: z.string().min(1).default('open'),
+  // Mirrors packetRowSchema in sourceIntelligence.ts: a source that states no
+  // status says so with null rather than being forced to invent one.
+  status: z.string().min(1).nullable().default(null),
   record_type: z.string().nullable().default(null),
   owner: z.string().nullable().default(null),
   due_date_raw: z.string().nullable().default(null),
@@ -749,11 +923,37 @@ const providerCoverageSchema = z.object({
   explanation: z.string().min(1).nullable(),
 }).strict();
 
+/**
+ * Accept both the nested `{registerName, row:{...}}` shape and the flat
+ * `{registerName, ...rowFields}` shape.
+ *
+ * Strictness has to live where it protects the register — on the *content* of a
+ * row — not on an incidental nesting convention. A model that puts the register
+ * name alongside the fields rather than beside a sub-object has not made an
+ * error of substance, and rejecting the whole extraction for it costs a full
+ * multi-call pass. Once normalised, the row faces exactly the same strict schema.
+ */
+const providerRowEnvelopeSchema = z.preprocess((value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const entry = value as Record<string, unknown>;
+  if ('row' in entry) return entry;
+  const { registerName, register_name: registerNameSnake, ...rest } = entry;
+  const name = registerName ?? registerNameSnake;
+  if (name === undefined) return entry;
+  return { registerName: name, row: rest };
+}, z.object({
+  registerName: z.enum(SOURCE_INTELLIGENCE_CATEGORIES),
+  row: providerRowSchema,
+}).strict());
+
+export interface RejectedProviderRow {
+  index: number;
+  registerName: string | null;
+  reason: string;
+}
+
 export const structuredExtractionOutputSchema = z.object({
-  rows: z.array(z.object({
-    registerName: z.enum(SOURCE_INTELLIGENCE_CATEGORIES),
-    row: providerRowSchema,
-  }).strict()),
+  rows: z.array(providerRowEnvelopeSchema),
   windowCoverage: z.array(providerCoverageSchema),
   categoryCoverage: z.array(providerCoverageSchema),
   markerDismissals: z.array(z.object({ markerId: z.string().min(1), reason: z.string().min(1) }).strict()).optional(),
@@ -773,18 +973,85 @@ function formatIssues(error: z.ZodError): string {
 }
 
 /** Validate an already-parsed provider payload. Throws a typed `malformed-output` error, never returns a half-valid object. */
+/**
+ * Write the provider's complete raw output beside the run when it fails to
+ * validate.
+ *
+ * A rejected extraction otherwise costs a full multi-call pass to diagnose,
+ * because the error carries only a truncated excerpt. Best effort and silent on
+ * failure: diagnostics must never mask the original error. Never logged, only
+ * written to the local artefacts directory, because the content is source-derived.
+ */
+function captureRawOutput(context: OutputParseContext, raw: string): void {
+  const directory = process.env.PROJECTMANAGAIR_PROVIDER_OUTPUT_DIR;
+  if (!directory) return;
+  try {
+    mkdirSync(directory, { recursive: true });
+    const name = `${context.providerId}-${createHash('sha256').update(raw).digest('hex').slice(0, 16)}.txt`;
+    writeFileSync(pathJoin(directory, name), raw, 'utf8');
+  } catch {
+    /* diagnostics are best effort */
+  }
+}
+
+/**
+ * The share of rows that may fail row-level validation before the whole pass is
+ * treated as malformed.
+ */
+export const MAX_REJECTED_ROW_RATIO = 0.1;
+
+/**
+ * Validate rows individually so one malformed row does not discard a whole
+ * multi-call extraction.
+ *
+ * The contract stays strict: an unknown key still rejects the row it appears on,
+ * and the row is *dropped*, never silently repaired — silent repair is precisely
+ * the failure that sank the previous attempt, where a permissive parser stripped
+ * a field the system then claimed was present. The difference is accounting:
+ * every rejected row is recorded with its reason, returned to the caller,
+ * persisted against the run and surfaced to the reviewer, and if more than
+ * MAX_REJECTED_ROW_RATIO of rows fail the entire pass is still rejected.
+ */
 export function parseStructuredExtractionOutput(value: unknown, context: OutputParseContext): StructuredExtractionOutput {
   const result = structuredExtractionOutputSchema.safeParse(value);
-  if (!result.success) {
-    throw new ProviderError({
-      kind: 'malformed-output',
-      providerId: context.providerId,
-      headline: `Provider output failed StructuredExtractionOutput validation: ${formatIssues(result.error)}`,
-      stdout: context.stdout ?? (typeof value === 'string' ? value : JSON.stringify(value)),
-      stderr: context.stderr ?? '',
-    });
+  if (result.success) return result.data as unknown as StructuredExtractionOutput;
+
+  // Everything except `rows` must be perfect: coverage is a gate input, not content.
+  const envelope = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+  const candidateRows = envelope && Array.isArray(envelope.rows) ? envelope.rows : null;
+  if (candidateRows && candidateRows.length > 0) {
+    const kept: unknown[] = [];
+    const rejected: RejectedProviderRow[] = [];
+    for (const [index, row] of candidateRows.entries()) {
+      const parsedRow = providerRowEnvelopeSchema.safeParse(row);
+      if (parsedRow.success) kept.push(parsedRow.data);
+      else rejected.push({ index, registerName: rowRegisterHint(row), reason: formatIssues(parsedRow.error) });
+    }
+    const ratio = rejected.length / candidateRows.length;
+    if (rejected.length > 0 && ratio <= MAX_REJECTED_ROW_RATIO) {
+      const retry = structuredExtractionOutputSchema.safeParse({ ...envelope, rows: [] });
+      if (retry.success) {
+        captureRawOutput(context, typeof value === 'string' ? value : JSON.stringify(value));
+        return { ...(retry.data as unknown as StructuredExtractionOutput), rows: kept as StructuredExtractionOutput['rows'], rejectedRows: rejected };
+      }
+    }
   }
-  return result.data as unknown as StructuredExtractionOutput;
+
+  captureRawOutput(context, typeof value === 'string' ? value : JSON.stringify(value));
+  throw new ProviderError({
+    kind: 'malformed-output',
+    providerId: context.providerId,
+    headline: `Provider output failed StructuredExtractionOutput validation: ${formatIssues(result.error)}`,
+    stdout: context.stdout ?? (typeof value === 'string' ? value : JSON.stringify(value)),
+    stderr: context.stderr ?? '',
+  });
+}
+
+function rowRegisterHint(row: unknown): string | null {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+  const entry = row as Record<string, unknown>;
+  const name = entry.registerName ?? entry.register_name;
+  return typeof name === 'string' ? name : null;
 }
 
 /** Strip an optional code fence, parse JSON, then validate. Every failure is `malformed-output`. */
@@ -803,6 +1070,7 @@ export function parseStructuredExtractionOutputText(raw: string, context: Output
   try {
     json = parseJsonOutput(trimmed);
   } catch (error) {
+    captureRawOutput(context, trimmed);
     throw new ProviderError({
       kind: 'malformed-output',
       providerId: context.providerId,
@@ -874,11 +1142,18 @@ export class FrozenPacketExtractionProvider implements StructuredExtractionProvi
 }
 
 export class ClaudeCodeStructuredExtractionProvider implements StructuredExtractionProvider {
-  readonly identity = Object.freeze({ providerId: 'claude-code', modelLabel: 'claude-code-cli-default' });
+  readonly identity: Readonly<{ providerId: string; modelLabel: string }>;
   private readonly tracker: CliAvailabilityTracker;
   private readonly timeoutMs: number;
+  private readonly model: string | null;
 
-  constructor(private readonly executable = 'claude', options: CliProviderOptions = {}) {
+  constructor(private readonly executable = 'claude', options: CliProviderOptions & { model?: string | null } = {}) {
+    // The model is part of the recorded provenance of a pass, so it is named
+    // explicitly rather than inherited from whatever the CLI happens to default
+    // to. `PROJECTMANAGAIR_EXTRACTION_MODEL` lets an operator pin it without a
+    // code change.
+    this.model = options.model ?? process.env.PROJECTMANAGAIR_EXTRACTION_MODEL ?? null;
+    this.identity = Object.freeze({ providerId: 'claude-code', modelLabel: this.model ? `claude-code-cli:${this.model}` : 'claude-code-cli-default' });
     this.timeoutMs = options.timeoutMs ?? DEFAULT_EXTRACTION_TIMEOUT_MS;
     this.tracker = new CliAvailabilityTracker({
       providerId: 'claude-code',
@@ -908,10 +1183,19 @@ export class ClaudeCodeStructuredExtractionProvider implements StructuredExtract
       const run = await runCliCommand({
         providerId: this.identity.providerId,
         command: this.executable,
-        args: ['-p', request.prompt],
+        // The prompt goes on stdin, never argv: a real extraction prompt is
+        // ~140 KB and passing it as an argument fails with E2BIG before the
+        // model is ever reached.
+        args: this.model ? ['-p', '--model', this.model] : ['-p'],
+        input: request.prompt,
         signal,
         timeoutMs: this.timeoutMs,
       });
+      // Persist the raw response for every call, not only failing ones. A
+      // downstream merge or gate failure otherwise discards a multi-call
+      // extraction with no way to recover the model's work, which is exactly how
+      // twenty-five minutes of output was lost during acceptance.
+      captureRawOutput({ providerId: this.identity.providerId }, run.stdout);
       const output = parseStructuredExtractionOutputText(run.stdout, {
         providerId: this.identity.providerId,
         stdout: run.stdout,
