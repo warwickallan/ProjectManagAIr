@@ -56,6 +56,16 @@ interface ProposedPayload {
   items: StructuredItem[];
 }
 
+export interface BlindExtractionInput {
+  sourceFile: IntakeFileInput;
+  frozenPacket: ProposedPayload & {
+    model?: string;
+    generatedAt?: string;
+    packetHash?: string;
+    extractionMode?: string;
+  };
+}
+
 const repoRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const localConfigPath = path.join(repoRoot, 'config', 'project-storage.local.json');
 const defaultNamingFormat = '{code} - {name}';
@@ -73,6 +83,7 @@ const storageMapping: Record<string, string> = {
   issuedDeliverable: path.join('08_Deliverables', 'Issued'),
   aiWrites: path.join('09_Reporting_QA_Comms', '01_Writes'),
   verifications: path.join('09_Reporting_QA_Comms', '02_Verifications'),
+  externalRegisters: path.join('06_Registers_and_Exports', 'External_Registers'),
 };
 
 function nowIso() {
@@ -324,6 +335,56 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
   return { sourceId, proposedChangeId: proposedId, duplicate: false, processingStatus: status, extractedCount: payload.items.length };
 }
 
+export function recordBlindExtractionPacket(db: DatabaseSync, projectId: string, input: BlindExtractionInput) {
+  const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId) as { id: string } | undefined;
+  if (!project) throw new Error('Project not found.');
+  const sourceBytes = Buffer.from(input.sourceFile.dataBase64, 'base64');
+  const sourceHash = createHash('sha256').update(sourceBytes).digest('hex');
+  const sourceType = sourceTypeFor(input.sourceFile.name);
+  if (sourceType !== 'vtt-transcript') throw new Error('Blind extraction source must be a VTT transcript.');
+  if (input.frozenPacket.contractVersion !== 1) throw new Error('Frozen packet contractVersion must be 1.');
+  if (!input.frozenPacket.provider?.trim()) throw new Error('Frozen packet provider is required.');
+  if (!Array.isArray(input.frozenPacket.items)) throw new Error('Frozen packet items must be an array.');
+  if (input.frozenPacket.sourceMetadata.contentHash !== sourceHash) throw new Error('Frozen packet source hash does not match the submitted source file.');
+
+  const filedSource = fileProjectArtifact(db, projectId, 'transcripts', input.sourceFile.name, sourceBytes);
+  const packetJson = JSON.stringify(input.frozenPacket);
+  const packetHash = createHash('sha256').update(packetJson).digest('hex');
+  if (input.frozenPacket.packetHash && input.frozenPacket.packetHash !== packetHash) throw new Error('Frozen packet hash does not match the submitted packet.');
+  const timestamp = nowIso();
+  const sourceId = `source:${projectId}:${sourceHash.slice(0, 16)}`;
+  const jobId = `source-job:${projectId}:${packetHash.slice(0, 16)}`;
+  const proposedId = `proposed:${projectId}:${packetHash.slice(0, 16)}`;
+  const writeId = `ai-write:${projectId}:${packetHash.slice(0, 16)}`;
+  const extractedIds = input.frozenPacket.items.map((candidate) => candidate.id);
+  const existing = db.prepare('SELECT id FROM proposed_changes WHERE id = ?').get(proposedId) as { id: string } | undefined;
+  if (existing) {
+    return { sourceId, proposedChangeId: proposedId, duplicate: true, packetHash, sourceHash, filedSource: filedSource.relativePath, extractedCount: extractedIds.length };
+  }
+
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    db.prepare('INSERT INTO project_source_intake (id, project_id, original_file_name, original_received_at, content_hash, source_type, current_external_path, previous_external_path, processing_status, processor_provider, extracted_item_ids_json, review_state, verification_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, content_hash) DO UPDATE SET current_external_path = excluded.current_external_path, processing_status = excluded.processing_status, processor_provider = excluded.processor_provider, extracted_item_ids_json = excluded.extracted_item_ids_json, review_state = excluded.review_state, verification_state = excluded.verification_state, updated_at = excluded.updated_at')
+      .run(sourceId, projectId, input.sourceFile.name, timestamp, sourceHash, sourceType, filedSource.destinationPath, null, 'awaiting_review', `${input.frozenPacket.provider}${input.frozenPacket.model ? `/${input.frozenPacket.model}` : ''}`, JSON.stringify(extractedIds), 'proposed', 'pending', timestamp, timestamp);
+    db.prepare('INSERT INTO source_processing_jobs (id, source_id, project_id, provider, status, started_at, completed_at, error_message, structured_output_contract, proposed_change_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(jobId, sourceId, projectId, input.frozenPacket.provider, 'completed', timestamp, timestamp, null, 'projectmanagair-blind-ptw-extraction-v1', proposedId);
+    db.prepare('INSERT INTO proposed_changes (id, project_id, source_id, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(proposedId, projectId, sourceId, 'proposed', packetJson, timestamp);
+    db.prepare('INSERT INTO source_file_history (id, source_id, project_id, from_external_path, to_external_path, action, occurred_at, actor, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(randomUUID(), sourceId, projectId, null, filedSource.destinationPath, 'filed-immutable-original', timestamp, 'Project ManagAIr', sourceHash);
+    db.prepare('INSERT INTO ai_writes (id, project_id, label, related_entity_type, related_entity_id, write_status, verification_status, verification_method, last_attempt_at, verified_at, verified_by, status_detail, attention_owner, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(writeId, projectId, 'Blind PTW extraction packet', 'source', sourceId, 'complete', 'pending', 'sealed-benchmark-comparison', timestamp, null, null, `Frozen packet SHA-256 ${packetHash}. Awaiting sealed benchmark comparison.`, 'current-user', 'operational-reference');
+    db.prepare('INSERT INTO verifications (id, project_id, ai_write_id, verification_status, method, checked_at, checked_by, summary, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(randomUUID(), projectId, writeId, 'pending', 'sealed-benchmark-comparison', timestamp, 'Project ManagAIr', 'Frozen blind extraction packet recorded; sealed benchmark comparison has not been run.', 'operational-reference');
+    db.prepare('INSERT INTO activity_events (id, project_id, occurred_at, event_type, summary, actor, related_entity_type, related_entity_id, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(randomUUID(), projectId, timestamp, 'ai', 'Blind PTW extraction packet frozen and recorded for benchmark comparison.', 'Project ManagAIr', 'source', sourceId, 'operational-reference');
+    db.exec('COMMIT;');
+  } catch (error) {
+    db.exec('ROLLBACK;');
+    throw error;
+  }
+  return { sourceId, proposedChangeId: proposedId, duplicate: false, packetHash, sourceHash, filedSource: filedSource.relativePath, extractedCount: extractedIds.length };
+}
 function readProposal(db: DatabaseSync, proposedChangeId: string) {
   return db.prepare('SELECT * FROM proposed_changes WHERE id = ?').get(proposedChangeId) as Record<string, unknown> | undefined;
 }
@@ -457,12 +518,15 @@ export function openOriginalPath(db: DatabaseSync, filePath: string) {
   spawn('cmd', ['/c', 'start', '', resolved], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
   return { opened: true };
 }
-
-
-
-
-
-
-
-
-
+export function fileProjectArtifact(db: DatabaseSync, projectId: string, destinationKey: keyof typeof storageMapping, originalName: string, bytes: Buffer) {
+  const root = configuredRoot(db);
+  const pPath = projectPath(db, projectId);
+  const destinationDir = path.join(pPath, storageMapping[destinationKey]);
+  assertInside(root, destinationDir);
+  mkdirSync(destinationDir, { recursive: true });
+  const hash = createHash('sha256').update(bytes).digest('hex');
+  const destinationPath = path.join(destinationDir, fileNameFor(originalName, hash));
+  assertInside(root, destinationPath);
+  if (!existsSync(destinationPath)) writeFileSync(destinationPath, bytes);
+  return { destinationPath, hash, relativePath: path.relative(pPath, destinationPath) };
+}

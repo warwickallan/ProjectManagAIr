@@ -4,9 +4,11 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { buildPortfolioResponse, buildProjectResponse, portfolioFixtureSchema } from './src/domain.js';
 import { openProjectManagairDatabase, readPortfolioData, readProjectData } from './src/db.js';
-import { approveProposedChange, createProject, intakeProjectSource, openOriginalPath, readStorageSettings, rejectProposedChange, updateStorageSettings, verifyStorageRoot } from './src/projectLifecycle.js';
+import { approveProposedChange, createProject, intakeProjectSource, openOriginalPath, readStorageSettings, recordBlindExtractionPacket, rejectProposedChange, updateStorageSettings, verifyStorageRoot } from './src/projectLifecycle.js';
 import { authStatus, markMessageRead, moveMessageToDeletedItems, pollDeviceCode, readCalendarProjection, readInboxProjection, requiredScopes, startDeviceCode, syncCalendarView, syncInbox } from './src/m365.js';
 import { probeAIProviders, sendChatMessage } from './src/aiProvider.js';
+import { compareBlindExtractionToBenchmark } from './src/blindExtractionComparison.js';
+import { importProjectRegisterBenchmark } from './src/projectRegisters.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -96,6 +98,30 @@ app.get('/api/projects/:projectId', (request, response) => {
   response.json(buildProjectResponse(data, request.params.projectId, new Date(), databaseEnvironment));
 });
 
+app.post('/api/projects/:projectId/register-imports', asyncRoute(async (request, response) => {
+  const body = request.body as { benchmarkFile?: { name: string; dataBase64: string }; workbookFile?: { name: string; dataBase64: string } };
+  if (!body.benchmarkFile) {
+    response.status(400).json({ error: 'benchmarkFile is required.' });
+    return;
+  }
+  response.status(201).json(importProjectRegisterBenchmark(db(), String(request.params.projectId), { benchmarkFile: body.benchmarkFile, workbookFile: body.workbookFile }));
+}));
+app.post('/api/projects/:projectId/blind-extractions', asyncRoute(async (request, response) => {
+  const body = request.body as { sourceFile?: { name: string; type?: string; dataBase64: string }; frozenPacket?: Parameters<typeof recordBlindExtractionPacket>[2]['frozenPacket'] };
+  if (!body.sourceFile || !body.frozenPacket) {
+    response.status(400).json({ error: 'sourceFile and frozenPacket are required.' });
+    return;
+  }
+  response.status(201).json(recordBlindExtractionPacket(db(), String(request.params.projectId), { sourceFile: body.sourceFile, frozenPacket: body.frozenPacket }));
+}));
+app.post('/api/projects/:projectId/blind-extraction-comparisons', asyncRoute(async (request, response) => {
+  const body = request.body as { frozenPacketFile?: { name: string; dataBase64: string }; expectedDeltaFile?: { name: string; dataBase64: string }; expectedWorkbookFile?: { name: string; dataBase64: string } };
+  if (!body.frozenPacketFile || !body.expectedDeltaFile) {
+    response.status(400).json({ error: 'frozenPacketFile and expectedDeltaFile are required.' });
+    return;
+  }
+  response.status(201).json(compareBlindExtractionToBenchmark(db(), String(request.params.projectId), { frozenPacketFile: body.frozenPacketFile, expectedDeltaFile: body.expectedDeltaFile, expectedWorkbookFile: body.expectedWorkbookFile }));
+}));
 app.post('/api/projects/:projectId/sources', asyncRoute(async (request, response) => {
   const body = request.body as { files?: Array<{ name: string; type?: string; dataBase64: string }> };
   const files = Array.isArray(body.files) ? body.files : [];

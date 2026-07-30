@@ -212,6 +212,66 @@ export const sourceFileHistorySchema = z.object({
   actor: z.string().min(1),
   contentHash: z.string().min(1),
 });
+
+export const registerRowSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  registerName: z.string().min(1),
+  externalRegisterId: z.string().min(1),
+  title: z.string().min(1),
+  summary: z.string(),
+  recordStatus: z.string().min(1),
+  recordType: z.string().nullable(),
+  owner: z.string().nullable(),
+  dueDate: z.string().nullable(),
+  sourceRef: z.string().nullable(),
+  sourceAnchor: z.string().nullable(),
+  originalStatusWording: z.string().nullable(),
+  relatedIds: z.array(z.string()),
+  supersessionIds: z.array(z.string()),
+  workPackageTags: z.array(z.string()),
+  importRunId: z.string().min(1),
+  originalRowNumber: z.number().nullable(),
+  originalTabName: z.string().min(1),
+  rawRow: z.record(z.string(), z.unknown()),
+  normalizedRow: z.record(z.string(), z.string()),
+  updatedAt: isoDateTime,
+});
+
+export const registerComparisonRowSchema = z.object({
+  id: z.string().min(1),
+  registerName: z.string().min(1),
+  externalRegisterId: z.string().nullable(),
+  fieldName: z.string().nullable(),
+  comparisonStatus: z.enum(['EXACT', 'MATCH_WITH_NORMALISATION', 'MISMATCH', 'NOT_COMPARED']),
+  detail: z.string().nullable(),
+});
+
+export const blindExtractionComparisonReportSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  proposedChangeId: z.string().nullable(),
+  frozenPacketHash: z.string().min(1),
+  expectedDeltaHash: z.string().min(1),
+  expectedWorkbookHash: z.string().nullable(),
+  comparisonStatus: z.string().min(1),
+  summary: z.unknown(),
+  reportMarkdown: z.string(),
+  createdAt: isoDateTime,
+  createdBy: z.string().min(1),
+});
+export const registerComparisonSummarySchema = z.object({
+  registerName: z.string().min(1),
+  sourceWorkbookRowCount: z.number().int().min(0),
+  sqliteRowCount: z.number().int().min(0),
+  matchingDurableIds: z.number().int().min(0),
+  missingIds: z.array(z.string()),
+  additionalIds: z.array(z.string()),
+  exactFieldMatches: z.number().int().min(0),
+  normalisedFieldMatches: z.number().int().min(0),
+  fieldMismatches: z.number().int().min(0),
+  overallStatus: z.enum(['EXACT', 'MATCH_WITH_NORMALISATION', 'MISMATCH', 'NOT_COMPARED']),
+});
 export const projectSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -228,6 +288,7 @@ export const projectSchema = z.object({
   dataClassification,
   externalPath: z.string().nullable().default(null),
   folderName: z.string().nullable().default(null),
+  storageSchemaVersion: z.string().default('project-storage-v1'),
   projectSources: z.array(projectSourceSchema).default([]),
   actions: z.array(actionSchema).default([]),
   risksIssues: z.array(riskIssueSchema).default([]),
@@ -245,6 +306,10 @@ export const projectSchema = z.object({
   proposedChanges: z.array(proposedChangeSchema).default([]),
   sourceEntityProvenance: z.array(sourceEntityProvenanceSchema).default([]),
   sourceFileHistory: z.array(sourceFileHistorySchema).default([]),
+  registerRows: z.array(registerRowSchema).default([]),
+  registerComparisonRows: z.array(registerComparisonRowSchema).default([]),
+  registerComparisonSummary: z.array(registerComparisonSummarySchema).default([]),
+  blindExtractionComparisonReports: z.array(blindExtractionComparisonReportSchema).default([]),
 });
 
 export const portfolioDataSchema = z.object({

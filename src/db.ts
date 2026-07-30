@@ -3,6 +3,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { importPayloadSchema, portfolioDataSchema, type ImportPayload, type PortfolioData, type Project, type UserConfig } from './domain.js';
+import { readBlindExtractionComparisonReports } from './blindExtractionComparison.js';
+import { readRegisterState } from './projectRegisters.js';
 
 type SqlValue = string | number | bigint | null;
 
@@ -126,6 +128,7 @@ function readProjectFromRows(db: DatabaseSync, row: Record<string, unknown>): Pr
     dataClassification: String(row.data_classification),
     externalPath: row.external_path ? String(row.external_path) : null,
     folderName: row.folder_name ? String(row.folder_name) : null,
+    storageSchemaVersion: row.storage_schema_version ? String(row.storage_schema_version) : 'project-storage-v1',
     projectSources: (db.prepare('SELECT * FROM project_sources WHERE project_id = ? ORDER BY label').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
       id: String(item.id), projectId, sourceType: String(item.source_type), label: String(item.label), externalPath: String(item.external_path), lastSeenAt: item.last_seen_at ? String(item.last_seen_at) : null, dataClassification: String(item.data_classification),
     })),
@@ -177,6 +180,10 @@ function readProjectFromRows(db: DatabaseSync, row: Record<string, unknown>): Pr
     sourceFileHistory: (db.prepare('SELECT * FROM source_file_history WHERE project_id = ? ORDER BY occurred_at DESC').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
       id: String(item.id), sourceId: String(item.source_id), projectId, fromExternalPath: item.from_external_path ? String(item.from_external_path) : null, toExternalPath: String(item.to_external_path), action: String(item.action), occurredAt: String(item.occurred_at), actor: String(item.actor), contentHash: String(item.content_hash),
     })),
+    registerRows: readRegisterState(db, projectId).registerRows,
+    registerComparisonRows: readRegisterState(db, projectId).comparisonRows,
+    registerComparisonSummary: readRegisterState(db, projectId).comparisonSummary,
+    blindExtractionComparisonReports: readBlindExtractionComparisonReports(db, projectId),
   };
   return project as Project;
 }

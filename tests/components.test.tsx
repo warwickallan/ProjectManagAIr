@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, vi } from 'vitest';
 import fixtureJson from '../fixtures/portfolio.json';
 import { App } from '../src/App';
@@ -43,18 +43,20 @@ describe('Cockpit states and routes', () => {
     expect(await screen.findByText('Data snapshot is stale')).toBeInTheDocument();
   });
 
-  it('renders every required project detail section', async () => {
-    window.location.hash = '#/projects/atlas';
-    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(buildProjectResponse(fixture, 'atlas', new Date(fixture.asOf)))));
-    render(<App />);
-    expect(await screen.findByRole('heading', { name: 'Project Atlas' })).toBeInTheDocument();
-    for (const name of ['Actions', 'Risks and issues', 'Decisions', 'Open questions', 'Milestones', 'Work packages', 'AI write and verification status', 'Latest project activity']) {
-      expect(screen.getByRole('heading', { name })).toBeInTheDocument();
+  it('renders true project tab routes for required project detail sections', async () => {
+    const response = buildProjectResponse(fixture, 'atlas', new Date(fixture.asOf));
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(response)));
+    for (const [route, heading] of [['actions', /Actions/i], ['risks', /Risks and issues/i], ['decisions', /Decisions/i], ['open-questions', /Open Questions/i], ['milestones', /Milestones/i], ['work-packages', /Work Packages/i], ['activity', /AI write and verification status/i]] as const) {
+      cleanup();
+      window.location.hash = `#/projects/atlas/${route}`;
+      render(<App />);
+      expect(await screen.findByRole('heading', { name: 'Project Atlas' })).toBeInTheDocument();
+      expect(await screen.findByRole('heading', { name: heading })).toBeInTheDocument();
     }
   });
 
-  it('renders an honest empty state for an empty project section', async () => {
-    window.location.hash = '#/projects/atlas';
+  it('renders an honest empty state for an empty project tab', async () => {
+    window.location.hash = '#/projects/atlas/open-questions';
     const response = buildProjectResponse(fixture, 'atlas', new Date(fixture.asOf));
     if (!response) throw new Error('Expected fixture project');
     response.project.openQuestions = [];

@@ -1,6 +1,7 @@
 import type { Route } from './useRoute';
 import { AppFrame } from './components';
 import { PortfolioPage } from './PortfolioPage';
+import { SettingsPage } from './SettingsPage';
 import { ProjectPage } from './ProjectPage';
 import { TodayPage } from './WorkdayPage';
 import { InboxPage } from './InboxPage';
@@ -15,7 +16,8 @@ export function App() {
       {route.name === 'calendar' ? <TodayPage mode="week" /> : null}
       {route.name === 'inbox' ? <InboxPage /> : null}
       {route.name === 'portfolio' || route.name === 'needs-you' ? <PortfolioPage initialSection={route.name === 'needs-you' ? 'attention' : undefined} /> : null}
-      {route.name === 'project' ? <ProjectPage projectId={route.projectId} focus={route.focus} /> : null}
+      {route.name === 'settings' ? <SettingsPage /> : null}
+      {route.name === 'project' ? <ProjectPage projectId={route.projectId} tab={route.tab} /> : null}
       {route.name === 'ai-chat' ? <AIChatPage /> : null}
     </AppFrame>
   );

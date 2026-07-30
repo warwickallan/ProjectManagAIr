@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
 import type { AttentionItem, Freshness, ActivityEvent } from './domain';
 
-type ActiveNav = 'today' | 'inbox' | 'calendar' | 'portfolio' | 'needs-you' | 'ai-chat';
+type ActiveNav = 'today' | 'inbox' | 'calendar' | 'portfolio' | 'needs-you' | 'ai-chat' | 'settings';
 
 export function AppFrame({ active, children }: { active: ActiveNav; children: ReactNode }) {
   const nav = [
@@ -11,6 +11,7 @@ export function AppFrame({ active, children }: { active: ActiveNav; children: Re
     ['portfolio', '#/projects', 'Projects'],
     ['needs-you', '#/needs-you', 'Needs You'],
     ['ai-chat', '#/ai-chat', 'AI Chat'],
+    ['settings', '#/settings', 'Settings'],
   ] as const;
   return (
     <div className="app-shell">
