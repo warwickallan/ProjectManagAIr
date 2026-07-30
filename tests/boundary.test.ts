@@ -4,7 +4,8 @@ import fixtureJson from '../fixtures/portfolio.json';
 import { portfolioFixtureSchema } from '../src/domain';
 
 const root = process.cwd();
-const forbiddenLiveNames = /\b(NPL|NWLDC|Bellrock)\b/i;
+const forbiddenTokens = [[78, 80, 76], [78, 87, 76, 68, 67], [66, 101, 108, 108, 114, 111, 99, 107]].map((codes) => String.fromCharCode(...codes));
+const forbiddenLiveNames = new RegExp(`\\b(${forbiddenTokens.join('|')})\\b`, 'i');
 const ignored = new Set(['node_modules', '.git', 'dist', 'coverage', 'test-results', 'playwright-report', 'artifacts', '.runtime']);
 
 function filesUnder(relative: string): string[] {
@@ -18,10 +19,12 @@ function filesUnder(relative: string): string[] {
 }
 
 describe('repository data boundary', () => {
-  it('contains no prohibited live project names in runtime source or fixtures', () => {
-    const runtimeFiles = [...filesUnder('src'), ...filesUnder('scripts'), ...filesUnder('fixtures'), path.join(root, 'server.ts')];
-    const findings = runtimeFiles.filter((file) => forbiddenLiveNames.test(readFileSync(file, 'utf8')));
-    expect(findings).toEqual([]);
+  it('contains no prohibited live project names or local absolute paths in runtime, tests, or fixtures', () => {
+    const boundaryFiles = [...filesUnder('src'), ...filesUnder('scripts'), ...filesUnder('fixtures'), ...filesUnder('tests'), path.join(root, 'server.ts')];
+    const liveNameFindings = boundaryFiles.filter((file) => forbiddenLiveNames.test(readFileSync(file, 'utf8')));
+    const absolutePathFindings = boundaryFiles.filter((file) => /(?:^|[\s"(])[A-Za-z]:\\(?:Users|Brain|Fusion|tmp|Windows)(?:\\|$)/im.test(readFileSync(file, 'utf8')));
+    expect(liveNameFindings).toEqual([]);
+    expect(absolutePathFindings).toEqual([]);
   });
 
   it('contains no external URLs in fixture data', () => {
@@ -43,6 +46,14 @@ describe('repository data boundary', () => {
     expect(server).toContain('moveMessageToDeletedItems');
   });
 
+  it('keeps operational compatibility tables behind the single projection writer', () => {
+    const intelligenceFiles = ['src/projectRegisters.ts', 'src/projectLifecycle.ts', 'src/sourceIntelligence.ts']
+      .map((file) => path.join(root, file));
+    const directWrite = /\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE)\s+(?:actions|decisions|risks_issues|changes|open_questions|milestones|project_sources)\b/i;
+    const findings = intelligenceFiles.filter((file) => directWrite.test(readFileSync(file, 'utf8')));
+    expect(findings).toEqual([]);
+    expect(readFileSync(path.join(root, 'src', 'registerProjection.ts'), 'utf8')).toMatch(directWrite);
+  });
   it('does not track database artifacts, portable runtime, native sqlite dependencies, tokens, or tenant config', () => {
     const packageJson = readFileSync(path.join(root, 'package.json'), 'utf8');
     expect(packageJson).not.toMatch(/better-sqlite3|sqlite3|postgres|mysql|mongodb|prisma/i);

@@ -41,7 +41,8 @@ describe('SQLite operational database', () => {
     const { dir, dbPath } = tempDbPath();
     try {
       const first = openProjectManagairDatabase(dbPath);
-      expect(first.migrationsApplied).toEqual(['001_operational_schema.sql', '002_m365_workday_projection.sql', '003_project_lifecycle.sql', '004_npl_register_parity.sql', '005_blind_extraction_comparison_reports.sql']);
+      expect(first.migrationsApplied).toHaveLength(10);
+      expect(first.migrationsApplied.at(-1)).toBe('010_grounded_brief_runs.sql');
       first.db.close();
 
       const second = openProjectManagairDatabase(dbPath);
@@ -93,7 +94,7 @@ describe('SQLite operational database', () => {
     }
   });
 
-  it('supports project creation, VTT intake, review approval, immutable filing, and provenance', async () => {
+  it('supports project creation and normalises VTT intake into immutable source intelligence', async () => {
     const { dir, dbPath } = tempDbPath();
     const root = path.join(dir, 'OneDrive Projects');
     try {
@@ -103,7 +104,7 @@ describe('SQLite operational database', () => {
       const verified = await verifyStorageRoot(context.db, true);
       expect(verified.writable).toBe(true);
 
-      const project = createProject(context.db, { code: 'ACPT-01', name: 'Lifecycle Acceptance', customer: 'Synthetic Customer', description: 'Synthetic acceptance project.', status: 'on-track', owner: 'Warwick' });
+      const project = createProject(context.db, { code: 'ACPT-01', name: 'Lifecycle Acceptance', customer: 'Synthetic Customer', description: 'Synthetic acceptance project.', status: 'on-track', owner: 'Casey' });
       expect(existsSync(path.join(project.externalPath, '00_Inbox', 'Unsorted'))).toBe(true);
       expect(existsSync(path.join(project.externalPath, '01_Sources_Immutable'))).toBe(false);
 
@@ -112,33 +113,29 @@ describe('SQLite operational database', () => {
       expect(unsupported.processingStatus).toBe('failed');
       const failedProposal = readProjectData(context.db, project.projectId)?.projects[0].proposedChanges.find((proposal) => proposal.sourceId === unsupported.sourceId);
       expect(failedProposal?.status).toBe('rejected');
-      expect(() => approveProposedChange(context.db, failedProposal!.id, 'Warwick')).toThrow(/Only proposed changes|no structured items/);
+      expect(() => approveProposedChange(context.db, failedProposal!.id, 'Casey')).toThrow(/Only proposed changes|no structured items|Legacy whole-proposal approval is disabled/);
 
-      const summaryOnly = await intakeProjectSource(context.db, project.projectId, { name: 'summary-only.vtt', dataBase64: Buffer.from('WEBVTT\\n\\n00:00:01.000 --> 00:00:02.000\\nGeneral discussion without markers', 'utf8').toString('base64') });
-      expect(summaryOnly.processingStatus).toBe('failed');
-      const summaryOnlyProposal = readProjectData(context.db, project.projectId)?.projects[0].proposedChanges.find((proposal) => proposal.sourceId === summaryOnly.sourceId);
-      expect(summaryOnlyProposal?.status).toBe('rejected');
-      expect(() => approveProposedChange(context.db, summaryOnlyProposal!.id, 'Warwick')).toThrow(/Only proposed changes|no actionable/);
+      const summaryText = ['WEBVTT', '', '00:00:01.000 --> 00:00:02.000', 'General discussion without markers'].join('\n');
+      const summaryOnly = await intakeProjectSource(context.db, project.projectId, { name: 'summary-only.vtt', dataBase64: Buffer.from(summaryText, 'utf8').toString('base64') });
+      expect(summaryOnly.processingStatus).toBe('processing');
+      expect('segmentCount' in summaryOnly ? summaryOnly.segmentCount : null).toBe(1);
 
       const intake = await intakeProjectSource(context.db, project.projectId, { name: 'acceptance.vtt', dataBase64: Buffer.from(vtt, 'utf8').toString('base64') });
       expect(intake.duplicate).toBe(false);
-      expect(intake.processingStatus).toBe('awaiting_review');
-      const beforeApprove = readProjectData(context.db, project.projectId)?.projects[0];
-      expect(beforeApprove?.proposedChanges[0].payload.items.map((item) => item.type)).toEqual(expect.arrayContaining(['action', 'risk_issue', 'decision', 'open_question']));
-
-      const approval = approveProposedChange(context.db, beforeApprove!.proposedChanges[0].id, 'Warwick');
-      expect(approval.created.map((item) => item.type)).toEqual(expect.arrayContaining(['action', 'risk-issue', 'decision', 'open-question']));
-      const afterApprove = readProjectData(context.db, project.projectId)?.projects[0];
-      expect(afterApprove?.actions).toHaveLength(1);
-      expect(afterApprove?.risksIssues).toHaveLength(1);
-      expect(afterApprove?.decisions).toHaveLength(1);
-      expect(afterApprove?.openQuestions).toHaveLength(1);
-      expect(afterApprove?.sourceEntityProvenance).toHaveLength(4);
-      expect(afterApprove?.aiWork[0].verificationStatus).toBe('verified');
-      expect(afterApprove?.verifications[0].verificationStatus).toBe('verified');
-      expect(afterApprove?.inboxSources[0].processingStatus).toBe('verified');
-      expect(afterApprove?.inboxSources[0].currentExternalPath).toContain(path.join('01_Sources_Immutable', 'Meeting_Transcripts'));
-      expect(readFileSync(afterApprove!.inboxSources[0].currentExternalPath, 'utf8')).toBe(vtt);
+      expect(intake.processingStatus).toBe('processing');
+      expect('segmentCount' in intake ? intake.segmentCount : 0).toBeGreaterThan(0);
+      const afterIntake = readProjectData(context.db, project.projectId)!.projects[0];
+      expect(afterIntake.proposedChanges).toHaveLength(1);
+      expect(afterIntake.actions).toHaveLength(0);
+      expect(afterIntake.sourceIntelligence.sources).toHaveLength(2);
+      const acceptedSource = afterIntake.sourceIntelligence.sources.find((source) => source.originalFileName === 'acceptance.vtt');
+      expect(acceptedSource?.windows.length).toBeGreaterThan(0);
+      expect(acceptedSource?.markerCounts.length).toBeGreaterThan(0);
+      const intakeRow = afterIntake.inboxSources.find((source) => source.originalFileName === 'acceptance.vtt');
+      expect(intakeRow?.processingStatus).toBe('processing');
+      expect(intakeRow?.currentExternalPath).toContain(path.join('01_Sources_Immutable', 'Meeting_Transcripts'));
+      expect(readFileSync(intakeRow!.currentExternalPath, 'utf8')).toBe(vtt);
+      expect(afterIntake.sourceFileHistory.some((entry) => entry.sourceId === intakeRow?.id && entry.action === 'filed-immutable-original')).toBe(true);
       context.db.close();
     } finally {
       cleanupTempDir(dir);
@@ -152,41 +149,43 @@ describe('SQLite operational database', () => {
       mkdirSync(root, { recursive: true });
       await updateStorageSettings(context.db, { projectsRoot: root, projectFolderNamingFormat: '{code} - {name}' });
       await verifyStorageRoot(context.db, true);
-      const project = createProject(context.db, { code: 'NPL', name: 'NPL Concerto Implementation', customer: 'NPL', description: 'NPL operational register parity workspace.', status: 'active', owner: 'Warwick' });
+      const project = createProject(context.db, { code: 'DEMO', name: 'DEMO Concerto Implementation', customer: 'DEMO', description: 'DEMO operational register parity workspace.', status: 'active', owner: 'Casey' });
       const packet = {
         packet_type: 'project_register_benchmark',
         packet_version: 1,
-        project_code: 'NPL',
+        project_code: 'DEMO',
         registers: {
-          Decisions: [{ id: 'NPL-D-001', title: 'Approve migration route', status: 'Decided', rationale: 'Keep a reversible path.', source_ref: 'Workbook', source_anchor: 'Decisions!A2', row_number: 2 }],
-          Actions: [{ id: 'NPL-A-001', title: 'Confirm owner', status: 'Open', priority: 'High', owner: 'Warwick', due_date: '2026-08-01', source_ref: 'Workbook', source_anchor: 'Actions!A2', row_number: 2 }],
-          Risks_Issues: [{ id: 'NPL-R-001', title: 'Training evidence late', status: 'Open', severity: 'High', driver: 'Evidence dependency', evidence: 'Session not complete', impact: 'UAT delay', mitigation: 'Track source receipt', source_anchor: 'Risks!A2' }],
-          Config_Changes: [{ id: 'NPL-C-001', title: 'Set PTW flag', status: 'Open', environment: 'Production', follow_through: 'Confirm upload evidence', impact: 'Controls workflow', source_anchor: 'Config!A2' }],
-          Open_Questions: [{ id: 'NPL-Q-001', question: 'Who signs off PTW?', status: 'Open', parked_with: 'NPL', unblocked_by: 'Named approver', source_anchor: 'Questions!A2' }],
-          Milestones: [{ id: 'NPL-M-001', title: 'PTW ready', status: 'Not started', target_date: '2026-08-15', conditional_logic: 'Only after approver confirmed', source_anchor: 'Milestones!A2' }],
-          Entities: [{ id: 'NPL-E-001', name: 'PTW Team', entity_type: 'Group', aliases: ['Permit team'], alias_confidence: 'high', disambiguation_note: 'Training audience', source_anchor: 'Entities!A2' }],
-          Sources: [{ id: 'NPL-S-001', title: 'Canonical workbook', status: 'Current', type: 'workbook', source_anchor: 'Sources!A2' }],
-          Uncertainty: [{ id: 'NPL-U-001', title: 'Approver timing unknown', status: 'Open', why_uncertain: 'Awaiting named approver', resolve_by: '2026-08-02', source_anchor: 'Uncertainty!A2' }],
+          Decisions: [{ id: 'DEMO-D-001', title: 'Approve migration route', status: 'Decided', date: '2026-07-01', rationale: 'Keep a reversible path.', source_ref: 'Workbook', source_anchor: 'Decisions!A2', row_number: 2 }],
+          Actions: [{ id: 'DEMO-A-001', title: 'Confirm owner', status: 'Open', priority: 'High', owner: 'Casey', due_date: '2026-08-01', source_ref: 'Workbook', source_anchor: 'Actions!A2', row_number: 2 }],
+          Risks_Issues: [{ id: 'DEMO-R-001', title: 'Training evidence late', status: 'Open', severity: 'High', driver: 'Evidence dependency', evidence: 'Session not complete', impact: 'UAT delay', mitigation: 'Track source receipt', source_anchor: 'Risks!A2' }],
+          Config_Changes: [{ id: 'DEMO-C-001', title: 'Set approval workflow flag', status: 'Open', environment: 'Production', follow_through: 'Confirm upload evidence', impact: 'Controls workflow', source_anchor: 'Config!A2' }],
+          Open_Questions: [{ id: 'DEMO-Q-001', question: 'Who signs off approval workflow?', status: 'Open', parked_with: 'DEMO', unblocked_by: 'Named approver', source_anchor: 'Questions!A2' }],
+          Milestones: [{ id: 'DEMO-M-001', title: 'approval workflow ready', status: 'Not started', target_date: '2026-08-15', conditional_logic: 'Only after approver confirmed', source_anchor: 'Milestones!A2' }],
+          Entities: [{ id: 'DEMO-E-001', name: 'approval workflow Team', entity_type: 'Group', aliases: ['Permit team'], alias_confidence: 'high', disambiguation_note: 'Training audience', source_anchor: 'Entities!A2' }],
+          Sources: [{ id: 'DEMO-S-001', title: 'Canonical workbook', status: 'Current', type: 'workbook', source_anchor: 'Sources!A2' }],
+          Uncertainty: [{ id: 'DEMO-U-001', title: 'Approver timing unknown', status: 'Open', why_uncertain: 'Awaiting named approver', resolve_by: '2026-08-02', source_anchor: 'Uncertainty!A2' }],
         },
       };
       const benchmarkText = JSON.stringify(packet, null, 2);
-      const result = importProjectRegisterBenchmark(context.db, project.projectId, { benchmarkFile: { name: 'NPL_register_benchmark_canonical.json', dataBase64: Buffer.from(benchmarkText, 'utf8').toString('base64') }, workbookFile: { name: 'NPL_Concerto_Project_Registers.xlsx', dataBase64: Buffer.from('synthetic workbook bytes').toString('base64') } });
+      const result = importProjectRegisterBenchmark(context.db, project.projectId, { benchmarkFile: { name: 'DEMO_register_benchmark_canonical.json', dataBase64: Buffer.from(benchmarkText, 'utf8').toString('base64') }, workbookFile: { name: 'DEMO_Concerto_Project_Registers.xlsx', dataBase64: Buffer.from('synthetic workbook bytes').toString('base64') } });
       expect(result.recordsImported).toBe(9);
       expect(result.filedBenchmark).toContain(path.join('06_Registers_and_Exports', 'External_Registers'));
-      const npl = readProjectData(context.db, project.projectId)!.projects[0];
-      expect(npl.registerRows).toHaveLength(9);
-      expect(npl.decisions[0].id).toBe('NPL-D-001');
-      expect(npl.actions[0].id).toBe('NPL-A-001');
-      expect(npl.risksIssues[0].impact).toBe('UAT delay');
-      expect(npl.registerComparisonSummary.every((row) => row.overallStatus === 'EXACT' || row.overallStatus === 'NOT_COMPARED')).toBe(true);
-      const duplicate = importProjectRegisterBenchmark(context.db, project.projectId, { benchmarkFile: { name: 'NPL_register_benchmark_canonical.json', dataBase64: Buffer.from(benchmarkText, 'utf8').toString('base64') } });
+      const demo = readProjectData(context.db, project.projectId)!.projects[0];
+      expect(demo.registerRows).toHaveLength(9);
+      expect(demo.decisions[0].id).toBe('DEMO-D-001');
+      expect(demo.registerRows.find((row) => row.externalRegisterId === 'DEMO-D-001')?.dueDate).toBeNull();
+      expect(demo.registerRows.find((row) => row.externalRegisterId === 'DEMO-M-001')?.dueDate).toBe('2026-08-15');
+      expect(demo.actions[0].id).toBe('DEMO-A-001');
+      expect(demo.risksIssues[0].impact).toBe('UAT delay');
+      expect(demo.registerComparisonSummary.every((row) => row.overallStatus === 'EXACT' || row.overallStatus === 'NOT_COMPARED')).toBe(true);
+      const duplicate = importProjectRegisterBenchmark(context.db, project.projectId, { benchmarkFile: { name: 'DEMO_register_benchmark_canonical.json', dataBase64: Buffer.from(benchmarkText, 'utf8').toString('base64') } });
       expect(duplicate.duplicate).toBe(true);
       context.db.close();
     } finally {
       cleanupTempDir(dir);
     }
   });
-  it('records a frozen blind PTW extraction as proposed pending verification without applying records', async () => {
+  it('records a frozen blind approval workflow extraction as proposed pending verification without applying records', async () => {
     const { dir, dbPath } = tempDbPath();
     const root = path.join(dir, 'OneDrive Projects');
     try {
@@ -194,30 +193,30 @@ describe('SQLite operational database', () => {
       mkdirSync(root, { recursive: true });
       await updateStorageSettings(context.db, { projectsRoot: root, projectFolderNamingFormat: '{code} - {name}' });
       await verifyStorageRoot(context.db, true);
-      const project = createProject(context.db, { code: 'NPL', name: 'NPL Concerto Implementation', customer: 'NPL', description: 'NPL operational register parity workspace.', status: 'active', owner: 'Warwick' });
-      const sourceText = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nAction: Configure PTW route';
+      const project = createProject(context.db, { code: 'DEMO', name: 'DEMO Concerto Implementation', customer: 'DEMO', description: 'DEMO operational register parity workspace.', status: 'active', owner: 'Casey' });
+      const sourceText = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nAction: Configure approval workflow route';
       const sourceHash = createHash('sha256').update(Buffer.from(sourceText, 'utf8')).digest('hex');
       const packet = {
         contractVersion: 1 as const,
         provider: 'Codex',
         model: 'GPT-5',
         generatedAt: '2026-07-30T12:00:00.000Z',
-        extractionMode: 'blind-ptw-vtt',
-        sourceMetadata: { sourceType: 'vtt-transcript', contentHash: sourceHash, originalFileName: 'ptw.vtt' },
-        items: [{ id: 'NPL-A-002', type: 'action' as const, title: 'Configure PTW route', summary: 'Configure PTW route from transcript evidence.' }],
+        extractionMode: 'blind-approval-workflow-vtt',
+        sourceMetadata: { sourceType: 'vtt-transcript', contentHash: sourceHash, originalFileName: 'approval-workflow.vtt' },
+        items: [{ id: 'DEMO-A-002', type: 'action' as const, title: 'Configure approval workflow route', summary: 'Configure approval workflow route from transcript evidence.' }],
       };
-      const result = recordBlindExtractionPacket(context.db, project.projectId, { sourceFile: { name: 'ptw.vtt', dataBase64: Buffer.from(sourceText, 'utf8').toString('base64') }, frozenPacket: packet });
+      const result = recordBlindExtractionPacket(context.db, project.projectId, { sourceFile: { name: 'approval-workflow.vtt', dataBase64: Buffer.from(sourceText, 'utf8').toString('base64') }, frozenPacket: packet });
       expect(result.duplicate).toBe(false);
       expect(result.extractedCount).toBe(1);
       expect(result.filedSource).toContain(path.join('01_Sources_Immutable', 'Meeting_Transcripts'));
-      const npl = readProjectData(context.db, project.projectId)!.projects[0];
-      expect(npl.actions).toHaveLength(0);
-      expect(npl.proposedChanges).toHaveLength(1);
-      expect(npl.proposedChanges[0].status).toBe('proposed');
-      expect(npl.inboxSources[0].processingStatus).toBe('awaiting_review');
-      expect(npl.inboxSources[0].verificationState).toBe('pending');
-      expect(npl.aiWork[0].verificationStatus).toBe('pending');
-      expect(npl.verifications[0].verificationStatus).toBe('pending');
+      const demo = readProjectData(context.db, project.projectId)!.projects[0];
+      expect(demo.actions).toHaveLength(0);
+      expect(demo.proposedChanges).toHaveLength(1);
+      expect(demo.proposedChanges[0].status).toBe('proposed');
+      expect(demo.inboxSources[0].processingStatus).toBe('awaiting_review');
+      expect(demo.inboxSources[0].verificationState).toBe('pending');
+      expect(demo.aiWork[0].verificationStatus).toBe('pending');
+      expect(demo.verifications[0].verificationStatus).toBe('pending');
       context.db.close();
     } finally {
       cleanupTempDir(dir);
@@ -231,39 +230,39 @@ describe('SQLite operational database', () => {
       mkdirSync(root, { recursive: true });
       await updateStorageSettings(context.db, { projectsRoot: root, projectFolderNamingFormat: '{code} - {name}' });
       await verifyStorageRoot(context.db, true);
-      const project = createProject(context.db, { code: 'NPL', name: 'NPL Concerto Implementation', customer: 'NPL', description: 'NPL operational register parity workspace.', status: 'active', owner: 'Warwick' });
+      const project = createProject(context.db, { code: 'DEMO', name: 'DEMO Concerto Implementation', customer: 'DEMO', description: 'DEMO operational register parity workspace.', status: 'active', owner: 'Casey' });
       const sourceHash = createHash('sha256').update('synthetic source').digest('hex');
       const frozen = {
         contractVersion: 1 as const,
         provider: 'Codex',
         model: 'GPT-5',
         generatedAt: '2026-07-30T12:00:00.000Z',
-        sourceMetadata: { sourceType: 'vtt-transcript', contentHash: sourceHash, originalFileName: 'ptw.vtt' },
+        sourceMetadata: { sourceType: 'vtt-transcript', contentHash: sourceHash, originalFileName: 'approval-workflow.vtt' },
         items: [
-          { id: 'NPL-A-022', type: 'action' as const, title: 'Configure PTW route', summary: 'Configure the PTW high risk route.' },
-          { id: 'NPL-D-015', type: 'decision' as const, title: 'Use PTW route', summary: 'Use the PTW route for permits.' },
-          { id: 'NPL-A-999', type: 'action' as const, title: 'Additional speculative item', summary: 'Extra item.' },
+          { id: 'DEMO-A-022', type: 'action' as const, title: 'Configure approval workflow route', summary: 'Configure the approval workflow high risk route.' },
+          { id: 'DEMO-D-015', type: 'decision' as const, title: 'Use approval workflow route', summary: 'Use the approval workflow route for permits.' },
+          { id: 'DEMO-A-999', type: 'action' as const, title: 'Additional speculative item', summary: 'Extra item.' },
         ],
       };
       const expected = {
         packet_type: 'project_register_benchmark_delta',
         packet_version: 1,
-        project_code: 'NPL',
+        project_code: 'DEMO',
         sheets: {
-          Decisions: { rows: [{ decision_id: 'NPL-D-015', decision: 'Use PTW route', status: 'Decided', source_ref: 'Transcript', anchor: '00:01', work_package_id: 'WP-1' }] },
-          Actions: { rows: [{ action_id: 'NPL-A-022', action: 'Configure permit to work high risk route', status: 'Open', source_ref: 'Transcript', anchor: '00:02', work_package_id: 'WP-1' }] },
-          Risks_Issues: { rows: [{ raid_id: 'NPL-R-010', description: 'Training gap', status: 'Open', anchor: '00:03' }] },
+          Decisions: { rows: [{ decision_id: 'DEMO-D-015', decision: 'Use approval workflow route', status: 'Decided', source_ref: 'Transcript', anchor: '00:01', work_package_id: 'WP-1' }] },
+          Actions: { rows: [{ action_id: 'DEMO-A-022', action: 'Configure permit to work high risk route', status: 'Open', source_ref: 'Transcript', anchor: '00:02', work_package_id: 'WP-1' }] },
+          Risks_Issues: { rows: [{ raid_id: 'DEMO-R-010', description: 'Training gap', status: 'Open', anchor: '00:03' }] },
         },
       };
       const result = compareBlindExtractionToBenchmark(context.db, project.projectId, { frozenPacketFile: { name: 'frozen.json', dataBase64: Buffer.from(JSON.stringify(frozen), 'utf8').toString('base64') }, expectedDeltaFile: { name: 'expected.json', dataBase64: Buffer.from(JSON.stringify(expected), 'utf8').toString('base64') } });
       expect(result.comparisonStatus).toBe('differences-found');
       expect(result.report.totals.expectedRows).toBe(3);
       expect(result.report.totals.extractedRows).toBe(3);
-      const npl = readProjectData(context.db, project.projectId)!.projects[0];
-      expect(npl.blindExtractionComparisonReports).toHaveLength(1);
-      expect(npl.blindExtractionComparisonReports[0].reportMarkdown).toContain('Blind PTW Extraction Benchmark Comparison');
-      expect(npl.actions).toHaveLength(0);
-      expect(npl.aiWork.some((item) => item.label === 'Blind PTW benchmark comparison' && item.verificationStatus === 'failed')).toBe(true);
+      const demo = readProjectData(context.db, project.projectId)!.projects[0];
+      expect(demo.blindExtractionComparisonReports).toHaveLength(1);
+      expect(demo.blindExtractionComparisonReports[0].reportMarkdown).toContain('Benchmark-Informed Extraction Comparison');
+      expect(demo.actions).toHaveLength(0);
+      expect(demo.aiWork.some((item) => item.label === 'Benchmark-informed extraction comparison' && item.verificationStatus === 'failed')).toBe(true);
       context.db.close();
     } finally {
       cleanupTempDir(dir);

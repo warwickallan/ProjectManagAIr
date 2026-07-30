@@ -1,14 +1,20 @@
 import express from 'express';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { buildPortfolioResponse, buildProjectResponse, portfolioFixtureSchema } from './src/domain.js';
 import { openProjectManagairDatabase, readPortfolioData, readProjectData } from './src/db.js';
-import { approveProposedChange, createProject, intakeProjectSource, openOriginalPath, readStorageSettings, recordBlindExtractionPacket, rejectProposedChange, updateStorageSettings, verifyStorageRoot } from './src/projectLifecycle.js';
+import { approveProposedChange, createProject, openOriginalPath, readStorageSettings, recordBlindExtractionPacket, rejectProposedChange, updateStorageSettings, verifyStorageRoot, type IntakeFileInput } from './src/projectLifecycle.js';
 import { authStatus, markMessageRead, moveMessageToDeletedItems, pollDeviceCode, readCalendarProjection, readInboxProjection, requiredScopes, startDeviceCode, syncCalendarView, syncInbox } from './src/m365.js';
 import { probeAIProviders, sendChatMessage } from './src/aiProvider.js';
 import { compareBlindExtractionToBenchmark } from './src/blindExtractionComparison.js';
 import { importProjectRegisterBenchmark } from './src/projectRegisters.js';
+import { recordRegisterEvent } from './src/registerProjection.js';
+import { applyReviewedChangeset, buildConsultantBrief, freezePacketAndCreateChangeset, pinOverviewMode, readSourceIntelligence, replayPacket, reviewChangeset } from './src/sourceIntelligence.js';
+import { createLifecycleSourceEnqueuer, orchestrateSourceExtraction, WatchedInboxScanner } from './src/sourcePipeline.js';
+import { ClaudeCodeStructuredExtractionProvider } from './src/extractionProvider.js';
+import { ClaudeCodeGroundedBriefProvider } from './src/briefProvider.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -34,10 +40,58 @@ function db() {
   return dbContext.db;
 }
 
+const structuredExtractionProvider = new ClaudeCodeStructuredExtractionProvider();
+const groundedBriefProvider = new ClaudeCodeGroundedBriefProvider();
+let extractionWorker = Promise.resolve();
+
+function scheduleSourceExtraction(sourceId: string) {
+  const source = db().prepare('SELECT id, project_id, intake_source_id, content_hash FROM source_documents WHERE id = ?').get(sourceId) as { id: string; project_id: string; intake_source_id: string | null; content_hash: string } | undefined;
+  if (!source) return;
+  if (!structuredExtractionProvider.isAvailable()) {
+    const timestamp = new Date().toISOString();
+    const jobId = `source-job:${source.project_id}:${source.content_hash.slice(0, 16)}`;
+    db().prepare("UPDATE source_processing_jobs SET status = 'queued', current_stage = 'awaiting-provider', updated_at = ?, error_message = ? WHERE id = ?")
+      .run(timestamp, 'Local structured extraction provider is unavailable; deterministic source evidence remains available.', jobId);
+    db().prepare("UPDATE project_source_intake SET processing_status = 'awaiting_processing', updated_at = ? WHERE id = ?").run(timestamp, source.intake_source_id);
+    return;
+  }
+  extractionWorker = extractionWorker.catch(() => undefined).then(async () => {
+    await orchestrateSourceExtraction(db(), { sourceId, provider: structuredExtractionProvider });
+  });
+  void extractionWorker.catch(() => undefined);
+}
+
+async function enqueueSourceFile(projectId: string, file: IntakeFileInput) {
+  const result = await createLifecycleSourceEnqueuer(db())(projectId, file);
+  if (!result.duplicate && typeof result.sourceId === 'string') scheduleSourceExtraction(result.sourceId);
+  return result;
+}
+
 function asyncRoute(handler: express.RequestHandler): express.RequestHandler {
   return (request, response, next) => Promise.resolve(handler(request, response, next)).catch(next);
 }
 
+const inboxWatchers = new Map<string, WatchedInboxScanner>();
+
+function ensureInboxWatcher(projectId: string, externalPath: string | null) {
+  if (demoMode || !externalPath || inboxWatchers.has(projectId)) return;
+  const inboxPath = path.join(externalPath, '00_Inbox', 'Unsorted');
+  if (!existsSync(inboxPath)) return;
+  const scanner = new WatchedInboxScanner({
+    projectId,
+    inboxPath,
+    enqueue: enqueueSourceFile,
+    isKnownHash: (contentHash) => Boolean(db().prepare('SELECT 1 FROM project_source_intake WHERE project_id = ? AND content_hash = ? LIMIT 1').get(projectId, contentHash)),
+  });
+  scanner.start();
+  inboxWatchers.set(projectId, scanner);
+}
+
+function startInboxWatchers() {
+  if (demoMode) return;
+  const projects = db().prepare('SELECT id, external_path FROM projects WHERE external_path IS NOT NULL').all() as Array<{ id: string; external_path: string | null }>;
+  for (const project of projects) ensureInboxWatcher(project.id, project.external_path);
+}
 app.disable('x-powered-by');
 app.use(express.json({ limit: '32mb' }));
 app.use((_, response, next) => {
@@ -78,6 +132,7 @@ app.post('/api/project-storage/verify', asyncRoute(async (request, response) => 
 
 app.post('/api/projects', asyncRoute(async (request, response) => {
   const result = createProject(db(), request.body as Parameters<typeof createProject>[1]);
+  ensureInboxWatcher(result.projectId, result.externalPath);
   response.status(201).json(result);
 }));
 app.get('/api/projects/:projectId', (request, response) => {
@@ -125,10 +180,39 @@ app.post('/api/projects/:projectId/blind-extraction-comparisons', asyncRoute(asy
 app.post('/api/projects/:projectId/sources', asyncRoute(async (request, response) => {
   const body = request.body as { files?: Array<{ name: string; type?: string; dataBase64: string }> };
   const files = Array.isArray(body.files) ? body.files : [];
-  response.status(201).json({ results: await Promise.all(files.map((file) => intakeProjectSource(db(), String(request.params.projectId), file))) });
+  response.status(201).json({ results: await Promise.all(files.map((file) => enqueueSourceFile(String(request.params.projectId), file))) });
 }));
-app.post('/api/proposed-changes/:proposedChangeId/approve', asyncRoute(async (request, response) => response.json(approveProposedChange(db(), String(request.params.proposedChangeId), String((request.body as { reviewer?: string }).reviewer ?? 'Warwick')))));
-app.post('/api/proposed-changes/:proposedChangeId/reject', asyncRoute(async (request, response) => response.json(rejectProposedChange(db(), String(request.params.proposedChangeId), String((request.body as { reviewer?: string }).reviewer ?? 'Warwick')))));
+app.get('/api/projects/:projectId/source-intelligence', (request, response) => response.json(readSourceIntelligence(db(), String(request.params.projectId))));
+app.post('/api/projects/:projectId/extraction-packets', asyncRoute(async (request, response) => response.status(201).json(freezePacketAndCreateChangeset(db(), request.body))));
+app.post('/api/projects/:projectId/changesets/:changesetId/review', asyncRoute(async (request, response) => {
+  const body = request.body as { reviewer?: string; decision?: 'accept' | 'reject'; opIds?: string[]; batch?: boolean; note?: string; decisions?: Array<{ operationId: string; status: 'accepted' | 'rejected'; note?: string }> };
+  const reviewer = String(body.reviewer ?? 'current-user');
+  if (Array.isArray(body.decisions)) {
+    const accepted = body.decisions.filter((item) => item.status === 'accepted');
+    const rejected = body.decisions.filter((item) => item.status === 'rejected');
+    const results = [];
+    if (accepted.length) results.push(reviewChangeset(db(), String(request.params.changesetId), { decision: 'accept', reviewer, opIds: accepted.map((item) => item.operationId), batch: Boolean(body.batch), note: accepted.map((item) => item.note).filter(Boolean).join('; ') || null }));
+    if (rejected.length) results.push(reviewChangeset(db(), String(request.params.changesetId), { decision: 'reject', reviewer, opIds: rejected.map((item) => item.operationId), batch: Boolean(body.batch), note: rejected.map((item) => item.note).filter(Boolean).join('; ') || null }));
+    response.json({ changesetId: String(request.params.changesetId), results });
+    return;
+  }
+  if (!body.decision) { response.status(400).json({ error: 'decision or decisions is required.' }); return; }
+  response.json(reviewChangeset(db(), String(request.params.changesetId), { decision: body.decision, reviewer, opIds: body.opIds, batch: body.batch, note: body.note ?? null }));
+}));
+app.post('/api/projects/:projectId/changesets/:changesetId/apply', asyncRoute(async (request, response) => response.json(applyReviewedChangeset(db(), String(request.params.changesetId)))));
+app.post('/api/projects/:projectId/packets/:packetId/replay', asyncRoute(async (request, response) => response.json(replayPacket(db(), String(request.params.packetId)))));
+app.post('/api/projects/:projectId/register-rows/:externalRegisterId/events', asyncRoute(async (request, response) => {
+  const body = request.body as { actor?: string; eventType?: string; field?: string | null; newValue?: string | null; reason?: string; evidenceRef?: string | null; occurredAt?: string };
+  if (!body.eventType || !body.reason) { response.status(400).json({ error: 'eventType and reason are required.' }); return; }
+  response.status(201).json(recordRegisterEvent(db(), String(request.params.projectId), String(request.params.externalRegisterId), { actor: String(body.actor ?? 'current-user'), eventType: body.eventType, field: body.field, newValue: body.newValue, reason: body.reason, evidenceRef: body.evidenceRef, occurredAt: body.occurredAt }));
+}));
+app.post('/api/projects/:projectId/overview/pin', asyncRoute(async (request, response) => {
+  const mode = (request.body as { mode?: 'changes' | 'meeting' | 'needs-warwick' | null }).mode ?? null;
+  response.json(pinOverviewMode(db(), String(request.params.projectId), mode, 'current-user'));
+}));
+app.post('/api/projects/:projectId/consultant-brief', asyncRoute(async (request, response) => response.json(await buildConsultantBrief(db(), String(request.params.projectId), String((request.body as { mode?: string }).mode ?? 'needs-warwick'), groundedBriefProvider))));
+app.post('/api/proposed-changes/:proposedChangeId/approve', asyncRoute(async (request, response) => response.json(approveProposedChange(db(), String(request.params.proposedChangeId), String((request.body as { reviewer?: string }).reviewer ?? 'current-user')))));
+app.post('/api/proposed-changes/:proposedChangeId/reject', asyncRoute(async (request, response) => response.json(rejectProposedChange(db(), String(request.params.proposedChangeId), String((request.body as { reviewer?: string }).reviewer ?? 'current-user')))));
 app.post('/api/files/open', asyncRoute(async (request, response) => response.json(openOriginalPath(db(), String((request.body as { path?: string }).path ?? '')))));
 app.get('/api/m365/status', (_, response) => response.json({ ...authStatus(), scopes: requiredScopes(), aiProviders: probeAIProviders() }));
 app.post('/api/m365/auth/start', asyncRoute(async (_, response) => response.json(await startDeviceCode())));
@@ -179,6 +263,8 @@ if (production) {
   const vite = await createServer({ root, server: { middlewareMode: true }, appType: 'spa' });
   app.use(vite.middlewares);
 }
+
+startInboxWatchers();
 
 app.listen(port, '127.0.0.1', () => {
   console.log(`Project ManagAIr Cockpit running at http://127.0.0.1:${port}`);

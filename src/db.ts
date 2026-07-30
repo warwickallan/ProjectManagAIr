@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { importPayloadSchema, portfolioDataSchema, type ImportPayload, type PortfolioData, type Project, type UserConfig } from './domain.js';
 import { readBlindExtractionComparisonReports } from './blindExtractionComparison.js';
 import { readRegisterState } from './projectRegisters.js';
+import { buildDeterministicBrief, computeProjectOverview, readSourceIntelligence } from './sourceIntelligence.js';
 
 type SqlValue = string | number | bigint | null;
 
@@ -112,6 +113,7 @@ export function readProjectData(db: DatabaseSync, projectId: string): PortfolioD
 
 function readProjectFromRows(db: DatabaseSync, row: Record<string, unknown>): Project {
   const projectId = String(row.id);
+  const registerState = readRegisterState(db, projectId);
   const project = {
     id: projectId,
     name: String(row.name),
@@ -180,10 +182,13 @@ function readProjectFromRows(db: DatabaseSync, row: Record<string, unknown>): Pr
     sourceFileHistory: (db.prepare('SELECT * FROM source_file_history WHERE project_id = ? ORDER BY occurred_at DESC').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
       id: String(item.id), sourceId: String(item.source_id), projectId, fromExternalPath: item.from_external_path ? String(item.from_external_path) : null, toExternalPath: String(item.to_external_path), action: String(item.action), occurredAt: String(item.occurred_at), actor: String(item.actor), contentHash: String(item.content_hash),
     })),
-    registerRows: readRegisterState(db, projectId).registerRows,
-    registerComparisonRows: readRegisterState(db, projectId).comparisonRows,
-    registerComparisonSummary: readRegisterState(db, projectId).comparisonSummary,
+    registerRows: registerState.registerRows,
+    registerComparisonRows: registerState.comparisonRows,
+    registerComparisonSummary: registerState.comparisonSummary,
     blindExtractionComparisonReports: readBlindExtractionComparisonReports(db, projectId),
+    sourceIntelligence: readSourceIntelligence(db, projectId),
+    projectOverview: computeProjectOverview(db, projectId),
+    consultantBrief: buildDeterministicBrief(db, projectId),
   };
   return project as Project;
 }

@@ -4,6 +4,8 @@ import fixtureJson from '../fixtures/portfolio.json';
 import { importProjectPayload, openProjectManagairDatabase } from '../src/db.js';
 import { portfolioFixtureSchema } from '../src/domain.js';
 
+process.env.NODE_ENV = 'test';
+
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const dbPath = process.env.PROJECTMANAGAIR_DB_PATH ?? path.join(repoRoot, 'artifacts', 'e2e-projectmanagair.db');
 const artifactsDir = path.join(repoRoot, 'artifacts');

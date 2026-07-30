@@ -158,7 +158,7 @@ export function ActivityList({ activity, projectNames }: { activity: ActivityEve
 }
 
 export function formatDate(value: string | null): string {
-  if (!value) return 'Not set';
+  if (!value || value === '9999-12-31') return 'Not set';
   return new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }).format(new Date(value.length === 10 ? `${value}T12:00:00Z` : value));
 }
 

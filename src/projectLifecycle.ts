@@ -1,11 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { accessSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, rmdirSync, writeFileSync } from 'node:fs';
+import { accessSync, existsSync, mkdirSync, readFileSync, rmSync, rmdirSync, writeFileSync } from 'node:fs';
 import { access, readFile, stat, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import { registerNormalizedSource } from './sourceIntelligence.js';
 
 export type SourceState = 'awaiting_processing' | 'processing' | 'awaiting_review' | 'verified' | 'failed' | 'rejected' | 'archived';
 export type ProposedStatus = 'proposed' | 'reviewed' | 'approved' | 'applied' | 'rejected';
@@ -137,11 +138,12 @@ function assertInside(root: string, candidate: string) {
 }
 
 function readLocalConfigFile(): { projectsRoot?: string; projectFolderNamingFormat?: string } {
-  if (!existsSync(localConfigPath)) return {};
+  if (process.env.NODE_ENV === 'test' || !existsSync(localConfigPath)) return {};
   return JSON.parse(readFileSync(localConfigPath, 'utf8')) as { projectsRoot?: string; projectFolderNamingFormat?: string };
 }
 
 function writeLocalConfigFile(settings: { projectsRoot: string | null; projectFolderNamingFormat: string }) {
+  if (process.env.NODE_ENV === 'test') return;
   mkdirSync(path.dirname(localConfigPath), { recursive: true });
   writeFileSync(localConfigPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
 }
@@ -302,11 +304,16 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
 
   const timestamp = nowIso();
   const sourceId = randomUUID();
-  const jobId = randomUUID();
+  const jobId = `source-job:${projectId}:${contentHash.slice(0, 16)}`;
   const proposedId = randomUUID();
+  const extension = path.extname(file.name).toLowerCase();
+  const sourceIntelligenceSupported = ['.vtt', '.txt', '.eml', '.docx'].includes(extension);
   let status: SourceState = 'awaiting_review';
   let payload: ProposedPayload;
-  try {
+  if (sourceIntelligenceSupported) {
+    status = 'processing';
+    payload = { contractVersion: 1, provider: 'source-intelligence-v1', sourceMetadata: { sourceType, contentHash, originalFileName: file.name }, items: [] };
+  } else try {
     const text = ['vtt-transcript', 'plain-text'].includes(sourceType) ? bytes.toString('utf8') : '';
     payload = parseDeterministic(sourceType, file.name, text, contentHash);
     if (actionableItems(payload.items).length === 0) status = 'failed';
@@ -318,11 +325,13 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
   db.exec('BEGIN IMMEDIATE;');
   try {
     db.prepare('INSERT INTO project_source_intake (id, project_id, original_file_name, original_received_at, content_hash, source_type, current_external_path, previous_external_path, processing_status, processor_provider, extracted_item_ids_json, review_state, verification_state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(sourceId, projectId, file.name, timestamp, contentHash, sourceType, target, null, status, payload.provider, JSON.stringify(payload.items.map((candidate) => candidate.id)), 'proposed', status === 'failed' ? 'failed' : 'pending', timestamp, timestamp);
-    db.prepare('INSERT INTO source_processing_jobs (id, source_id, project_id, provider, status, started_at, completed_at, error_message, structured_output_contract, proposed_change_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(jobId, sourceId, projectId, payload.provider, status === 'failed' ? 'failed' : 'completed', timestamp, timestamp, status === 'failed' ? 'No supported structured items could be parsed.' : null, contractName, proposedId);
-    db.prepare('INSERT INTO proposed_changes (id, project_id, source_id, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(proposedId, projectId, sourceId, status === 'failed' ? 'rejected' : 'proposed', JSON.stringify(payload), timestamp);
+      .run(sourceId, projectId, file.name, timestamp, contentHash, sourceType, target, null, status, payload.provider, JSON.stringify(payload.items.map((candidate) => candidate.id)), sourceIntelligenceSupported ? 'not-started' : 'proposed', status === 'failed' ? 'failed' : 'pending', timestamp, timestamp);
+    db.prepare('INSERT INTO source_processing_jobs (id, source_id, project_id, provider, status, started_at, completed_at, error_message, structured_output_contract, proposed_change_id, current_stage, queued_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(jobId, sourceId, projectId, payload.provider, sourceIntelligenceSupported ? 'queued' : status === 'failed' ? 'failed' : 'completed', timestamp, sourceIntelligenceSupported ? null : timestamp, status === 'failed' ? 'No supported structured items could be parsed.' : null, sourceIntelligenceSupported ? 'project_register_delta-v1' : contractName, sourceIntelligenceSupported ? null : proposedId, sourceIntelligenceSupported ? 'queued' : status === 'failed' ? 'failed' : 'complete', timestamp, timestamp);
+    if (!sourceIntelligenceSupported) {
+      db.prepare('INSERT INTO proposed_changes (id, project_id, source_id, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(proposedId, projectId, sourceId, status === 'failed' ? 'rejected' : 'proposed', JSON.stringify(payload), timestamp);
+    }
     db.prepare('INSERT INTO activity_events (id, project_id, occurred_at, event_type, summary, actor, related_entity_type, related_entity_id, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(randomUUID(), projectId, timestamp, 'ai', `Source ${file.name} was taken into the project Inbox and hashed.`, 'Project ManagAIr', 'source', sourceId, 'operational-reference');
     db.exec('COMMIT;');
@@ -331,6 +340,30 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
     db.exec('ROLLBACK;');
     if (!intakeRecordCommitted) rmSync(target, { force: true });
     throw error;
+  }
+  if (sourceIntelligenceSupported) {
+    try {
+      const filed = fileProjectArtifact(db, projectId, destinationKeyFor(sourceType) as keyof typeof storageMapping, file.name, bytes);
+      const normalized = registerNormalizedSource(db, { projectId, intakeSourceId: sourceId, fileName: file.name, immutablePath: filed.destinationPath, contentHash, bytes });
+      const filedAt = nowIso();
+      db.exec('BEGIN IMMEDIATE;');
+      try {
+        db.prepare("UPDATE project_source_intake SET current_external_path = ?, previous_external_path = ?, processing_status = 'processing', updated_at = ? WHERE id = ?").run(filed.destinationPath, target, filedAt, sourceId);
+        db.prepare('INSERT INTO source_file_history (id, source_id, project_id, from_external_path, to_external_path, action, occurred_at, actor, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(randomUUID(), sourceId, projectId, target, filed.destinationPath, 'filed-immutable-original', filedAt, 'Project ManagAIr', contentHash);
+        db.exec('COMMIT;');
+      } catch (error) {
+        db.exec('ROLLBACK;');
+        throw error;
+      }
+      if (path.resolve(target) !== path.resolve(filed.destinationPath) && existsSync(target)) rmSync(target, { force: true });
+      return { ...normalized, intakeSourceId: sourceId, proposedChangeId: null, processingStatus: 'processing', extractedCount: 0, immutablePath: filed.destinationPath };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      db.prepare("UPDATE project_source_intake SET processing_status = 'failed', verification_state = 'failed', updated_at = ? WHERE id = ?").run(nowIso(), sourceId);
+      db.prepare("UPDATE source_processing_jobs SET status = 'failed', current_stage = 'failed', completed_at = ?, updated_at = ?, error_message = ? WHERE id = ?").run(nowIso(), nowIso(), message, jobId);
+      throw error;
+    }
   }
   return { sourceId, proposedChangeId: proposedId, duplicate: false, processingStatus: status, extractedCount: payload.items.length };
 }
@@ -341,7 +374,7 @@ export function recordBlindExtractionPacket(db: DatabaseSync, projectId: string,
   const sourceBytes = Buffer.from(input.sourceFile.dataBase64, 'base64');
   const sourceHash = createHash('sha256').update(sourceBytes).digest('hex');
   const sourceType = sourceTypeFor(input.sourceFile.name);
-  if (sourceType !== 'vtt-transcript') throw new Error('Blind extraction source must be a VTT transcript.');
+  if (sourceType !== 'vtt-transcript') throw new Error('Benchmark acceptance source must be a VTT transcript.');
   if (input.frozenPacket.contractVersion !== 1) throw new Error('Frozen packet contractVersion must be 1.');
   if (!input.frozenPacket.provider?.trim()) throw new Error('Frozen packet provider is required.');
   if (!Array.isArray(input.frozenPacket.items)) throw new Error('Frozen packet items must be an array.');
@@ -373,11 +406,11 @@ export function recordBlindExtractionPacket(db: DatabaseSync, projectId: string,
     db.prepare('INSERT INTO source_file_history (id, source_id, project_id, from_external_path, to_external_path, action, occurred_at, actor, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(randomUUID(), sourceId, projectId, null, filedSource.destinationPath, 'filed-immutable-original', timestamp, 'Project ManagAIr', sourceHash);
     db.prepare('INSERT INTO ai_writes (id, project_id, label, related_entity_type, related_entity_id, write_status, verification_status, verification_method, last_attempt_at, verified_at, verified_by, status_detail, attention_owner, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(writeId, projectId, 'Blind PTW extraction packet', 'source', sourceId, 'complete', 'pending', 'sealed-benchmark-comparison', timestamp, null, null, `Frozen packet SHA-256 ${packetHash}. Awaiting sealed benchmark comparison.`, 'current-user', 'operational-reference');
+      .run(writeId, projectId, 'Benchmark-informed extraction packet', 'source', sourceId, 'complete', 'pending', 'sealed-benchmark-comparison', timestamp, null, null, `Frozen packet SHA-256 ${packetHash}. Awaiting sealed benchmark comparison.`, 'current-user', 'operational-reference');
     db.prepare('INSERT INTO verifications (id, project_id, ai_write_id, verification_status, method, checked_at, checked_by, summary, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(randomUUID(), projectId, writeId, 'pending', 'sealed-benchmark-comparison', timestamp, 'Project ManagAIr', 'Frozen blind extraction packet recorded; sealed benchmark comparison has not been run.', 'operational-reference');
     db.prepare('INSERT INTO activity_events (id, project_id, occurred_at, event_type, summary, actor, related_entity_type, related_entity_id, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(randomUUID(), projectId, timestamp, 'ai', 'Blind PTW extraction packet frozen and recorded for benchmark comparison.', 'Project ManagAIr', 'source', sourceId, 'operational-reference');
+      .run(randomUUID(), projectId, timestamp, 'ai', 'Benchmark-informed extraction packet frozen for comparison; it remains a read-only proposal.', 'Project ManagAIr', 'source', sourceId, 'operational-reference');
     db.exec('COMMIT;');
   } catch (error) {
     db.exec('ROLLBACK;');
@@ -389,127 +422,18 @@ function readProposal(db: DatabaseSync, proposedChangeId: string) {
   return db.prepare('SELECT * FROM proposed_changes WHERE id = ?').get(proposedChangeId) as Record<string, unknown> | undefined;
 }
 
-export function approveProposedChange(db: DatabaseSync, proposedChangeId: string, reviewer = 'Warwick') {
+export function approveProposedChange(db: DatabaseSync, proposedChangeId: string, _reviewer = 'current-user') {
   const proposal = readProposal(db, proposedChangeId);
   if (!proposal) throw new Error('Proposed change was not found.');
-  const proposalStatus = String(proposal.status);
-  if (proposalStatus === 'applied') return { proposedChangeId, alreadyApplied: true, created: [] };
-  if (proposalStatus !== 'proposed') throw new Error(`Only proposed changes can be approved. Current state: ${proposalStatus}`);
-  const source = db.prepare('SELECT * FROM project_source_intake WHERE id = ?').get(String(proposal.source_id)) as Record<string, unknown> | undefined;
-  if (!source) throw new Error('Source was not found.');
-  const payload = JSON.parse(String(proposal.payload_json)) as ProposedPayload;
-  if (actionableItems(payload.items).length === 0) throw new Error('Cannot approve a proposal with no actionable structured items.');
-  const sourceId = String(source.id);
-  const sourceHash = String(source.content_hash);
-  const sourceCurrentPath = String(source.current_external_path);
-  const projectId = String(proposal.project_id);
-  const pPath = projectPath(db, projectId);
-  const root = configuredRoot(db);
-  const timestamp = nowIso();
-  const created: Array<{ type: string; id: string }> = [];
-
-  const destinationDir = path.join(pPath, storageMapping[destinationKeyFor(String(source.source_type))]);
-  assertInside(root, destinationDir);
-  mkdirSync(destinationDir, { recursive: true });
-  const destinationPath = path.join(destinationDir, path.basename(String(sourceCurrentPath)));
-  assertInside(root, destinationPath);
-  let fileMoved = false;
-
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    if (path.resolve(sourceCurrentPath) !== path.resolve(destinationPath)) {
-      renameSync(sourceCurrentPath, destinationPath);
-      fileMoved = true;
-    }
-    for (const candidate of payload.items) {
-      if (candidate.type === 'meeting_summary' || candidate.type === 'source_metadata' || candidate.type === 'stakeholder') continue;
-      const id = randomUUID();
-      if (candidate.type === 'action') {
-        db.prepare('INSERT INTO actions (id, project_id, title, status, owner, updated_at, data_classification, summary, priority, due_date, needs_user_attention, attention_owner, attention_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(id, projectId, candidate.title, 'open', reviewer, timestamp, 'operational-reference', candidate.summary, candidate.priority ?? 'medium', null, 1, 'current-user', 'Imported source proposal approved for action.');
-        created.push({ type: 'action', id });
-      } else if (candidate.type === 'risk_issue') {
-        db.prepare('INSERT INTO risks_issues (id, project_id, title, status, owner, updated_at, data_classification, summary, kind, severity, likelihood, impact, response, target_resolution_date, needs_user_attention, attention_owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(id, projectId, candidate.title, 'open', reviewer, timestamp, 'operational-reference', candidate.summary, 'risk', candidate.severity ?? 'medium', 'possible', candidate.summary, 'Review and define response.', null, 1, 'current-user');
-        created.push({ type: 'risk-issue', id });
-      } else if (candidate.type === 'decision') {
-        db.prepare('INSERT INTO decisions (id, project_id, title, status, owner, updated_at, data_classification, summary, decision_status, decision_needed_by, options_summary, outcome, needs_user_attention, attention_owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(id, projectId, candidate.title, 'open', reviewer, timestamp, 'operational-reference', candidate.summary, 'awaiting-user', null, 'Imported source proposal needs review.', null, 1, 'current-user');
-        created.push({ type: 'decision', id });
-      } else if (candidate.type === 'open_question') {
-        db.prepare('INSERT INTO open_questions (id, project_id, title, status, owner, updated_at, data_classification, summary, question, answer_needed_by, blocking, resolution, needs_user_attention, attention_owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(id, projectId, candidate.title, 'open', reviewer, timestamp, 'operational-reference', candidate.summary, candidate.body ?? candidate.summary, null, 0, null, 1, 'current-user');
-        created.push({ type: 'open-question', id });
-      } else if (candidate.type === 'milestone') {
-        db.prepare('INSERT INTO milestones (id, project_id, title, status, owner, updated_at, data_classification, summary, target_date, milestone_status, completion_percent, work_package_ids_json, needs_user_attention, attention_owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(id, projectId, candidate.title, 'open', reviewer, timestamp, 'operational-reference', candidate.summary, addDaysDate(30), 'not-started', 0, '[]', 0, null);
-        created.push({ type: 'milestone', id });
-      } else if (candidate.type === 'work_package') {
-        db.prepare('INSERT INTO work_packages (id, project_id, title, status, owner, updated_at, data_classification, summary, work_package_status, lead, start_date, target_date, completion_percent, blocker_summary, milestone_id, needs_user_attention, attention_owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(id, projectId, candidate.title, 'open', reviewer, timestamp, 'operational-reference', candidate.summary, 'not-started', reviewer, todayDate(), addDaysDate(30), 0, null, '', 0, null);
-        created.push({ type: 'work-package', id });
-      } else if (candidate.type === 'deliverable') {
-        db.prepare('INSERT INTO deliverables (id, project_id, title, status, owner, updated_at, data_classification, summary, deliverable_type, external_path, due_date, needs_user_attention, attention_owner, attention_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(id, projectId, candidate.title, 'open', reviewer, timestamp, 'operational-reference', candidate.summary, 'source-derived', null, null, 0, null, null);
-        created.push({ type: 'deliverable', id });
-      } else if (candidate.type === 'change_request') {
-        db.prepare('INSERT INTO changes (id, project_id, title, status, owner, updated_at, data_classification, summary, change_type, impact, decision_id, needs_user_attention, attention_owner, attention_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-          .run(id, projectId, candidate.title, 'open', reviewer, timestamp, 'operational-reference', candidate.summary, 'scope', candidate.summary, null, 1, 'current-user', 'Imported source proposal approved as change request.');
-        created.push({ type: 'change', id });
-      }
-    }
-
-    for (const record of created) {
-      db.prepare('INSERT INTO source_entity_provenance (id, source_id, project_id, entity_type, entity_id, source_path, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(randomUUID(), sourceId, projectId, record.type, record.id, destinationPath, sourceHash, timestamp);
-      db.prepare('INSERT INTO provenance_file_refs (id, project_id, entity_type, entity_id, label, external_path, evidence_kind, captured_at, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(randomUUID(), projectId, record.type, record.id, String(source.original_file_name), destinationPath, 'immutable-source-file', timestamp, 'operational-reference');
-    }
-
-    db.prepare('INSERT INTO source_file_history (id, source_id, project_id, from_external_path, to_external_path, action, occurred_at, actor, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(randomUUID(), sourceId, projectId, sourceCurrentPath, destinationPath, 'filed-immutable-original', timestamp, 'Project ManagAIr', sourceHash);
-    const writeId = randomUUID();
-    db.prepare('INSERT INTO ai_writes (id, project_id, label, related_entity_type, related_entity_id, write_status, verification_status, verification_method, last_attempt_at, verified_at, verified_by, status_detail, attention_owner, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(writeId, projectId, `Applied source proposal for ${String(source.original_file_name)}`, 'source', sourceId, 'complete', 'verified', 'SQLite transaction and file hash boundary', timestamp, timestamp, 'Project ManagAIr', `${created.length} structured records applied with source provenance.`, null, 'operational-reference');
-    db.prepare('INSERT INTO verifications (id, project_id, ai_write_id, verification_status, method, checked_at, checked_by, summary, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(randomUUID(), projectId, writeId, 'verified', 'hash-preserved-file-move-and-sqlite-foreign-keys', timestamp, 'Project ManagAIr', `Immutable source filed at ${destinationPath} with SHA-256 ${String(sourceHash).slice(0, 12)}...`, 'operational-reference');
-    db.prepare('INSERT INTO review_decisions (id, proposed_change_id, source_id, project_id, decision, decided_at, decided_by, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(randomUUID(), proposedChangeId, sourceId, projectId, 'approved', timestamp, reviewer, null);
-    db.prepare('UPDATE proposed_changes SET status = ?, reviewed_at = ?, reviewed_by = ?, applied_at = ? WHERE id = ?').run('applied', timestamp, reviewer, timestamp, proposedChangeId);
-    db.prepare('UPDATE project_source_intake SET current_external_path = ?, previous_external_path = ?, processing_status = ?, review_state = ?, verification_state = ?, extracted_item_ids_json = ?, updated_at = ? WHERE id = ?')
-      .run(destinationPath, sourceCurrentPath, 'verified', 'applied', 'verified', JSON.stringify(created.map((record) => record.id)), timestamp, sourceId);
-    db.prepare('INSERT INTO activity_events (id, project_id, occurred_at, event_type, summary, actor, related_entity_type, related_entity_id, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(randomUUID(), projectId, timestamp, 'ai', `Approved source proposal and filed immutable original ${String(source.original_file_name)}.`, reviewer, 'source', sourceId, 'operational-reference');
-    db.exec('COMMIT;');
-  } catch (error) {
-    db.exec('ROLLBACK;');
-    if (fileMoved && existsSync(destinationPath) && !existsSync(sourceCurrentPath)) renameSync(destinationPath, sourceCurrentPath);
-    throw error;
-  }
-  return { proposedChangeId, alreadyApplied: false, created, destinationPath };
+  if (String(proposal.status) === 'applied') return { proposedChangeId, alreadyApplied: true, created: [] };
+  throw new Error('Legacy whole-proposal approval is disabled. Review and apply a Source Intelligence changeset instead.');
 }
-
-export function rejectProposedChange(db: DatabaseSync, proposedChangeId: string, reviewer = 'Warwick') {
+export function rejectProposedChange(db: DatabaseSync, proposedChangeId: string, _reviewer = 'current-user') {
   const proposal = readProposal(db, proposedChangeId);
   if (!proposal) throw new Error('Proposed change was not found.');
-  const proposalStatus = String(proposal.status);
-  if (proposalStatus === 'rejected') return { proposedChangeId, rejected: true, alreadyRejected: true };
-  if (proposalStatus !== 'proposed') throw new Error(`Only proposed changes can be rejected. Current state: ${proposalStatus}`);
-  const timestamp = nowIso();
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    db.prepare('UPDATE proposed_changes SET status = ?, reviewed_at = ?, reviewed_by = ? WHERE id = ?').run('rejected', timestamp, reviewer, proposedChangeId);
-    db.prepare('UPDATE project_source_intake SET processing_status = ?, review_state = ?, updated_at = ? WHERE id = ?').run('rejected', 'rejected', timestamp, String(proposal.source_id));
-    db.prepare('INSERT INTO review_decisions (id, proposed_change_id, source_id, project_id, decision, decided_at, decided_by, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(randomUUID(), proposedChangeId, String(proposal.source_id), String(proposal.project_id), 'rejected', timestamp, reviewer, null);
-    db.exec('COMMIT;');
-  } catch (error) {
-    db.exec('ROLLBACK;');
-    throw error;
-  }
-  return { proposedChangeId, rejected: true };
+  if (String(proposal.status) === 'rejected') return { proposedChangeId, rejected: true, alreadyRejected: true };
+  throw new Error('Legacy proposals are read-only historical records. Use governed Source Intelligence changesets for review.');
 }
-
 export function openOriginalPath(db: DatabaseSync, filePath: string) {
   const root = configuredRoot(db);
   const resolved = path.resolve(filePath);

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { fileProjectArtifact } from './projectLifecycle.js';
+import { rebuildProjection, readRowEvidence, readTypedDetails } from './registerProjection.js';
 
 const knownRegisters = ['Decisions', 'Actions', 'Risks_Issues', 'Config_Changes', 'Open_Questions', 'Milestones', 'Entities', 'Sources', 'Uncertainty'] as const;
 export type RegisterName = typeof knownRegisters[number];
@@ -48,6 +49,20 @@ function rowValue(row: JsonObject, keys: string[]): unknown {
   return null;
 }
 
+function dueDateValue(registerName: RegisterName, row: JsonObject): string {
+  const names: Record<RegisterName, string[]> = {
+    Decisions: ['decision_needed_by'],
+    Actions: ['due_date', 'target_date'],
+    Risks_Issues: ['target_resolution_date', 'resolve_by', 'due_date'],
+    Config_Changes: ['due_date', 'target_date', 'follow_through_date'],
+    Open_Questions: ['answer_needed_by', 'resolve_by', 'due_date'],
+    Milestones: ['target_date', 'hard_stop_date', 'date'],
+    Entities: [],
+    Sources: [],
+    Uncertainty: ['resolve_by'],
+  };
+  return text(rowValue(row, names[registerName]));
+}
 function jsonArrayValue(value: unknown): string[] {
   if (Array.isArray(value)) return value.map(text).filter(Boolean);
   const raw = text(value);
@@ -61,7 +76,7 @@ function normalizeValue(value: unknown) {
 
 function dateOnlyOrNull(value: unknown) {
   const raw = text(value);
-  return /^\\d{4}-\\d{2}-\\d{2}$/.test(raw) ? raw : null;
+  return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : null;
 }
 
 function parsePacket(raw: string) {
@@ -110,8 +125,8 @@ function rowSummary(registerName: RegisterName, row: JsonObject) {
     summary,
     status,
     type: text(rowValue(row, ['type', 'kind', 'change_type', 'entity_type', 'source_type'])),
-    owner: text(rowValue(row, ['owner', 'assigned_to', 'lead', 'parked_with', 'decider', 'committed_by', 'made_by'])) || 'Warwick',
-    dueDate: text(rowValue(row, ['due_date', 'target_date', 'answer_needed_by', 'decision_needed_by', 'resolve_by', 'date'])),
+    owner: text(rowValue(row, ['owner', 'assigned_to', 'lead', 'parked_with', 'decider', 'committed_by', 'made_by'])) || 'Unassigned',
+    dueDate: dueDateValue(registerName, row),
     sourceRef: text(rowValue(row, ['source_ref', 'source', 'source_id'])),
     sourceAnchor: text(rowValue(row, ['source_anchor', 'anchor', 'cell', 'range'])),
     originalStatus: text(rowValue(row, ['original_status_wording', 'status'])) || status,
@@ -125,62 +140,6 @@ function rowSummary(registerName: RegisterName, row: JsonObject) {
 
 function registerRowId(projectId: string, externalId: string) {
   return `register:${projectId}:${externalId}`;
-}
-
-function upsertOperationalRecord(db: DatabaseSync, projectId: string, registerName: RegisterName, row: JsonObject, timestamp: string) {
-  const base = rowSummary(registerName, row);
-  if (registerName === 'Actions') {
-    db.prepare(`INSERT INTO actions (id, project_id, title, status, owner, updated_at, data_classification, summary, priority, due_date, needs_user_attention, attention_owner, attention_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title = excluded.title, status = excluded.status, owner = excluded.owner, updated_at = excluded.updated_at, summary = excluded.summary, priority = excluded.priority, due_date = excluded.due_date`).run(base.externalId, projectId, base.title, base.status, base.owner, timestamp, 'operational-reference', base.summary, normalizePriority(rowValue(row, ['priority'])), dateOnlyOrNull(base.dueDate), 0, null, null);
-  } else if (registerName === 'Decisions') {
-    db.prepare(`INSERT INTO decisions (id, project_id, title, status, owner, updated_at, data_classification, summary, decision_status, decision_needed_by, options_summary, outcome, needs_user_attention, attention_owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title = excluded.title, status = excluded.status, owner = excluded.owner, updated_at = excluded.updated_at, summary = excluded.summary, decision_status = excluded.decision_status, decision_needed_by = excluded.decision_needed_by, options_summary = excluded.options_summary, outcome = excluded.outcome`).run(base.externalId, projectId, base.title, base.status, base.owner, timestamp, 'operational-reference', base.summary, normalizeDecisionStatus(base.status), dateOnlyOrNull(base.dueDate), text(rowValue(row, ['options_summary', 'options'])) || '', text(rowValue(row, ['outcome'])) || null, 0, null);
-  } else if (registerName === 'Risks_Issues') {
-    db.prepare(`INSERT INTO risks_issues (id, project_id, title, status, owner, updated_at, data_classification, summary, kind, severity, likelihood, impact, response, target_resolution_date, needs_user_attention, attention_owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title = excluded.title, status = excluded.status, owner = excluded.owner, updated_at = excluded.updated_at, summary = excluded.summary, kind = excluded.kind, severity = excluded.severity, likelihood = excluded.likelihood, impact = excluded.impact, response = excluded.response, target_resolution_date = excluded.target_resolution_date`).run(base.externalId, projectId, base.title, base.status, base.owner, timestamp, 'operational-reference', base.summary, normalizeRiskKind(base.type), normalizeSeverity(rowValue(row, ['severity'])), normalizeLikelihood(rowValue(row, ['likelihood'])), text(rowValue(row, ['impact'])) || base.summary, text(rowValue(row, ['mitigation', 'response', 'mitigation_discussed'])) || base.summary, dateOnlyOrNull(base.dueDate), 0, null);
-  } else if (registerName === 'Config_Changes') {
-    db.prepare(`INSERT INTO changes (id, project_id, title, status, owner, updated_at, data_classification, summary, change_type, impact, decision_id, needs_user_attention, attention_owner, attention_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title = excluded.title, status = excluded.status, owner = excluded.owner, updated_at = excluded.updated_at, summary = excluded.summary, change_type = excluded.change_type, impact = excluded.impact, decision_id = excluded.decision_id`).run(base.externalId, projectId, base.title, base.status, base.owner, timestamp, 'operational-reference', base.summary, base.type || 'configuration', text(rowValue(row, ['impact', 'follow_through'])) || base.summary, text(rowValue(row, ['decision_id'])) || null, 0, null, null);
-  } else if (registerName === 'Open_Questions') {
-    db.prepare(`INSERT INTO open_questions (id, project_id, title, status, owner, updated_at, data_classification, summary, question, answer_needed_by, blocking, resolution, needs_user_attention, attention_owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title = excluded.title, status = excluded.status, owner = excluded.owner, updated_at = excluded.updated_at, summary = excluded.summary, question = excluded.question, answer_needed_by = excluded.answer_needed_by, blocking = excluded.blocking, resolution = excluded.resolution`).run(base.externalId, projectId, base.title, base.status, base.owner, timestamp, 'operational-reference', base.summary, text(rowValue(row, ['question'])) || base.title, dateOnlyOrNull(base.dueDate), truthy(rowValue(row, ['blocking'])) ? 1 : 0, text(rowValue(row, ['resolution'])) || null, 0, null);
-  } else if (registerName === 'Milestones') {
-    db.prepare(`INSERT INTO milestones (id, project_id, title, status, owner, updated_at, data_classification, summary, target_date, milestone_status, completion_percent, work_package_ids_json, needs_user_attention, attention_owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET title = excluded.title, status = excluded.status, owner = excluded.owner, updated_at = excluded.updated_at, summary = excluded.summary, target_date = excluded.target_date, milestone_status = excluded.milestone_status, completion_percent = excluded.completion_percent, work_package_ids_json = excluded.work_package_ids_json`).run(base.externalId, projectId, base.title, base.status, base.owner, timestamp, 'operational-reference', base.summary, dateOnlyOrNull(base.dueDate) || timestamp.slice(0, 10), normalizeMilestoneStatus(base.status), Number(rowValue(row, ['completion_percent']) ?? 0) || 0, JSON.stringify(base.workPackageTags), 0, null);
-  } else if (registerName === 'Sources') {
-    db.prepare(`INSERT INTO project_sources (id, project_id, source_type, label, external_path, last_seen_at, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET source_type = excluded.source_type, label = excluded.label, external_path = excluded.external_path, last_seen_at = excluded.last_seen_at`).run(base.externalId, projectId, base.type || 'external-register-row', base.title, base.sourceRef || base.sourceAnchor || 'canonical-register', timestamp, 'operational-reference');
-  }
-}
-
-function normalizePriority(value: unknown) {
-  const normalized = normalizeValue(value);
-  if (['low', 'medium', 'high', 'critical'].includes(normalized)) return normalized;
-  return 'medium';
-}
-
-function normalizeSeverity(value: unknown) {
-  const normalized = normalizeValue(value);
-  if (['low', 'medium', 'high', 'critical'].includes(normalized)) return normalized;
-  return 'medium';
-}
-
-function normalizeLikelihood(value: unknown) {
-  const normalized = normalizeValue(value).replace(/ /g, '-');
-  if (['unlikely', 'possible', 'likely', 'almost-certain'].includes(normalized)) return normalized;
-  return 'possible';
-}
-
-function normalizeRiskKind(value: unknown) {
-  return normalizeValue(value).includes('issue') ? 'issue' : 'risk';
-}
-
-function normalizeDecisionStatus(value: unknown) {
-  const normalized = normalizeValue(value).replace(/ /g, '-');
-  if (normalized.includes('supersed')) return 'superseded';
-  if (normalized.includes('decid') || normalized.includes('closed') || normalized.includes('complete')) return 'decided';
-  if (normalized.includes('propos')) return 'proposed';
-  return 'awaiting-user';
-}
-
-function normalizeMilestoneStatus(value: unknown) {
-  const normalized = normalizeValue(value).replace(/ /g, '-');
-  if (['not-started', 'in-progress', 'at-risk', 'achieved', 'missed'].includes(normalized)) return normalized;
-  if (normalized.includes('complete') || normalized.includes('achiev')) return 'achieved';
-  return 'not-started';
 }
 
 function truthy(value: unknown) {
@@ -260,12 +219,12 @@ export function importProjectRegisterBenchmark(db: DatabaseSync, projectId: stri
         for (const [fieldName, value] of Object.entries(row)) {
           db.prepare('INSERT INTO project_register_row_fields (id, register_row_id, project_id, register_name, external_register_id, field_name, original_value_json, normalized_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(randomUUID(), rowId, projectId, register.name, summary.externalId, fieldName, JSON.stringify(value), normalizeValue(value));
         }
-        upsertOperationalRecord(db, projectId, register.name, row, timestamp);
         insertTypedDetails(db, projectId, register.name, rowId, row);
         compareRowFields(db, importRunId, projectId, register.name, summary.externalId, row, timestamp);
         recordsImported += 1;
       }
     }
+    rebuildProjection(db, projectId, timestamp);
     db.prepare('INSERT INTO activity_events (id, project_id, occurred_at, event_type, summary, actor, related_entity_type, related_entity_id, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(randomUUID(), projectId, timestamp, 'progress', `Imported ${recordsImported} canonical register rows with field-level comparison.`, 'Project ManagAIr', 'register-import', importRunId, 'operational-reference');
     const writeId = randomUUID();
     db.prepare('INSERT INTO ai_writes (id, project_id, label, related_entity_type, related_entity_id, write_status, verification_status, verification_method, last_attempt_at, verified_at, verified_by, status_detail, attention_owner, data_classification) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(writeId, projectId, 'Canonical register import parity', 'register-import', importRunId, 'complete', 'verified', 'durable-id-and-field-level-comparison', timestamp, timestamp, 'Project ManagAIr', `${recordsImported} register rows imported and compared against canonical benchmark packet.`, null, 'operational-reference');
@@ -304,6 +263,20 @@ export function readRegisterState(db: DatabaseSync, projectId: string) {
     rawRow: JSON.parse(String(row.raw_row_json)) as JsonObject,
     normalizedRow: JSON.parse(String(row.normalized_row_json)) as Record<string, string>,
     updatedAt: String(row.updated_at),
+    derivation: String(row.derivation ?? 'fact'),
+    confidence: String(row.confidence ?? 'unknown'),
+    dueDateRaw: row.due_date_raw ? String(row.due_date_raw) : null,
+    dueDateConfidence: String(row.due_date_confidence ?? 'none'),
+    typedDetails: readTypedDetails(db, String(row.register_name), String(row.id)),
+    ...readRowEvidence(db, projectId, String(row.external_register_id)),
+    currentState: (() => {
+      const state = db.prepare('SELECT * FROM register_row_state WHERE project_id = ? AND external_register_id = ?').get(projectId, String(row.external_register_id)) as Record<string, unknown> | undefined;
+      return state ? { status: String(state.status), owner: state.owner ? String(state.owner) : null, dueDate: state.due_date ? String(state.due_date) : null, resolution: state.resolution ? String(state.resolution) : null, lastHumanEventAt: state.last_human_event_at ? String(state.last_human_event_at) : null } : null;
+    })(),
+    score: (() => {
+      const score = db.prepare('SELECT * FROM register_row_scores WHERE project_id = ? AND external_register_id = ?').get(projectId, String(row.external_register_id)) as Record<string, unknown> | undefined;
+      return score ? { value: Number(score.score), band: String(score.band), inputs: JSON.parse(String(score.inputs_json)) as JsonObject, scoringVersion: String(score.scoring_version) } : null;
+    })(),
   }));
   const comparisonRows = comparisons.map((row) => ({
     id: String(row.id), registerName: String(row.register_name), externalRegisterId: row.external_register_id ? String(row.external_register_id) : null, fieldName: row.field_name ? String(row.field_name) : null, comparisonStatus: String(row.comparison_status), detail: row.detail ? String(row.detail) : null,
