@@ -358,6 +358,20 @@ export interface AttentionItem {
   route: string;
 }
 
+function tabForAttentionSource(source: AttentionSource): string {
+  const tabs: Record<AttentionSource, string> = {
+    action: 'actions',
+    'risk-issue': 'risks',
+    change: 'config-changes',
+    decision: 'decisions',
+    'open-question': 'open-questions',
+    milestone: 'milestones',
+    'work-package': 'work-packages',
+    deliverable: 'deliverables',
+    'ai-work': 'activity',
+  };
+  return tabs[source];
+}
 export interface ProjectSummary {
   id: string;
   name: string;
@@ -426,7 +440,7 @@ export function deriveAttentionItems(project: Project, userId: string, asOf: str
       urgency: urgencyFor(dueAt, asOf, forceNow),
       dueAt,
       title,
-      route: `#/projects/${project.id}?focus=${sourceEntityType}`,
+      route: `#/projects/${project.id}/${tabForAttentionSource(sourceEntityType)}`,
     });
   };
 
