@@ -4,8 +4,11 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { buildPortfolioResponse, buildProjectResponse, portfolioFixtureSchema } from './src/domain.js';
 import { openProjectManagairDatabase, readPortfolioData, readProjectData } from './src/db.js';
+import { approveProposedChange, createProject, intakeProjectSource, openOriginalPath, readStorageSettings, recordBlindExtractionPacket, rejectProposedChange, updateStorageSettings, verifyStorageRoot } from './src/projectLifecycle.js';
 import { authStatus, markMessageRead, moveMessageToDeletedItems, pollDeviceCode, readCalendarProjection, readInboxProjection, requiredScopes, startDeviceCode, syncCalendarView, syncInbox } from './src/m365.js';
 import { probeAIProviders, sendChatMessage } from './src/aiProvider.js';
+import { compareBlindExtractionToBenchmark } from './src/blindExtractionComparison.js';
+import { importProjectRegisterBenchmark } from './src/projectRegisters.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -36,7 +39,7 @@ function asyncRoute(handler: express.RequestHandler): express.RequestHandler {
 }
 
 app.disable('x-powered-by');
-app.use(express.json({ limit: '256kb' }));
+app.use(express.json({ limit: '32mb' }));
 app.use((_, response, next) => {
   response.setHeader('Cache-Control', 'no-store');
   response.setHeader('X-Content-Type-Options', 'nosniff');
@@ -58,7 +61,7 @@ app.get('/api/health', (_, response) => {
     return;
   }
   const portfolio = readPortfolioData(dbContext.db);
-  response.json({ ok: true, mode: 'sqlite-read-only', dbPath: dbContext.dbPath, migrationsApplied: dbContext.migrationsApplied, projects: portfolio.projects.length, m365: authStatus(), aiProviders: probeAIProviders() });
+  response.json({ ok: true, mode: 'sqlite-operational', dbPath: dbContext.dbPath, migrationsApplied: dbContext.migrationsApplied, projects: portfolio.projects.length, m365: authStatus(), aiProviders: probeAIProviders() });
 });
 
 app.get('/api/portfolio', (_, response) => {
@@ -69,6 +72,14 @@ app.get('/api/portfolio', (_, response) => {
   response.json(buildPortfolioResponse(readPortfolioData(db()), new Date(), databaseEnvironment));
 });
 
+app.get('/api/project-storage/settings', asyncRoute(async (_, response) => response.json(await readStorageSettings(db()))));
+app.post('/api/project-storage/settings', asyncRoute(async (request, response) => response.json(await updateStorageSettings(db(), request.body as { projectsRoot?: string; projectFolderNamingFormat?: string }))));
+app.post('/api/project-storage/verify', asyncRoute(async (request, response) => response.json(await verifyStorageRoot(db(), Boolean((request.body as { writeTest?: boolean }).writeTest)))));
+
+app.post('/api/projects', asyncRoute(async (request, response) => {
+  const result = createProject(db(), request.body as Parameters<typeof createProject>[1]);
+  response.status(201).json(result);
+}));
 app.get('/api/projects/:projectId', (request, response) => {
   if (demoMode && fixture) {
     const result = buildProjectResponse(fixture, request.params.projectId, new Date(), demoEnvironment);
@@ -87,6 +98,38 @@ app.get('/api/projects/:projectId', (request, response) => {
   response.json(buildProjectResponse(data, request.params.projectId, new Date(), databaseEnvironment));
 });
 
+app.post('/api/projects/:projectId/register-imports', asyncRoute(async (request, response) => {
+  const body = request.body as { benchmarkFile?: { name: string; dataBase64: string }; workbookFile?: { name: string; dataBase64: string } };
+  if (!body.benchmarkFile) {
+    response.status(400).json({ error: 'benchmarkFile is required.' });
+    return;
+  }
+  response.status(201).json(importProjectRegisterBenchmark(db(), String(request.params.projectId), { benchmarkFile: body.benchmarkFile, workbookFile: body.workbookFile }));
+}));
+app.post('/api/projects/:projectId/blind-extractions', asyncRoute(async (request, response) => {
+  const body = request.body as { sourceFile?: { name: string; type?: string; dataBase64: string }; frozenPacket?: Parameters<typeof recordBlindExtractionPacket>[2]['frozenPacket'] };
+  if (!body.sourceFile || !body.frozenPacket) {
+    response.status(400).json({ error: 'sourceFile and frozenPacket are required.' });
+    return;
+  }
+  response.status(201).json(recordBlindExtractionPacket(db(), String(request.params.projectId), { sourceFile: body.sourceFile, frozenPacket: body.frozenPacket }));
+}));
+app.post('/api/projects/:projectId/blind-extraction-comparisons', asyncRoute(async (request, response) => {
+  const body = request.body as { frozenPacketFile?: { name: string; dataBase64: string }; expectedDeltaFile?: { name: string; dataBase64: string }; expectedWorkbookFile?: { name: string; dataBase64: string } };
+  if (!body.frozenPacketFile || !body.expectedDeltaFile) {
+    response.status(400).json({ error: 'frozenPacketFile and expectedDeltaFile are required.' });
+    return;
+  }
+  response.status(201).json(compareBlindExtractionToBenchmark(db(), String(request.params.projectId), { frozenPacketFile: body.frozenPacketFile, expectedDeltaFile: body.expectedDeltaFile, expectedWorkbookFile: body.expectedWorkbookFile }));
+}));
+app.post('/api/projects/:projectId/sources', asyncRoute(async (request, response) => {
+  const body = request.body as { files?: Array<{ name: string; type?: string; dataBase64: string }> };
+  const files = Array.isArray(body.files) ? body.files : [];
+  response.status(201).json({ results: await Promise.all(files.map((file) => intakeProjectSource(db(), String(request.params.projectId), file))) });
+}));
+app.post('/api/proposed-changes/:proposedChangeId/approve', asyncRoute(async (request, response) => response.json(approveProposedChange(db(), String(request.params.proposedChangeId), String((request.body as { reviewer?: string }).reviewer ?? 'Warwick')))));
+app.post('/api/proposed-changes/:proposedChangeId/reject', asyncRoute(async (request, response) => response.json(rejectProposedChange(db(), String(request.params.proposedChangeId), String((request.body as { reviewer?: string }).reviewer ?? 'Warwick')))));
+app.post('/api/files/open', asyncRoute(async (request, response) => response.json(openOriginalPath(db(), String((request.body as { path?: string }).path ?? '')))));
 app.get('/api/m365/status', (_, response) => response.json({ ...authStatus(), scopes: requiredScopes(), aiProviders: probeAIProviders() }));
 app.post('/api/m365/auth/start', asyncRoute(async (_, response) => response.json(await startDeviceCode())));
 app.post('/api/m365/auth/poll', asyncRoute(async (_, response) => response.json(await pollDeviceCode(db()))));

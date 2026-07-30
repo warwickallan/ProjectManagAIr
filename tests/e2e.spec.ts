@@ -12,15 +12,14 @@ test('Portfolio to attention item to Project Detail still works end to end', asy
   const consoleErrors: string[] = [];
   page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
   await page.goto('/#/projects');
-  await expect(page.getByRole('heading', { name: 'Implementation focus, without the noise.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Project portfolio workspace' })).toBeVisible();
   await expect(page.locator('#attention').getByRole('heading', { level: 2 })).toHaveText(/^Needs /);
   await expect(page.getByRole('heading', { name: 'Project Atlas' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Project Beacon' })).toBeVisible();
   await page.getByRole('link', { name: 'Confirm the pilot cutover window', exact: true }).click();
-  await expect(page).toHaveURL(/#\/projects\/atlas\?focus=action/);
+  await expect(page).toHaveURL(/#\/projects\/atlas\/actions$/);
   await expect(page.getByRole('heading', { name: 'Project Atlas' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Actions' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'AI write and verification status' })).toBeVisible();
   expect(consoleErrors).toEqual([]);
 });
 
@@ -34,8 +33,9 @@ test('Inbox renders an honest unauthenticated empty projection', async ({ page }
 test('project cards navigate to both fictional project routes', async ({ page }) => {
   await page.goto('/#/projects');
   await page.getByRole('heading', { name: 'Project Beacon' }).getByRole('link').click();
-  await expect(page).toHaveURL(/#\/projects\/beacon$/);
+  await expect(page).toHaveURL(/#\/projects\/beacon\/overview$/);
   await expect(page.getByText('BCN-02 . Solution design')).toBeVisible();
+  await page.goto('/#/projects/beacon/risks');
   await expect(page.getByRole('heading', { name: 'Risks and issues' })).toBeVisible();
 });
 

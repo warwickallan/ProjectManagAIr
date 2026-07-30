@@ -155,12 +155,129 @@ export const provenanceFileRefSchema = z.object({
   dataClassification,
 });
 
+export const inboxSourceSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  originalFileName: z.string().min(1),
+  originalReceivedAt: isoDateTime,
+  contentHash: z.string().min(1),
+  sourceType: z.string().min(1),
+  currentExternalPath: z.string().min(1),
+  previousExternalPath: z.string().nullable(),
+  processingStatus: z.enum(['awaiting_processing', 'processing', 'awaiting_review', 'verified', 'failed', 'rejected', 'archived']),
+  processorProvider: z.string().min(1),
+  extractedItemIds: z.array(z.string()),
+  reviewState: z.string().min(1),
+  verificationState: z.string().min(1),
+  createdAt: isoDateTime,
+  updatedAt: isoDateTime,
+});
+
+export const proposedChangeSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  sourceId: z.string().min(1),
+  status: z.enum(['proposed', 'reviewed', 'approved', 'applied', 'rejected']),
+  payload: z.object({
+    contractVersion: z.literal(1),
+    provider: z.string().min(1),
+    sourceMetadata: z.object({ sourceType: z.string(), contentHash: z.string(), originalFileName: z.string() }),
+    items: z.array(z.object({ id: z.string(), type: z.string(), title: z.string(), summary: z.string(), body: z.string().optional(), severity: z.string().optional(), priority: z.string().optional() })),
+  }),
+  createdAt: isoDateTime,
+  reviewedAt: isoDateTime.nullable(),
+  reviewedBy: z.string().nullable(),
+  appliedAt: isoDateTime.nullable(),
+});
+
+export const sourceEntityProvenanceSchema = z.object({
+  id: z.string().min(1),
+  sourceId: z.string().min(1),
+  projectId: z.string().min(1),
+  entityType: z.string().min(1),
+  entityId: z.string().min(1),
+  sourcePath: z.string().min(1),
+  contentHash: z.string().min(1),
+  createdAt: isoDateTime,
+});
+
+export const sourceFileHistorySchema = z.object({
+  id: z.string().min(1),
+  sourceId: z.string().min(1),
+  projectId: z.string().min(1),
+  fromExternalPath: z.string().nullable(),
+  toExternalPath: z.string().min(1),
+  action: z.string().min(1),
+  occurredAt: isoDateTime,
+  actor: z.string().min(1),
+  contentHash: z.string().min(1),
+});
+
+export const registerRowSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  registerName: z.string().min(1),
+  externalRegisterId: z.string().min(1),
+  title: z.string().min(1),
+  summary: z.string(),
+  recordStatus: z.string().min(1),
+  recordType: z.string().nullable(),
+  owner: z.string().nullable(),
+  dueDate: z.string().nullable(),
+  sourceRef: z.string().nullable(),
+  sourceAnchor: z.string().nullable(),
+  originalStatusWording: z.string().nullable(),
+  relatedIds: z.array(z.string()),
+  supersessionIds: z.array(z.string()),
+  workPackageTags: z.array(z.string()),
+  importRunId: z.string().min(1),
+  originalRowNumber: z.number().nullable(),
+  originalTabName: z.string().min(1),
+  rawRow: z.record(z.string(), z.unknown()),
+  normalizedRow: z.record(z.string(), z.string()),
+  updatedAt: isoDateTime,
+});
+
+export const registerComparisonRowSchema = z.object({
+  id: z.string().min(1),
+  registerName: z.string().min(1),
+  externalRegisterId: z.string().nullable(),
+  fieldName: z.string().nullable(),
+  comparisonStatus: z.enum(['EXACT', 'MATCH_WITH_NORMALISATION', 'MISMATCH', 'NOT_COMPARED']),
+  detail: z.string().nullable(),
+});
+
+export const blindExtractionComparisonReportSchema = z.object({
+  id: z.string().min(1),
+  projectId: z.string().min(1),
+  proposedChangeId: z.string().nullable(),
+  frozenPacketHash: z.string().min(1),
+  expectedDeltaHash: z.string().min(1),
+  expectedWorkbookHash: z.string().nullable(),
+  comparisonStatus: z.string().min(1),
+  summary: z.unknown(),
+  reportMarkdown: z.string(),
+  createdAt: isoDateTime,
+  createdBy: z.string().min(1),
+});
+export const registerComparisonSummarySchema = z.object({
+  registerName: z.string().min(1),
+  sourceWorkbookRowCount: z.number().int().min(0),
+  sqliteRowCount: z.number().int().min(0),
+  matchingDurableIds: z.number().int().min(0),
+  missingIds: z.array(z.string()),
+  additionalIds: z.array(z.string()),
+  exactFieldMatches: z.number().int().min(0),
+  normalisedFieldMatches: z.number().int().min(0),
+  fieldMismatches: z.number().int().min(0),
+  overallStatus: z.enum(['EXACT', 'MATCH_WITH_NORMALISATION', 'MISMATCH', 'NOT_COMPARED']),
+});
 export const projectSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
   code: z.string().min(1),
   summary: z.string().min(1),
-  deliveryStatus: z.enum(['on-track', 'watch', 'at-risk', 'blocked', 'complete']),
+  deliveryStatus: z.enum(['active', 'on-track', 'watch', 'at-risk', 'blocked', 'complete']),
   stage: z.string().min(1),
   owner: z.string().min(1),
   startDate: dateOnly,
@@ -169,6 +286,9 @@ export const projectSchema = z.object({
   updatedAt: isoDateTime,
   asOf: isoDateTime,
   dataClassification,
+  externalPath: z.string().nullable().default(null),
+  folderName: z.string().nullable().default(null),
+  storageSchemaVersion: z.string().default('project-storage-v1'),
   projectSources: z.array(projectSourceSchema).default([]),
   actions: z.array(actionSchema).default([]),
   risksIssues: z.array(riskIssueSchema).default([]),
@@ -182,6 +302,14 @@ export const projectSchema = z.object({
   aiWork: z.array(aiWorkSchema).default([]),
   verifications: z.array(verificationSchema).default([]),
   provenance: z.array(provenanceFileRefSchema).default([]),
+  inboxSources: z.array(inboxSourceSchema).default([]),
+  proposedChanges: z.array(proposedChangeSchema).default([]),
+  sourceEntityProvenance: z.array(sourceEntityProvenanceSchema).default([]),
+  sourceFileHistory: z.array(sourceFileHistorySchema).default([]),
+  registerRows: z.array(registerRowSchema).default([]),
+  registerComparisonRows: z.array(registerComparisonRowSchema).default([]),
+  registerComparisonSummary: z.array(registerComparisonSummarySchema).default([]),
+  blindExtractionComparisonReports: z.array(blindExtractionComparisonReportSchema).default([]),
 });
 
 export const portfolioDataSchema = z.object({
@@ -230,6 +358,20 @@ export interface AttentionItem {
   route: string;
 }
 
+function tabForAttentionSource(source: AttentionSource): string {
+  const tabs: Record<AttentionSource, string> = {
+    action: 'actions',
+    'risk-issue': 'risks',
+    change: 'config-changes',
+    decision: 'decisions',
+    'open-question': 'open-questions',
+    milestone: 'milestones',
+    'work-package': 'work-packages',
+    deliverable: 'deliverables',
+    'ai-work': 'activity',
+  };
+  return tabs[source];
+}
 export interface ProjectSummary {
   id: string;
   name: string;
@@ -298,7 +440,7 @@ export function deriveAttentionItems(project: Project, userId: string, asOf: str
       urgency: urgencyFor(dueAt, asOf, forceNow),
       dueAt,
       title,
-      route: `#/projects/${project.id}?focus=${sourceEntityType}`,
+      route: `#/projects/${project.id}/${tabForAttentionSource(sourceEntityType)}`,
     });
   };
 
@@ -419,6 +561,7 @@ export function buildPortfolioResponse(data: PortfolioData, now = new Date(), en
       highRiskIssues: data.projects.flatMap((project) => project.risksIssues).filter((item) => item.status !== 'closed' && ['high', 'critical'].includes(item.severity)).length,
       pendingDecisions: data.projects.flatMap((project) => project.decisions).filter((item) => item.decisionStatus === 'awaiting-user').length,
       aiAwaitingVerification: data.projects.flatMap((project) => project.aiWork).filter((item) => ['pending', 'failed'].includes(item.verificationStatus)).length,
+      awaitingSourceReview: data.projects.flatMap((project) => project.proposedChanges).filter((item) => item.status === 'proposed').length,
     },
   };
 }

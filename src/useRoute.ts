@@ -7,7 +7,8 @@ export type Route =
   | { name: 'portfolio' }
   | { name: 'needs-you' }
   | { name: 'ai-chat' }
-  | { name: 'project'; projectId: string; focus: string | null };
+  | { name: 'settings' }
+  | { name: 'project'; projectId: string; tab: string | null };
 
 export function parseRoute(hash: string): Route {
   const value = hash.replace(/^#/, '') || '/today';
@@ -16,14 +17,15 @@ export function parseRoute(hash: string): Route {
   if (path === '/inbox') return { name: 'inbox' };
   if (path === '/calendar') return { name: 'calendar' };
   if (path === '/projects') return { name: 'portfolio' };
+  if (path === '/settings') return { name: 'settings' };
   if (path === '/needs-you') return { name: 'needs-you' };
   if (path === '/ai-chat') return { name: 'ai-chat' };
-  const match = path.match(/^\/projects\/([^/]+)$/);
+  const match = path.match(/^\/projects\/([^/]+)(?:\/([^/]+))?$/);
   if (!match) return { name: 'today' };
   return {
     name: 'project',
     projectId: decodeURIComponent(match[1]),
-    focus: new URLSearchParams(query).get('focus'),
+    tab: match[2] ? decodeURIComponent(match[2]) : new URLSearchParams(query).get('focus'),
   };
 }
 

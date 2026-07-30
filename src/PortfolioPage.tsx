@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useApi, type PortfolioResponse } from './api';
 import { ActivityList, AttentionList, EmptyState, ErrorState, FreshnessNotice, LoadingState, PageIntro, Section, StatusChip, formatDate } from './components';
 
@@ -6,11 +7,13 @@ const statDefinitions = [
   { key: 'attention', label: 'Need attention', accent: 'coral' },
   { key: 'highRiskIssues', label: 'High risks & issues', accent: 'amber' },
   { key: 'pendingDecisions', label: 'Pending decisions', accent: 'violet' },
-  { key: 'aiAwaitingVerification', label: 'AI checks outstanding', accent: 'teal' },
+  { key: 'awaitingSourceReview', label: 'Sources to review', accent: 'teal' },
 ] as const;
 
 export function PortfolioPage({ initialSection }: { initialSection?: 'attention' } = {}) {
   const state = useApi<PortfolioResponse>('/api/portfolio');
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [creating, setCreating] = useState(false);
   if (state.status === 'loading') return <LoadingState label="Loading portfolio" />;
   if (state.status === 'error') return <ErrorState message={state.error} />;
 
@@ -20,18 +23,13 @@ export function PortfolioPage({ initialSection }: { initialSection?: 'attention'
   const isEmpty = data.projects.length === 0;
 
   return (
-    <div className="page-stack">
-      <PageIntro
-        eyebrow="Portfolio control"
-        title="Implementation focus, without the noise."
-        description="A local read-only Cockpit for seeing project attention, delivery signals, provenance, and AI verification status across imported implementation projects."
-        aside={<FreshnessNotice freshness={data.freshness} asOf={data.asOf} />}
-      />
+    <div className="page-stack" key={refreshKey}>
+      <PageIntro eyebrow="Portfolio control" title="Project portfolio workspace" description="Monitor project health, priority work, source review, and delivery movement from the Cockpit." aside={<FreshnessNotice freshness={data.freshness} asOf={data.asOf} />} />
 
       <div className="demo-banner" role="note">
         <span aria-hidden="true">PM</span>
-        <div><strong>{data.environment}</strong><p>{isEmpty ? 'No projects have been imported into the local operational database yet.' : 'This view is read from the local operational database.'}</p></div>
-        <span className="read-only-seal">Read only</span>
+        <div><strong>{data.environment}</strong><p>{isEmpty ? 'No projects exist in the local operational database yet.' : 'Project lifecycle state is backed by the local operational database.'}</p></div>
+        <div className="banner-actions"><a className="button secondary" href="#/settings">Settings</a><button className="button" onClick={() => setCreating(true)}>+ New Project</button></div>
       </div>
 
       <section className="stats-grid" aria-label="Portfolio summary">
@@ -44,52 +42,76 @@ export function PortfolioPage({ initialSection }: { initialSection?: 'attention'
       </section>
 
       <Section id="attention" title={data.attentionLabel} kicker="Portfolio priority" count={data.attention.length} className="attention-panel">
-        <p className="section-description">The queue is derived from explicit ownership, delivery urgency, and verification state. It is not manually curated.</p>
-        <AttentionList items={data.attention} emptyLabel={isEmpty ? 'No project records have been imported, so nothing can need attention yet.' : 'Nothing needs your attention.'} />
+        <p className="section-description">The queue is derived from explicit ownership, delivery urgency, source review, and verification state.</p>
+        <AttentionList items={data.attention} emptyLabel={isEmpty ? 'Create a project to start building portfolio attention.' : 'Nothing needs your attention.'} />
       </Section>
 
       <section className="portfolio-block" aria-labelledby="projects-heading">
         <header className="block-heading"><div><p className="section-kicker">Delivery landscape</p><h2 id="projects-heading">Implementation projects</h2></div><span>{data.projects.length} projects</span></header>
-        {isEmpty ? <EmptyState>No projects have been imported into Project ManagAIr yet. Import validated structured JSON to populate this Cockpit.</EmptyState> : (
-          <div className="project-grid">
-            {data.projects.map((project) => <ProjectCard key={project.id} project={project} />)}
-          </div>
-        )}
+        {isEmpty ? <EmptyState>No projects have been created in Project ManagAIr yet.</EmptyState> : <div className="project-grid">{data.projects.map((project) => <ProjectCard key={project.id} project={project} />)}</div>}
       </section>
 
       <Section id="activity" title="Latest project activity" kicker="Across the portfolio" count={data.activity.length}>
         <ActivityList activity={data.activity} projectNames={projectNames} />
       </Section>
+
+      {creating ? <NewProjectModal onClose={() => setCreating(false)} onCreated={(projectId) => { setCreating(false); window.location.hash = `#/projects/${projectId}/overview`; setRefreshKey((key) => key + 1); }} /> : null}
+    </div>
+  );
+}
+
+function NewProjectModal({ onCreated, onClose }: { onCreated: (projectId: string) => void; onClose: () => void }) {
+  const [form, setForm] = useState({ code: '', name: '', customer: '', description: '', status: 'active', owner: '', startDate: '', targetDate: '' });
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const set = (key: keyof typeof form, value: string) => setForm((current) => ({ ...current, [key]: value }));
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError('');
+    try {
+      const payload = { ...form, startDate: form.startDate || undefined, targetDate: form.targetDate || undefined };
+      const result = await postJson<{ projectId: string }>('/api/projects', 'POST', payload);
+      onCreated(result.projectId);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Project could not be created.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="modal-panel" role="dialog" aria-modal="true" aria-labelledby="new-project-heading">
+        <header className="section-head"><div><p className="section-kicker">New project</p><h2 id="new-project-heading">+ New Project</h2></div><button className="button secondary" onClick={onClose}>Close</button></header>
+        <form onSubmit={submit} className="lifecycle-form">
+          <div className="form-grid four">
+            <label><span className="field-label">Project code</span><input className="input" required value={form.code} onChange={(event) => set('code', event.target.value)} /></label>
+            <label><span className="field-label">Project name</span><input className="input" required value={form.name} onChange={(event) => set('name', event.target.value)} /></label>
+            <label><span className="field-label">Customer</span><input className="input" required value={form.customer} onChange={(event) => set('customer', event.target.value)} /></label>
+            <label><span className="field-label">Status</span><select className="input" value={form.status} onChange={(event) => set('status', event.target.value)}><option value="active">Active</option><option value="on-track">On track</option><option value="watch">Watch</option><option value="at-risk">At risk</option><option value="blocked">Blocked</option><option value="complete">Complete</option></select></label>
+            <label><span className="field-label">Owner</span><input className="input" required value={form.owner} onChange={(event) => set('owner', event.target.value)} /></label>
+            <label><span className="field-label">Start date</span><input className="input" type="date" value={form.startDate} onChange={(event) => set('startDate', event.target.value)} /></label>
+            <label><span className="field-label">Target completion</span><input className="input" type="date" value={form.targetDate} onChange={(event) => set('targetDate', event.target.value)} /></label>
+          </div>
+          <label><span className="field-label">Description</span><textarea className="input textarea" required value={form.description} onChange={(event) => set('description', event.target.value)} /></label>
+          <div className="action-row"><button className="button" disabled={busy}>Create project</button>{error ? <span className="form-error">{error}</span> : null}</div>
+        </form>
+      </section>
     </div>
   );
 }
 
 function ProjectCard({ project }: { project: PortfolioResponse['projects'][number] }) {
-  return (
-    <article className="project-card">
-      <div className="project-card-top">
-        <span className="project-code">{project.code}</span>
-        <StatusChip value={project.deliveryStatus} />
-      </div>
-      <div className="project-card-body">
-        <p className="project-stage">{project.stage}</p>
-        <h3><a href={`#/projects/${project.id}`}>{project.name}</a></h3>
-        <p>{project.summary}</p>
-      </div>
-      <dl className="project-signals">
-        <div><dt>Needs attention</dt><dd className={project.attentionCount > 0 ? 'signal-hot' : ''}>{project.attentionCount}</dd></div>
-        <div><dt>High risks / issues</dt><dd>{project.highRiskIssueCount}</dd></div>
-        <div><dt>Target</dt><dd>{formatDate(project.targetDate)}</dd></div>
-      </dl>
-      <div className="milestone-strip">
-        <div><small>Next milestone</small><strong>{project.nextMilestone?.title ?? 'Not set'}</strong></div>
-        <span>{project.nextMilestone ? formatDate(project.nextMilestone.targetDate) : '-'}</span>
-      </div>
-      <footer className="project-card-foot"><span>Owner - {project.owner}</span><a href={`#/projects/${project.id}`}>Open project <span aria-hidden="true">{'->'}</span></a></footer>
-    </article>
-  );
+  return <article className="project-card"><div className="project-card-top"><span className="project-code">{project.code}</span><StatusChip value={project.deliveryStatus} /></div><div className="project-card-body"><p className="project-stage">{project.stage}</p><h3><a href={`#/projects/${project.id}/overview`}>{project.name}</a></h3><p>{project.summary}</p></div><dl className="project-signals"><div><dt>Needs attention</dt><dd className={project.attentionCount > 0 ? 'signal-hot' : ''}>{project.attentionCount}</dd></div><div><dt>High risks / issues</dt><dd>{project.highRiskIssueCount}</dd></div><div><dt>Target</dt><dd>{formatDate(project.targetDate)}</dd></div></dl><div className="milestone-strip"><div><small>Next milestone</small><strong>{project.nextMilestone?.title ?? 'Not set'}</strong></div><span>{project.nextMilestone ? formatDate(project.nextMilestone.targetDate) : '-'}</span></div><footer className="project-card-foot"><span>Owner - {project.owner}</span><a href={`#/projects/${project.id}/overview`}>Open project <span aria-hidden="true">{'->'}</span></a></footer></article>;
 }
 
-function statGlyph(key: typeof statDefinitions[number]['key']): string {
-  return ({ projects: 'PM', attention: '!', highRiskIssues: '!', pendingDecisions: '?', aiAwaitingVerification: 'AI' } as const)[key];
+async function postJson<T>(url: string, method: 'POST', body: unknown): Promise<T> {
+  const response = await fetch(url, { method, headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) });
+  const data = (await response.json().catch(() => null)) as T | { error?: string } | null;
+  if (!response.ok) throw new Error((data as { error?: string } | null)?.error ?? `Request failed with ${response.status}`);
+  return data as T;
 }
+
+function statGlyph(key: typeof statDefinitions[number]['key']): string { return ({ projects: 'PM', attention: '!', highRiskIssues: '!', pendingDecisions: '?', awaitingSourceReview: 'SRC' } as const)[key]; }
