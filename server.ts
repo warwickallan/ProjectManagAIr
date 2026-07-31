@@ -36,6 +36,9 @@ import {
 } from './src/skillRegistry.js';
 import { CONSULTANT_VIEW_MODES, generateConsultantView, readConsultantView, renderSynthesisMarkdown, type ConsultantViewMode } from './src/consultantViews.js';
 import { readPreservedOutputs } from './src/providerOutputs.js';
+import { finalizeBuild } from './src/buildFinalizer.js';
+import { GitHubRestPort, GoogleDriveRestPort, beginDriveAuthorization, driveCredentialPaths } from './src/buildFinalizerPorts.js';
+import { isKnownManifestPath, readBuildHandoffs, resolveHandoffRoot } from './src/buildHandoffs.js';
 import { ClaudeCodeStructuredExtractionProvider } from './src/extractionProvider.js';
 import { ClaudeCodeGroundedBriefProvider } from './src/briefProvider.js';
 
@@ -428,6 +431,54 @@ app.post('/api/projects/:projectId/extraction-skill/pin', asyncRoute(async (requ
   response.json(pinProjectSkill(db(), { projectId: String(request.params.projectId), skillId: body.skillId, version: body.version, actor: String(body.actor ?? 'current-user'), note: body.note }));
 }));
 app.post('/api/projects/:projectId/extraction-skill/unpin', asyncRoute(async (request, response) => response.json(unpinProjectSkill(db(), { projectId: String(request.params.projectId), skillId: (request.body as { skillId?: string }).skillId, actor: String((request.body as { actor?: string }).actor ?? 'current-user') }))));
+/* ---------------------------------------------------------------------------- *
+ * Build handoffs
+ *
+ * The GET is a filesystem read: opening Settings must never push anything or
+ * spend a network call. The POST calls the same `finalizeBuild` engine the
+ * command line calls — there is no Git logic in this file or in the UI.
+ * ---------------------------------------------------------------------------- */
+
+const buildHandoffRoot = resolveHandoffRoot(root);
+
+app.get('/api/build-handoffs', (_, response) => response.json(readBuildHandoffs(buildHandoffRoot)));
+
+app.post('/api/build-handoffs/finalize', asyncRoute(async (request, response) => {
+  const body = request.body as { manifestPath?: string; dryRun?: boolean };
+  if (!body.manifestPath) { response.status(400).json({ error: 'manifestPath is required.' }); return; }
+  // The Cockpit is loopback-only, but a route that takes a path from a request
+  // body and hands it to something that runs `git push` accepts only a path this
+  // machine already offers.
+  if (!isKnownManifestPath(buildHandoffRoot, body.manifestPath)) {
+    response.status(400).json({ error: 'That manifest is not one of this machine\'s build handoffs.' });
+    return;
+  }
+  const result = await finalizeBuild({
+    manifestPath: body.manifestPath,
+    repoRoot: root,
+    handoffRoot: buildHandoffRoot,
+    github: new GitHubRestPort(),
+    drive: new GoogleDriveRestPort({ paths: driveCredentialPaths(root) }),
+    dryRun: Boolean(body.dryRun),
+  });
+  response.json(result);
+}));
+
+app.post('/api/build-handoffs/connect-drive', asyncRoute(async (_, response) => {
+  // Returns the consent URL and does not block on it: the operator opens it,
+  // Google redirects to the loopback listener this starts, and the refresh token
+  // is written there. Retry then completes the pending handoff.
+  const authorization = await beginDriveAuthorization({ paths: driveCredentialPaths(root) });
+  // The consent completes out of band, after this response has been sent. Its
+  // outcome is logged rather than discarded: a refused or abandoned
+  // authorisation is the thing an operator will be asking about a minute later.
+  authorization.completed.then(
+    () => console.log('[build-handoffs] Google Drive authorisation completed.'),
+    (error: unknown) => console.warn('[build-handoffs] Google Drive authorisation did not complete:', error instanceof Error ? error.message : error),
+  );
+  response.json({ authorizationUrl: authorization.authorizationUrl, port: authorization.port });
+}));
+
 app.get('/api/ai/providers', (_, response) => response.json({ providers: probeAIProviders() }));
 app.post('/api/ai/chat', asyncRoute(async (request, response) => response.json(await sendChatMessage(db(), request.body))));
 

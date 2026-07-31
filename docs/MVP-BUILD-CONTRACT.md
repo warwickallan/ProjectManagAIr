@@ -594,3 +594,38 @@ This sequence is approved for implementation.
 - stop at a local fictional-data MVP and seek approval before any live-source
   phase.
 
+
+---
+
+## Standing order: how a build is handed over
+
+Added 2026-07-31. This applies to every Project ManagAIr build from now on.
+
+A build is **not** handed over because a Markdown file exists somewhere on a
+local disk. It is handed over when a manifest exists that the local finaliser can
+act on without a human running Git commands or uploading files.
+
+Every builder finishes by writing:
+
+1. **A handoff manifest** at `Data\staging\build-handoffs\pending\<name>.json`,
+   in the schema documented in [`docs/build-finalisation.md`](build-finalisation.md).
+2. **A git bundle**, where the branch is not already on `origin`.
+3. **A deliverables list inside the manifest**, every entry classified as
+   `safe_for_drive`, `contains_customer_data`, `contains_secrets` or
+   `local_only`. An unclassified file is not uploaded. The default is to withhold.
+
+Warwick then performs exactly one action — `finish-projectmanagair-build.cmd`, or
+**Finalise** in Settings → Build Handoffs — which verifies the bundle and the
+exact SHA, pushes the branch, verifies what origin points at, opens or updates the
+draft pull request, mirrors the safe deliverables to the Google Drive
+`ProjectManagAIr` folder, and writes a completion manifest recording each
+deliverable's local path, classification, SHA-256, Drive file id, Drive URL,
+upload status and timestamp.
+
+**Required deliverables, at minimum:** the final handoff; the completion manifest;
+the acceptance or verification report; the adversarial-review report where one
+exists; merge-readiness or residual-risk notes; and any user guide needed to
+operate what was delivered.
+
+**Do not** rely on local absolute paths alone in a handoff. **Do not** ask Warwick
+to locate, attach, upload or copy a deliverable between systems.

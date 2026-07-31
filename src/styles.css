@@ -473,3 +473,31 @@ select.input { appearance: auto; }
   .skill-registry { grid-template-columns: 1fr; }
   .skill-metadata div { grid-template-columns: 1fr; }
 }
+
+/* ------------------------------------------------------------------ *
+ * Settings -> Build Handoffs
+ * ------------------------------------------------------------------ */
+.handoff-list { display: grid; gap: 12px; margin: 10px 0 18px; }
+.handoff-card { padding: 14px; border: 1px solid #dfe5f0; border-radius: 10px; background: #fff; }
+.handoff-card.unreadable { border-color: #eebfba; background: #fdf6f5; }
+.handoff-card h5 { margin: 3px 0; color: #24345b; font-size: 12px; }
+.handoff-card small { display: block; margin-top: 3px; color: var(--subtle); font-size: 9px; }
+.handoff-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.handoff-details div { grid-template-columns: 130px 1fr; }
+.handoff-errors { margin-top: 12px; padding: 11px; border: 1px solid #eebfba; border-radius: 8px; background: #fdf6f5; }
+.handoff-errors ul { margin: 6px 0 0; padding-left: 16px; }
+.handoff-errors li { color: #6b3a35; font-size: 10px; line-height: 1.55; }
+.drive-connection { margin-top: 12px; padding: 12px; border: 1px solid #e6d3a8; border-radius: 9px; background: #fdfaf1; }
+.drive-connection p { margin: 8px 0 0; color: #5f5124; font-size: 10px; line-height: 1.55; }
+.handoff-deliverables, .handoff-steps { margin-top: 12px; }
+.handoff-deliverables ul { display: grid; gap: 8px; margin: 8px 0 0; padding: 0; list-style: none; }
+.handoff-deliverables li { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; padding: 8px; border: 1px solid #edf0f4; border-radius: 8px; }
+.handoff-deliverables strong { color: #24345b; font-size: 11px; }
+.deliverable-class { padding: 2px 7px; border-radius: 999px; background: #eef1f7; color: #3f4b60; font-size: 9px; font-weight: 750; }
+.deliverable-class.class-safe-for-drive { background: #eefaf1; color: #1f6b3f; }
+.deliverable-class.class-contains-customer-data, .deliverable-class.class-contains-secrets { background: #fdeeed; color: #97372f; }
+.handoff-steps ol { display: grid; gap: 6px; margin: 8px 0 0; padding-left: 18px; }
+.handoff-steps li { color: #3f4b60; font-size: 10px; line-height: 1.5; }
+.handoff-steps li strong { display: block; color: #24345b; }
+.handoff-steps li.step-failed strong { color: #97372f; }
+.handoff-steps li.step-skipped strong { color: var(--subtle); }

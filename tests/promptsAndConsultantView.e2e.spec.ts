@@ -124,6 +124,25 @@ test('prompts are manageable and consultant views are complete without a provide
   await expect(page.getByText('Fixed application safety')).toBeVisible();
   await expect(page.getByText('Deterministic replay from the frozen packet')).toBeVisible();
 
+  /* -------------------------------------------------------- build handoffs */
+
+  // Reading build handoffs is a filesystem read: it must answer on a machine
+  // with no handoffs, no bundle and no GitHub credential, and it must not push.
+  const handoffs = await request.get('/api/build-handoffs');
+  expect(handoffs.ok()).toBe(true);
+  const handoffBody = await handoffs.json() as { root: string; pending: string; completed: string; handoffs: unknown[] };
+  expect(handoffBody.pending.endsWith('pending')).toBe(true);
+  expect(Array.isArray(handoffBody.handoffs)).toBe(true);
+
+  // A manifest path this machine does not offer is refused before anything runs.
+  const refused = await request.post('/api/build-handoffs/finalize', { data: { manifestPath: '/tmp/not-a-handoff.json' } });
+  expect(refused.status()).toBe(400);
+  expect((await refused.json()).error).toMatch(/not one of this machine/i);
+
+  await page.goto('/#/settings');
+  await expect(page.getByRole('heading', { name: 'Build Handoffs' })).toBeVisible();
+  await expect(page.getByText(/never merges, never force-pushes/i)).toBeVisible();
+
   await page.goto(`/#/projects/${projectId}/overview`);
   await expect(page.getByRole('heading', { name: 'Meeting Brief' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Consultant reasoning' })).toBeVisible();

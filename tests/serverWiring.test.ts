@@ -83,6 +83,32 @@ describe('server wiring of the consultant views', () => {
     }
   });
 
+  it('routes the build finaliser through the one engine, and reads without pushing', () => {
+    for (const route of [
+      "app.get('/api/build-handoffs'",
+      "app.post('/api/build-handoffs/finalize'",
+      "app.post('/api/build-handoffs/connect-drive'",
+    ]) {
+      expect(server, `server.ts should route ${route}`).toContain(route);
+    }
+    // The GET must be a filesystem read: opening Settings cannot push anything.
+    const getHandler = server.slice(indexOf("app.get('/api/build-handoffs'"), indexOf("app.post('/api/build-handoffs/finalize'"));
+    expect(getHandler).toContain('readBuildHandoffs(');
+    expect(getHandler).not.toContain('finalizeBuild(');
+    // The POST guards the supplied path against the handoffs this machine offers.
+    const postHandler = server.slice(indexOf("app.post('/api/build-handoffs/finalize'"), indexOf("app.post('/api/build-handoffs/connect-drive'"));
+    expect(postHandler).toContain('isKnownManifestPath(');
+    expect(postHandler).toContain('finalizeBuild(');
+    // And no Git command is issued from this file or from the UI: both delegate
+    // to the engine. Matched on what would actually run a process, not on prose
+    // — the comment above this route mentions `git push` on purpose.
+    const panel = readFileSync(path.join(process.cwd(), 'src', 'BuildHandoffsPanel.tsx'), 'utf8');
+    for (const source of [server, panel]) {
+      expect(source).not.toMatch(/(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|runCommand)\(\s*['"`]git['"`]/);
+      expect(source).not.toMatch(/\[\s*['"`](?:push|ls-remote|bundle|rev-parse)['"`]\s*,/);
+    }
+  });
+
   it('serves no route that returns skill or prompt text from a run', () => {
     // A revision body is a reusable template and may be served. An ASSEMBLED
     // prompt contains customer source windows and must not be, in any form.
