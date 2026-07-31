@@ -149,8 +149,10 @@ function unlockCount(row: ThemeRow, theme: ProjectTheme | undefined, byId: Map<s
  * Build the Meeting Brief or Needs Warwick view. No provider is reachable from
  * here — the module does not even take one.
  */
-export function buildDeterministicConsultantView(db: DatabaseSync, projectId: string, mode: ConsultantViewMode): DeterministicConsultantView {
-  const themed: ProjectThemeResult = buildProjectThemes(db, projectId);
+export function buildDeterministicConsultantView(db: DatabaseSync, projectId: string, mode: ConsultantViewMode, precomputedThemes?: ProjectThemeResult): DeterministicConsultantView {
+  // The grouping is a property of the project, not of the view. A caller
+  // rendering both modes computes it once and passes it in.
+  const themed: ProjectThemeResult = precomputedThemes ?? buildProjectThemes(db, projectId);
   const byId = new Map(themed.rows.map((row) => [row.id, row]));
   const themeOf = new Map<string, ProjectTheme>();
   for (const theme of themed.themes) for (const id of theme.memberIds) themeOf.set(id, theme);
@@ -338,6 +340,11 @@ export function consultantCacheKey(mode: ConsultantViewMode, selectionHash: stri
     selectionHash,
     skillId: identity.skillId,
     skillVersion: identity.skillVersion,
+    // The body hash, not only the version number. Two revisions can share a
+    // version across machines if one registry directory disagrees with another,
+    // and a cached narrative produced by different instructions is a different
+    // artefact.
+    skillSha256: identity.skillSha256,
     promptTemplateVersion: identity.promptTemplateVersion,
     providerId: identity.providerId,
     modelLabel: identity.modelLabel,
@@ -369,6 +376,28 @@ export interface CachedConsultantSynthesis {
   stale: boolean;
   staleReason: string | null;
   staleAt: string | null;
+}
+
+/**
+ * Reconcile the stored stale flag with the state this read computed, so a
+ * superseded narrative can never be badged as current.
+ */
+function staleFacts(cached: CachedConsultantSynthesis, state: SynthesisState, identity: SynthesisIdentity): Pick<CachedConsultantSynthesis, 'stale' | 'staleReason' | 'staleAt'> {
+  if (state !== 'stale') return { stale: cached.stale, staleReason: cached.staleReason, staleAt: cached.staleAt };
+  if (cached.stale && cached.staleReason) return { stale: true, staleReason: cached.staleReason, staleAt: cached.staleAt };
+  const changed = [
+    cached.skillVersion !== identity.skillVersion ? `the Consultant Brief revision moved from ${cached.skillVersion ?? 'unrecorded'} to ${identity.skillVersion ?? 'none published'}` : null,
+    cached.modelLabel !== identity.modelLabel ? `the model changed from ${cached.modelLabel ?? 'unrecorded'} to ${identity.modelLabel}` : null,
+    cached.promptTemplateVersion !== identity.promptTemplateVersion ? 'the prompt template version changed' : null,
+    cached.packetContractVersion !== identity.packetContractVersion ? 'the packet contract version changed' : null,
+  ].filter(Boolean);
+  return {
+    stale: true,
+    staleReason: changed.length > 0
+      ? `This narrative was generated under different conditions: ${changed.join('; ')}.`
+      : 'This narrative was generated for a different deterministic selection.',
+    staleAt: cached.staleAt ?? cached.generatedAt,
+  };
 }
 
 function toCached(row: Record<string, unknown>): CachedConsultantSynthesis {
@@ -403,13 +432,27 @@ function toCached(row: Record<string, unknown>): CachedConsultantSynthesis {
  * someone asks for a new one; discarding it, or silently replacing it, both cost
  * the consultant something they did not agree to lose.
  */
-export function markSupersededSyntheses(db: DatabaseSync, projectId: string, mode: string, currentSelectionHash: string, reason: string): number {
-  const affected = db.prepare('SELECT id FROM consultant_briefs WHERE project_id = ? AND mode = ? AND selection_hash <> ? AND stale = 0').all(projectId, mode, currentSelectionHash) as Array<{ id: string }>;
-  if (affected.length === 0) return 0;
+export function markSupersededSyntheses(db: DatabaseSync, projectId: string, mode: string, currentSelectionHash: string, reason: string): { superseded: number; revived: number } {
   const at = nowIso();
+  // `skill_id IS NOT NULL` is the discriminator for a row this module wrote.
+  // The deterministic template and the legacy grounded-brief route share this
+  // table but compute a different selection hash, so an unscoped update marked
+  // their rows stale on every read — and the legacy route, which requires
+  // `stale = 0` to hit its cache, then spent a provider call the next time it
+  // was asked. A zero-call read must not cause a paid call anywhere.
+  const superseded = db.prepare('SELECT id FROM consultant_briefs WHERE project_id = ? AND mode = ? AND skill_id IS NOT NULL AND selection_hash <> ? AND stale = 0').all(projectId, mode, currentSelectionHash) as Array<{ id: string }>;
   const update = db.prepare('UPDATE consultant_briefs SET stale = 1, stale_reason = ?, stale_at = ? WHERE id = ?');
-  for (const row of affected) update.run(reason, at, String(row.id));
-  return affected.length;
+  for (const row of superseded) update.run(reason, at, String(row.id));
+
+  // A stale flag whose cause has been undone is no longer true. When the
+  // selection moves away and back — a row closed and reopened, a due date
+  // corrected — the cached synthesis describes the current selection again, and
+  // refusing it would spend a call to regenerate something byte-identical AND
+  // overwrite the narrative that was already there.
+  const revived = db.prepare('SELECT id FROM consultant_briefs WHERE project_id = ? AND mode = ? AND skill_id IS NOT NULL AND selection_hash = ? AND stale = 1').all(projectId, mode, currentSelectionHash) as Array<{ id: string }>;
+  const revive = db.prepare('UPDATE consultant_briefs SET stale = 0, stale_reason = NULL, stale_at = NULL WHERE id = ?');
+  for (const row of revived) revive.run(String(row.id));
+  return { superseded: superseded.length, revived: revived.length };
 }
 
 /** Read the cache only. Never calls a provider, never writes a brief. */
@@ -420,7 +463,11 @@ export function readConsultantSynthesis(db: DatabaseSync, projectId: string, mod
 
 /** The most recent synthesis for this mode whatever its cache key — used to keep a stale one on screen. */
 export function readLatestConsultantSynthesis(db: DatabaseSync, projectId: string, mode: ConsultantViewMode): CachedConsultantSynthesis | null {
-  const row = db.prepare("SELECT * FROM consultant_briefs WHERE project_id = ? AND mode = ? AND provider_id <> 'deterministic-template' ORDER BY generated_at DESC LIMIT 1").get(projectId, mode) as Record<string, unknown> | undefined;
+  // Same discriminator as above: a narrative written by the legacy route, or
+  // carried across by migration 013, was validated against a different selection
+  // and records no skill provenance. Serving it here would present it as this
+  // view's reasoning with an "unrecorded skill".
+  const row = db.prepare("SELECT * FROM consultant_briefs WHERE project_id = ? AND mode = ? AND skill_id IS NOT NULL AND provider_id <> 'deterministic-template' ORDER BY generated_at DESC LIMIT 1").get(projectId, mode) as Record<string, unknown> | undefined;
   return row ? toCached(row) : null;
 }
 
@@ -440,6 +487,9 @@ export interface ConsultantViewResponse {
   synthesisState: SynthesisState;
   failure: { message: string; recoveryAction: string } | null;
   providerCallsThisRequest: number;
+  /** How many factual lines this generation dropped for failing citation validation. */
+  removedLines?: number;
+  factualLines?: number;
 }
 
 /**
@@ -462,7 +512,12 @@ export function readConsultantView(db: DatabaseSync, projectId: string, mode: Co
     projectId,
     mode,
     deterministic,
-    synthesis: fallback ? { ...fallback, state } : null,
+    // A synthesis served as the fallback for a DIFFERENT cache key is stale even
+    // though its stored flag says otherwise: the selection is unchanged but the
+    // skill version, model or packet contract has moved. Reconciling the two
+    // here is what stops the panel rendering "Stale" in one place and "Current"
+    // in another for the same artefact.
+    synthesis: fallback ? { ...fallback, ...staleFacts(fallback, state, identity), state } : null,
     identity: {
       ...identity,
       providerAvailable: provider.isAvailable(),
@@ -526,6 +581,9 @@ export async function generateConsultantView(
     providerCallsThisRequest: 0,
   });
 
+  // Read AFTER `markSupersededSyntheses`, which has just revived any row whose
+  // selection matches again, so an unchanged view is a cache hit rather than a
+  // paid regeneration of something byte-identical.
   const cached = readConsultantSynthesis(db, projectId, mode, cacheKey);
   if (cached && !cached.stale && !options.force) {
     return { ...base(), synthesis: { ...cached, state: 'current' }, synthesisState: 'current' };
@@ -536,7 +594,7 @@ export async function generateConsultantView(
     ...base(),
     // The deterministic view stands. The previous synthesis, if any, is still
     // shown and still labelled stale — never relabelled as this attempt's output.
-    synthesis: previous ? { ...previous, state: 'stale' } : null,
+    synthesis: previous ? { ...previous, ...staleFacts(previous, 'stale', identity), state: 'stale' } : null,
     synthesisState: 'failed',
     failure: { message, recoveryAction },
   });
@@ -625,6 +683,16 @@ export async function generateConsultantView(
   const durationMs = performance.now() - started;
   const validation = validateBriefCitations(result.markdown, deterministic.selectedIds);
   const outputSha256 = hash(result.markdown);
+  // A narrative made entirely of section headings has zero factual lines, a
+  // removal ratio of zero, and would otherwise be stored as a successful
+  // synthesis that asserts nothing.
+  if (validation.factual === 0) {
+    recordRun('citation-rejected', 'The narrative contained no factual lines to cite.', outputSha256, result.usage.inputTokens, result.usage.outputTokens, durationMs, null);
+    return withFailure(
+      'The generated narrative contained no factual statements — only section headings.',
+      'Nothing was cached. Press Generate again, or improve the Consultant Brief revision in Settings → AI Skills & Prompts.',
+    );
+  }
   if (!validation.valid || !validation.markdown) {
     recordRun('citation-rejected', `Removed ${validation.removed} of ${validation.factual} factual lines; invalid citations: ${validation.invalidCitations.join(', ') || 'none'}.`, outputSha256, result.usage.inputTokens, result.usage.outputTokens, durationMs, null);
     return withFailure(
@@ -652,7 +720,17 @@ export async function generateConsultantView(
   recordRun('complete', null, outputSha256, result.usage.inputTokens, result.usage.outputTokens, durationMs, id);
 
   const stored = readConsultantSynthesis(db, projectId, mode, cacheKey)!;
-  return { ...base(), synthesis: { ...stored, state: 'current' }, synthesisState: 'current', providerCallsThisRequest: 1 };
+  return {
+    ...base(),
+    synthesis: { ...stored, state: 'current' },
+    synthesisState: 'current',
+    providerCallsThisRequest: 1,
+    // Up to a fifth of the factual lines may be removed and the narrative still
+    // accepted. A consultant reading it has to be told that happened; a silent
+    // deletion is a narrative that reads as complete and is not.
+    removedLines: validation.removed,
+    factualLines: validation.factual,
+  };
 }
 
 /**

@@ -22,6 +22,15 @@ for (const suffix of ['', '-wal', '-shm', '-journal']) {
 
 process.env.PROJECTMANAGAIR_DB_PATH = resolvedDb;
 process.env.PROJECTMANAGAIR_M365_CONFIG = path.join(artifactsDir, 'missing-m365-auth.local.json');
+// The end-to-end run uploads a skill draft. Without its own registry directory
+// that draft lands in the machine-wide runtime directory and is then visible to
+// every other database on the host, including the unit suite's fixtures — which
+// made `vitest` fail if it happened to run after `playwright`.
+const e2eSkillDir = path.join(artifactsDir, 'e2e-skill-registry');
+rmSync(e2eSkillDir, { recursive: true, force: true });
+mkdirSync(e2eSkillDir, { recursive: true });
+process.env.PROJECTMANAGAIR_SKILL_REGISTRY_DIR = e2eSkillDir;
+process.env.PROJECTMANAGAIR_PROVIDER_OUTPUT_DIR = path.join(artifactsDir, 'e2e-provider-output');
 const fixture = portfolioFixtureSchema.parse(fixtureJson);
 const context = openProjectManagairDatabase(resolvedDb);
 try {

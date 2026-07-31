@@ -7,6 +7,7 @@ import { readBlindExtractionComparisonReports } from './blindExtractionCompariso
 import { readRegisterState } from './projectRegisters.js';
 import { buildDeterministicBrief, computeProjectOverview, readSourceIntelligence } from './sourceIntelligence.js';
 import { CONSULTANT_VIEW_MODES, buildDeterministicConsultantView } from './consultantViews.js';
+import { buildProjectThemes } from './projectThemes.js';
 
 type SqlValue = string | number | bigint | null;
 
@@ -197,7 +198,13 @@ function readProjectFromRows(db: DatabaseSync, row: Record<string, unknown>): Pr
     // Deterministic only. Nothing on this path can reach a provider, so opening
     // a project costs zero model calls however many tabs, filters or refreshes
     // follow.
-    consultantViews: CONSULTANT_VIEW_MODES.map((mode) => buildDeterministicConsultantView(db, projectId, mode)),
+    // Themes are computed once and shared by both modes: the grouping is a
+    // property of the project, not of the view, and building it twice doubled
+    // the cost of every project open.
+    consultantViews: (() => {
+      const themes = buildProjectThemes(db, projectId);
+      return CONSULTANT_VIEW_MODES.map((mode) => buildDeterministicConsultantView(db, projectId, mode, themes));
+    })(),
   };
   return project as Project;
 }

@@ -236,6 +236,16 @@ export class ProviderError extends Error {
   readonly stdout: string;
   readonly stderr: string;
   readonly detail: string;
+  /**
+   * The complete, untruncated streams.
+   *
+   * `stdout`/`stderr` above are truncated for the message and for the quarantine
+   * lane. Preservation needs the bytes as they arrived: a provider that returned
+   * a full response and then exited non-zero, or was killed at the timeout after
+   * emitting everything, has produced model work that must survive the failure.
+   */
+  readonly rawStdout: string;
+  readonly rawStderr: string;
 
   constructor(options: ProviderErrorOptions) {
     const detail = buildDetail(options);
@@ -248,6 +258,8 @@ export class ProviderError extends Error {
     this.signal = options.signal ?? null;
     this.stdout = truncateStream(options.stdout ?? '');
     this.stderr = truncateStream(options.stderr ?? '');
+    this.rawStdout = options.stdout ?? '';
+    this.rawStderr = options.stderr ?? '';
     this.detail = detail;
     if (options.cause !== undefined) (this as { cause?: unknown }).cause = options.cause;
   }
@@ -1125,11 +1137,19 @@ export class FakeStructuredExtractionProvider implements StructuredExtractionPro
   async extract(request: StructuredExtractionRequest): Promise<StructuredExtractionResult> {
     const requestedAt = new Date().toISOString();
     const started = Date.now();
-    const result = await this.handler(request);
-    // A synthetic provider preserves too. Otherwise every test of the
-    // preservation path would have to use a real CLI, and the guarantee would be
-    // exercised only by the one run it is most expensive to repeat.
-    request.preserveRawOutput?.({ raw: stable(result.output), requestedAt, receivedAt: new Date().toISOString(), durationMs: Date.now() - started });
+    // A synthetic provider preserves on both paths, exactly as the real ones do.
+    // Otherwise every test of the preservation guarantee would have to drive a
+    // real CLI, and the guarantee would be exercised only by the one run it is
+    // most expensive to repeat.
+    const preserve = (raw: string) => request.preserveRawOutput?.({ raw, requestedAt, receivedAt: new Date().toISOString(), durationMs: Date.now() - started });
+    let result: StructuredExtractionResult;
+    try {
+      result = await this.handler(request);
+    } catch (error) {
+      if (isProviderError(error) && error.rawStdout.trim()) preserve(error.rawStdout);
+      throw error;
+    }
+    preserve(stable(result.output));
     return { output: result.output, usage: normalizeUsage(result.usage) };
   }
 }
@@ -1217,6 +1237,7 @@ export class ClaudeCodeStructuredExtractionProvider implements StructuredExtract
   async extract(request: StructuredExtractionRequest, signal?: AbortSignal): Promise<StructuredExtractionResult> {
     const requestedAt = new Date().toISOString();
     const started = Date.now();
+    let preserved = false;
     try {
       const run = await runCliCommand({
         providerId: this.identity.providerId,
@@ -1234,6 +1255,7 @@ export class ClaudeCodeStructuredExtractionProvider implements StructuredExtract
       // gate failure otherwise discards a multi-call extraction with no way to
       // recover the model's work — which is exactly how twenty-five minutes of
       // completed output was lost during the previous acceptance attempt.
+      preserved = true;
       request.preserveRawOutput?.({ raw: run.stdout, requestedAt, receivedAt: new Date().toISOString(), durationMs: Date.now() - started });
       captureRawOutput({ providerId: this.identity.providerId }, run.stdout);
       const output = parseStructuredExtractionOutputText(run.stdout, {
@@ -1254,6 +1276,15 @@ export class ClaudeCodeStructuredExtractionProvider implements StructuredExtract
         },
       };
     } catch (error) {
+      // A transport failure can still carry a complete response: a CLI that
+      // printed everything and then exited non-zero, or was killed at the
+      // timeout after emitting its answer, has produced model work. Preserving
+      // it here is the difference between a recoverable failure and paying for
+      // the same call twice.
+      if (!preserved && isProviderError(error) && error.rawStdout.trim()) {
+        preserved = true;
+        request.preserveRawOutput?.({ raw: error.rawStdout, requestedAt, receivedAt: new Date().toISOString(), durationMs: Date.now() - started });
+      }
       if (isProviderError(error)) this.tracker.noteFailure(error);
       throw error;
     }
@@ -1381,6 +1412,7 @@ export class CodexCliStructuredExtractionProvider implements StructuredExtractio
   async extract(request: StructuredExtractionRequest, signal?: AbortSignal): Promise<StructuredExtractionResult> {
     const requestedAt = new Date().toISOString();
     const started = Date.now();
+    let preserved = false;
     try {
       const run = await runCliCommand({
         providerId: this.identity.providerId,
@@ -1396,6 +1428,7 @@ export class CodexCliStructuredExtractionProvider implements StructuredExtractio
       // The whole event stream, before it is interpreted. `parseCodexJsonl`
       // throws on a stream that carried an error and no agent message, so
       // preserving after it would lose the diagnostic as well as the output.
+      preserved = true;
       request.preserveRawOutput?.({ raw: run.stdout, requestedAt, receivedAt: new Date().toISOString(), durationMs: Date.now() - started });
       const parsed = parseCodexJsonl(run.stdout, this.identity.providerId);
       const output = parseStructuredExtractionOutputText(parsed.message, {
@@ -1415,6 +1448,10 @@ export class CodexCliStructuredExtractionProvider implements StructuredExtractio
         },
       };
     } catch (error) {
+      if (!preserved && isProviderError(error) && error.rawStdout.trim()) {
+        preserved = true;
+        request.preserveRawOutput?.({ raw: error.rawStdout, requestedAt, receivedAt: new Date().toISOString(), durationMs: Date.now() - started });
+      }
       if (isProviderError(error)) this.tracker.noteFailure(error);
       throw error;
     }

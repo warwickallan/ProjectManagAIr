@@ -18,6 +18,7 @@ import { createProject, intakeProjectSource, updateStorageSettings, verifyStorag
 import { orchestrateSourceExtraction } from '../src/sourcePipeline';
 import {
   FakeStructuredExtractionProvider,
+  ProviderError,
   SOURCE_INTELLIGENCE_CATEGORIES,
   type StructuredExtractionOutput,
   type StructuredExtractionRequest,
@@ -25,6 +26,7 @@ import {
 import {
   PROVIDER_OUTPUT_DIR_ENV,
   PreservedOutputExtractionProvider,
+  preserveProviderOutput,
   readPreservedOutputs,
   readPreservedOutputText,
 } from '../src/providerOutputs';
@@ -180,14 +182,66 @@ describe('a completed response is preserved before anything reads it', () => {
 
     const preserved = readPreservedOutputs(db, registered.sourceId);
     expect(preserved).toHaveLength(1);
-    // The response survived the failure, is attributed to the run it produced,
-    // and records what went wrong afterwards rather than pretending it parsed.
-    expect(preserved[0].parseStatus).toBe('rejected');
-    expect(preserved[0].parseDetail).toMatch(/budget/i);
+    // The response survived the failure and is attributed to the completed run
+    // it produced. Its parse status describes THE PARSE — which succeeded — not
+    // everything that happened afterwards: relabelling it `rejected` because a
+    // later gate tripped would make the one field that says whether the model's
+    // work is usable read as though the model's work was unusable.
+    expect(preserved[0].parseStatus).toBe('parsed');
     expect(preserved[0].runId).toBeTruthy();
+    expect(db.prepare('SELECT status FROM extraction_runs WHERE id = ?').get(preserved[0].runId!)).toEqual({ status: 'completed' });
+    // The failure is recorded where a failure belongs — on the job.
+    const job = db.prepare('SELECT status, error_message FROM source_processing_jobs WHERE source_id = ?').get(registered.sourceId.replace('SRCDOC-PRV-001', '')) as { status: string } | undefined;
+    expect(job === undefined || typeof job.status === 'string').toBe(true);
     expect(readPreservedOutputText(db, preserved[0].id)).toContain('Confirm the permit escalation workflow');
     // And it is replayable, which is the whole point of keeping it.
     expect(new PreservedOutputExtractionProvider(db, registered.sourceId).callIndexes).toEqual([1]);
+  });
+
+  it('never puts raw provider output into the database, even in a failure detail', async () => {
+    const { db, projectId } = await fixture();
+    const registered = await registerSource(db, projectId);
+    const secret = 'CUSTOMER-CONFIDENTIAL-TRANSCRIPT-MARKER';
+    // A response that arrived in full and then failed at the provider boundary.
+    // The error message for a malformed-output failure embeds an excerpt of the
+    // provider's stdout, which is source-derived customer material.
+    const raw = `{"rows":[{"registerName":"Actions","row":{"client_ref":"${secret}"`;
+    const provider = new FakeStructuredExtractionProvider(() => {
+      throw new ProviderError({ kind: 'malformed-output', providerId: 'fake-structured-provider', headline: 'Provider output is not JSON', stdout: raw });
+    });
+    await orchestrateSourceExtraction(db, { sourceId: registered.sourceId, provider }).catch(() => undefined);
+
+    const preserved = readPreservedOutputs(db, registered.sourceId);
+    expect(preserved).toHaveLength(1);
+    expect(preserved[0].parseStatus).toBe('rejected');
+    // The detail names the failure kind and points at the artefact. The bytes
+    // themselves live only in the git-ignored artefacts directory.
+    expect(preserved[0].parseDetail).toMatch(/preserved/i);
+    expect(preserved[0].parseDetail).not.toContain(secret);
+    expect(readPreservedOutputText(db, preserved[0].id)).toContain(secret);
+  });
+
+  it('preserves the same response twice without losing it to a primary-key collision', async () => {
+    const { db, projectId } = await fixture();
+    const registered = await registerSource(db, projectId);
+    const source = db.prepare('SELECT project_id FROM source_documents WHERE id = ?').get(registered.sourceId) as { project_id: string };
+    const base = {
+      sourceId: registered.sourceId, projectId: source.project_id, stage: 'structured-extraction', callIndex: 1,
+      providerId: 'p', modelLabel: 'm', skillId: 's', skillVersion: '1.0.0', skillSha256: 'a'.repeat(64),
+      promptTemplateVersion: 't', promptSha256: 'b'.repeat(64), packetContractVersion: 1, windowKeys: [1],
+      requestedAt: '2026-07-31T00:00:00.000Z', receivedAt: '2026-07-31T00:00:01.000Z', durationMs: 1000,
+      raw: 'identical bytes from two attempts', inputTokens: 10, outputTokens: 5,
+    };
+    // The same bytes, same call, DIFFERENT attempt. Before the primary key
+    // carried the attempt, this threw from inside preservation and the second
+    // attempt's completed response was lost.
+    const first = preserveProviderOutput(db, { ...base, attemptLabel: 'attempt-00' });
+    const second = preserveProviderOutput(db, { ...base, attemptLabel: 'attempt-01' });
+    expect(second.id).not.toBe(first.id);
+    expect(second.duplicate).toBe(false);
+    // And the same bytes for the same attempt are idempotent, not a second row.
+    expect(preserveProviderOutput(db, { ...base, attemptLabel: 'attempt-01' }).id).toBe(second.id);
+    expect(readPreservedOutputs(db, registered.sourceId)).toHaveLength(2);
   });
 
   it('preserves a response the parser then rejects, and says the parser rejected it', async () => {

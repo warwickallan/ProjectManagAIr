@@ -973,7 +973,11 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
     // outcome record below. The provider is contractually required to invoke it
     // before it parses anything, which is what makes a completed response
     // survive every downstream defect.
-    const preserved: { id: string | null } = { id: null };
+    // `outcomeRecorded` guards the catch below: a response that PARSED and
+    // produced a completed run must not be relabelled `rejected` because the
+    // pass failed afterwards on a budget or merge gate. The parse status
+    // describes the parse, not everything that happened next.
+    const preserved: { id: string | null; outcomeRecorded: boolean } = { id: null, outcomeRecorded: false };
     const preserveRawOutput = (event: RawProviderResponse): string | null => {
       const record = preserveProviderOutput(db, {
         sourceId: source.id,
@@ -1034,6 +1038,7 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
       runIds.push(runId);
       completedRunRecorded = true;
       if (preserved.id) {
+        preserved.outcomeRecorded = true;
         const excluded = result.output.rejectedRows?.length ?? 0;
         recordProviderOutputOutcome(db, preserved.id, {
           parseStatus: excluded > 0 ? 'parsed-with-exclusions' : 'parsed',
@@ -1050,7 +1055,17 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
       const failure = classifySourceFailure(error);
       // A response that arrived and then failed to parse is still preserved; the
       // record says so rather than being silently left as `received`.
-      if (preserved.id) recordProviderOutputOutcome(db, preserved.id, { parseStatus: 'rejected', parseDetail: failure.message.slice(0, 2000) });
+      // The detail names the failure KIND and points at the preserved artefact.
+      // It deliberately does not carry `failure.message`, which for a
+      // malformed-output error embeds an excerpt of the provider's raw stdout —
+      // source-derived customer material that migration 013 keeps out of the
+      // database on purpose.
+      if (preserved.id && !preserved.outcomeRecorded) {
+        recordProviderOutputOutcome(db, preserved.id, {
+          parseStatus: 'rejected',
+          parseDetail: `Rejected at the provider boundary (${failure.kind}). The complete response is preserved; read it from this record's artefact path.`,
+        });
+      }
       if (!completedRunRecorded) {
         recordRunProvenance(db, resolvedSkill, insertRun(db, {
           source,

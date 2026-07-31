@@ -5,9 +5,10 @@ import { EmptyState, Section, StatusChip, formatDate, formatDateTime, humanize }
  * Meeting Brief and Needs Warwick.
  *
  * The deterministic content on this panel arrives with the project payload and
- * costs nothing. The GET this component performs on mount reads the synthesis
- * CACHE only — it cannot reach a provider. A provider call happens on exactly
- * one path: the operator presses Generate or Refresh, which POSTs once.
+ * costs nothing. The GET this component performs on mount cannot reach a
+ * provider's `generate`: it reads the synthesis cache, reconciles staleness, and
+ * reports whether the provider is reachable. A model call happens on exactly one
+ * path — the operator presses Generate or Refresh, which POSTs once.
  *
  * Nothing here regenerates on a tab change, a filter change, a page refresh, a
  * row being opened, or the deterministic selection moving. When the selection
@@ -97,6 +98,8 @@ type ConsultantViewResponse = {
   synthesisState: 'none' | 'current' | 'stale' | 'failed';
   failure: { message: string; recoveryAction: string } | null;
   providerCallsThisRequest: number;
+  removedLines?: number;
+  factualLines?: number;
 };
 
 const MODES: Array<{ id: ConsultantMode; label: string; description: string }> = [
@@ -273,14 +276,19 @@ export function ConsultantViewPanel({ projectId, deterministicViews }: { project
         {synthesis ? (
           <article className="synthesis-body">
             <div className="brief-meta">
-              <StatusChip value={synthesis.stale ? 'watch' : 'verified'} label={synthesis.stale ? 'Stale' : 'Current'} />
+              {/* Driven by `state`, not by the stored `stale` column: a narrative
+                  superseded by a new skill version or model has an unchanged
+                  selection hash, so the column still reads 0 while the view is
+                  genuinely stale. */}
+              <StatusChip value={synthesis.state === 'current' ? 'verified' : 'watch'} label={synthesis.state === 'current' ? 'Current' : 'Stale'} />
               <span>{formatDateTime(synthesis.generatedAt)}</span>
               <span>{synthesis.providerId} / {synthesis.modelLabel ?? 'unrecorded model'}</span>
               <span>{synthesis.skillId ?? 'unrecorded skill'} {synthesis.skillVersion ?? ''}</span>
               <span>{synthesis.selectedIds.length} selected records</span>
               <span>{synthesis.inputTokens} in / {synthesis.outputTokens} out tokens</span>
             </div>
-            {synthesis.stale && synthesis.staleReason ? <p className="inline-note">Stale since {formatDateTime(synthesis.staleAt ?? synthesis.generatedAt)}: {synthesis.staleReason} Nothing has been regenerated — press Refresh to spend one call.</p> : null}
+            {synthesis.state !== 'current' && synthesis.staleReason ? <p className="inline-note">Stale since {formatDateTime(synthesis.staleAt ?? synthesis.generatedAt)}: {synthesis.staleReason} Nothing has been regenerated — press Refresh to spend one call.</p> : null}
+            {typeof view?.removedLines === 'number' && view.removedLines > 0 ? <p className="inline-note">{view.removedLines} of {view.factualLines} factual lines were removed because they cited nothing in the selection. What you are reading is what survived.</p> : null}
             <div className="brief-content">{synthesis.briefMarkdown.split(/\r?\n/).map((line, index) => {
               const key = `${index}:${line.slice(0, 20)}`;
               if (line.startsWith('### ')) return <h5 key={key}>{line.slice(4)}</h5>;

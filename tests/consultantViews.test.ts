@@ -15,7 +15,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { openProjectManagairDatabase, readProjectData } from '../src/db';
 import { FakeGroundedBriefProvider, type GroundedBriefProvider, type GroundedBriefRequest, type GroundedBriefResult } from '../src/briefProvider';
 import { canonicalNormalizedRowJson, canonicalRowJson, rebuildProjection } from '../src/registerProjection';
-import { ensureSkillRegistrySynced } from '../src/skillRegistry';
+import { ensureSkillRegistrySynced, promoteSkillRevision, uploadSkillDraft } from '../src/skillRegistry';
+import { buildConsultantBrief } from '../src/sourceIntelligence';
 import { buildProjectThemes } from '../src/projectThemes';
 import {
   buildDeterministicConsultantView,
@@ -98,6 +99,17 @@ function seedRealisticProject(db: DatabaseSync): string {
   seedRow(db, projectId, { register: 'Risks_Issues', id: 'CVF-R-001', title: 'Training room booking not confirmed', summary: 'The training room for the customer session is not confirmed.', owner: 'Customer Programme Office', details: { severity: 'medium' } });
   rebuildProjection(db, projectId, AS_OF);
   return projectId;
+}
+
+
+/** A source document and its segments, so anchors can satisfy their foreign keys. */
+function seedSource(db: DatabaseSync, projectId: string, sourceId: string, segmentSeqs: number[], segmentIdFor: (seq: number) => string) {
+  db.prepare("INSERT INTO source_documents (id, project_id, intake_source_id, content_hash, source_type, original_file_name, immutable_path, event_date, duration_ms, word_count, segment_count, participants_json, normaliser_version, created_at) VALUES (?, ?, NULL, ?, 'transcript', 'fixture.vtt', '/tmp/fixture.vtt', NULL, NULL, 10, ?, '[]', 'source-normaliser-v2', ?)")
+    .run(sourceId, projectId, `${sourceId}${'0'.repeat(64)}`.slice(0, 64), segmentSeqs.length, AS_OF);
+  for (const seq of segmentSeqs) {
+    db.prepare("INSERT INTO source_segments (id, source_id, seq, kind, speaker, t_start_ms, t_end_ms, message_id, sender, sent_at, page, section, para_index, char_start, char_end, text, window_id) VALUES (?, ?, ?, 'cue', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, ?, NULL)")
+      .run(segmentIdFor(seq), sourceId, seq, `Segment ${seq}.`);
+  }
 }
 
 /** A provider that counts every call and never touches the network. */
@@ -394,5 +406,207 @@ describe('the downloadable consultant view', () => {
     const { provider } = countingProvider();
     const markdown = renderSynthesisMarkdown(readConsultantView(db, projectId, 'needs-warwick', provider));
     expect(markdown).toContain('Generated reasoning: none');
+  });
+});
+
+/* ------------------------------------------------------------------ regressions
+ *
+ * Every case below reproduces a defect an adversarial reviewer demonstrated on
+ * this branch. They are written to fail if the fix is reverted.
+ * ---------------------------------------------------------------------------- */
+
+describe('regressions found by adversarial review', () => {
+  it('serves the cache when a selection moves away and comes back, instead of paying to regenerate it', async () => {
+    const { db } = fixture();
+    const projectId = seedRealisticProject(db);
+    const { provider, calls } = countingProvider();
+    const before = await generateConsultantView(db, projectId, 'needs-warwick', provider);
+    const originalMarkdown = before.synthesis!.briefMarkdown;
+    const originalHash = before.deterministic.selectionHash;
+    expect(calls()).toBe(1);
+
+    // The selection moves...
+    seedRow(db, projectId, { register: 'Actions', id: 'CVF-A-777', title: 'Transient consultant action', summary: 'Appears and disappears.', owner: 'Casey Flint' });
+    rebuildProjection(db, projectId, AS_OF);
+    expect(readConsultantView(db, projectId, 'needs-warwick', provider).synthesisState).toBe('stale');
+
+    // ...and comes back.
+    db.prepare('DELETE FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').run(projectId, 'CVF-A-777');
+    rebuildProjection(db, projectId, AS_OF);
+    expect(buildDeterministicConsultantView(db, projectId, 'needs-warwick').selectionHash).toBe(originalHash);
+
+    // The cached narrative describes the current selection again, so it is
+    // served unchanged and nothing is spent.
+    const after = await generateConsultantView(db, projectId, 'needs-warwick', provider);
+    expect(calls()).toBe(1);
+    expect(after.synthesisState).toBe('current');
+    expect(after.synthesis!.briefMarkdown).toBe(originalMarkdown);
+  });
+
+  it('does not invalidate the legacy brief cache from a zero-call read', async () => {
+    const { db } = fixture();
+    const projectId = seedRealisticProject(db);
+    const { provider, calls } = countingProvider(() => ({ markdown: '## Do first\n- Legacy narrative [CVF-D-001]\n', usage: { inputTokens: 10, outputTokens: 5 } }));
+
+    await buildConsultantBrief(db, projectId, 'needs-warwick', provider);
+    expect(calls()).toBe(1);
+    await buildConsultantBrief(db, projectId, 'needs-warwick', provider);
+    expect(calls()).toBe(1);
+
+    // A documented zero-call read must not cause a paid call anywhere else.
+    readConsultantView(db, projectId, 'needs-warwick', provider);
+    readProjectData(db, projectId);
+    await buildConsultantBrief(db, projectId, 'needs-warwick', provider);
+    expect(calls()).toBe(1);
+  });
+
+  it('never serves a legacy-route narrative as the consultant view synthesis', async () => {
+    const { db } = fixture();
+    const projectId = seedRealisticProject(db);
+    const { provider } = countingProvider(() => ({ markdown: '## Do first\n- Legacy narrative from the old route [CVF-D-001]\n', usage: { inputTokens: 10, outputTokens: 5 } }));
+    await buildConsultantBrief(db, projectId, 'needs-warwick', provider);
+
+    const view = readConsultantView(db, projectId, 'needs-warwick', provider);
+    // The legacy brief exists in the same table and records no skill provenance.
+    expect(db.prepare("SELECT count(*) count FROM consultant_briefs WHERE project_id = ? AND skill_id IS NULL AND provider_id <> 'deterministic-template'").get(projectId)).toEqual({ count: 1 });
+    expect(view.synthesis).toBeNull();
+    expect(view.synthesisState).toBe('none');
+  });
+
+  it('reports a narrative superseded by a new skill version as stale, with a reason', async () => {
+    const { db } = fixture();
+    const projectId = seedRealisticProject(db);
+    const { provider } = countingProvider();
+    await generateConsultantView(db, projectId, 'needs-warwick', provider);
+
+    // The selection is unchanged; the identity is not.
+    db.prepare("UPDATE extraction_skills SET version = '9.9.9' WHERE skill_id = 'consultant-brief'").run();
+
+    const view = readConsultantView(db, projectId, 'needs-warwick', provider);
+    expect(view.synthesisState).toBe('stale');
+    // The panel badges the narrative from these fields. They must agree with the
+    // state, or the same artefact reads "Stale" in one place and "Current" in
+    // another.
+    expect(view.synthesis!.stale).toBe(true);
+    expect(view.synthesis!.staleReason).toMatch(/Consultant Brief revision moved/i);
+  });
+
+  it('caches separately per skill version, not only per model', async () => {
+    const { db, directory } = fixture();
+    const registryDir = path.join(directory, 'registry');
+    mkdirSync(path.join(registryDir, 'consultant-brief'), { recursive: true });
+    process.env.PROJECTMANAGAIR_SKILL_REGISTRY_DIR = registryDir;
+    try {
+      const projectId = seedRealisticProject(db);
+      const first = countingProvider();
+      await generateConsultantView(db, projectId, 'needs-warwick', first.provider);
+      expect(first.calls()).toBe(1);
+
+      // A genuinely different published revision of the same skill. Same
+      // selection, same provider, same model — a different artefact.
+      uploadSkillDraft(db, {
+        text: [
+          '---', 'skillId: consultant-brief', 'name: Consultant Brief', 'version: 1.1.0',
+          'promptTemplateVersion: consultant-brief-prompt-v1', 'status: draft',
+          'purpose: Second revision used by the cache-separation regression test.',
+          'notes: Second revision for the cache-separation regression test.', '---',
+          'Return markdown only. Cite every factual line with a selected register id.',
+        ].join('\n'),
+        actor: 'test',
+      });
+      promoteSkillRevision(db, { skillId: 'consultant-brief', version: '1.1.0', actor: 'test' });
+
+      const second = countingProvider();
+      await generateConsultantView(db, projectId, 'needs-warwick', second.provider);
+      expect(second.calls()).toBe(1);
+      expect(db.prepare('SELECT count(*) count FROM consultant_briefs WHERE project_id = ? AND skill_id IS NOT NULL').get(projectId)).toEqual({ count: 2 });
+      // ...and the earlier narrative is retained, naming the revision that wrote it.
+      expect((db.prepare('SELECT skill_version FROM consultant_briefs WHERE project_id = ? AND skill_id IS NOT NULL ORDER BY skill_version').all(projectId) as Array<{ skill_version: string }>).map((row) => row.skill_version)).toEqual(['1.0.0', '1.1.0']);
+    } finally {
+      delete process.env.PROJECTMANAGAIR_SKILL_REGISTRY_DIR;
+    }
+  });
+
+  it('drops an anchor whose segment id carries no sequence rather than putting it at segment zero', () => {
+    const { db } = fixture();
+    const projectId = seedProject(db);
+    const unrelated = [
+      ['CVF-A-400', 'Book the training room'],
+      ['CVF-A-401', 'Rewrite the data migration script'],
+      ['CVF-A-402', 'Chase the invoice from finance'],
+      ['CVF-A-403', 'Agree the go-live comms plan'],
+      ['CVF-A-404', 'Replace the broken laptop'],
+    ] as const;
+    seedSource(db, projectId, 'SRC-9', [12], () => 'SRC-9/segment/12');
+    for (const [id, title] of unrelated) {
+      seedRow(db, projectId, { register: 'Actions', id, title, summary: `${title}.` });
+      // A segment id shape the parser cannot read. Defaulting it to zero used to
+      // place every one of these at the same point of the same source, and
+      // `shared-source-passage` is a structural edge trusted outright.
+      db.prepare('INSERT INTO register_row_anchors (id, project_id, external_register_id, source_id, segment_id, speaker, t_ms, quote, verified) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 0)')
+        .run(`anchor:${id}`, projectId, id, 'SRC-9', 'SRC-9/segment/12');
+    }
+    rebuildProjection(db, projectId, AS_OF);
+    const { themes, ungroupedIds } = buildProjectThemes(db, projectId);
+    expect(themes).toEqual([]);
+    expect(ungroupedIds.sort()).toEqual(unrelated.map(([id]) => id).sort());
+  });
+
+  it('produces the same selection hash whatever order the anchors were physically inserted', () => {
+    const hashes = ['forward', 'reverse'].map((order) => {
+      const { db } = fixture();
+      const projectId = seedProject(db);
+      seedRow(db, projectId, { register: 'Actions', id: 'CVF-A-500', title: 'Anchored action', summary: 'Two anchors in one source.' });
+      seedSource(db, projectId, 'SRC-1', [3, 11], (seq) => `SRC-1:seg:${String(seq).padStart(5, '0')}`);
+      const anchors = [['a', 3], ['b', 11]] as const;
+      for (const [suffix, seq] of order === 'forward' ? anchors : [...anchors].reverse()) {
+        db.prepare('INSERT INTO register_row_anchors (id, project_id, external_register_id, source_id, segment_id, speaker, t_ms, quote, verified) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 0)')
+          .run(`anchor:${suffix}`, projectId, 'CVF-A-500', 'SRC-1', `SRC-1:seg:${String(seq).padStart(5, '0')}`);
+      }
+      rebuildProjection(db, projectId, AS_OF);
+      return buildDeterministicConsultantView(db, projectId, 'needs-warwick').selectionHash;
+    });
+    // Re-applying a source deletes and re-inserts its anchors, so physical row
+    // order changes for logically identical data. The hash must not.
+    expect(hashes[0]).toBe(hashes[1]);
+  });
+
+  it('does not join two records because a short entity name appears inside longer words', () => {
+    const { db } = fixture();
+    const projectId = seedProject(db);
+    seedRow(db, projectId, { register: 'Actions', id: 'CVF-A-600', title: 'Book the venue for the two workshops', summary: 'Venue booking.' });
+    seedRow(db, projectId, { register: 'Actions', id: 'CVF-A-601', title: 'Order replacement laptops for the site team', summary: 'Hardware order.' });
+    seedRow(db, projectId, { register: 'Entities', id: 'CVF-E-600', title: 'Ops', summary: 'The operations team.' });
+    db.prepare("INSERT INTO register_entities (register_row_id, project_id, external_register_id, entity_name, entity_type, aliases_json, alias_confidence, disambiguation_note) VALUES (?, ?, 'CVF-E-600', 'Ops', 'team', '[]', NULL, NULL)")
+      .run(`register:${projectId}:CVF-E-600`, projectId);
+    rebuildProjection(db, projectId, AS_OF);
+    const { themes } = buildProjectThemes(db, projectId);
+    // "Ops" is a substring of both "workshops" and "laptops" and of nothing else
+    // they share.
+    expect(themes.filter((theme) => theme.memberIds.includes('CVF-A-600') && theme.memberIds.includes('CVF-A-601'))).toEqual([]);
+  });
+
+  it('draws no lexical edge in a project too small for document frequency to mean anything', () => {
+    const { db } = fixture();
+    const projectId = seedProject(db);
+    seedRow(db, projectId, { register: 'Actions', id: 'CVF-A-700', title: 'Customer data system update', summary: 'Customer data system update.' });
+    seedRow(db, projectId, { register: 'Risks_Issues', id: 'CVF-R-700', title: 'Update customer system data', summary: 'Update customer system data.' });
+    rebuildProjection(db, projectId, AS_OF);
+    // With two rows every token is "rare", so the distinctiveness guard measures
+    // nothing and these would group on exactly the vocabulary it exists to ignore.
+    expect(buildProjectThemes(db, projectId).themes).toEqual([]);
+  });
+
+  it('survives a JSON array column stored as an empty string', () => {
+    const { db } = fixture();
+    const projectId = seedRealisticProject(db);
+    db.prepare("UPDATE project_register_rows SET work_package_tags_json = '', related_ids_json = '' WHERE project_id = ?").run(projectId);
+    // A malformed value means "no tags", not "this view cannot be built". The
+    // wider project read has its own JSON parsing in `projectRegisters` and
+    // `registerProjection` that predates this branch and is unchanged; this
+    // asserts only that the theme engine no longer adds a new way for one bad
+    // column to take a route down.
+    expect(() => buildDeterministicConsultantView(db, projectId, 'meeting')).not.toThrow();
+    expect(buildProjectThemes(db, projectId).rows.every((row) => row.workPackages.length === 0)).toBe(true);
   });
 });

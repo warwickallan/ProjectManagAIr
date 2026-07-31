@@ -8,7 +8,7 @@
  * real money.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
@@ -20,6 +20,7 @@ import {
   SKILL_REGISTRY_DIR_ENV,
   compareSkillRevisions,
   ensureSkillRegistrySynced,
+  loadSkillRegistry,
   promoteSkillRevision,
   readExtractionRunProvenance,
   readRunsForSkillVersion,
@@ -420,5 +421,68 @@ describe('registry integrity', () => {
     const catalogueVersion = readSkillCatalogue(db).find((entry) => entry.skillId === DEFAULT_EXTRACTION_SKILL_ID)!.versions.find((version) => version.version === '2.1.0')!;
     expect(catalogueVersion.bodyAvailable).toBe(false);
     expect(catalogueVersion.bodyIssue).toMatch(/rewritten in place/i);
+  });
+});
+
+/* ------------------------------------------------------------------ regressions
+ *
+ * Each case reproduces a defect an adversarial reviewer demonstrated on this
+ * branch. They are written to fail if the fix is reverted.
+ * ---------------------------------------------------------------------------- */
+
+describe('regressions found by adversarial review', () => {
+  it('cannot activate itself by declaring status: active in the uploaded document', () => {
+    const { db, registryDir } = fixture();
+    // `syncSkillRegistry`'s bootstrap reads the FILE's status, not the database
+    // row, and promotes the highest declared-active revision of a skill that has
+    // none. An uploaded document declaring `active` could therefore promote
+    // itself on the next sync — an upload activating something.
+    uploadSkillDraft(db, { text: draftDocument({ skillId: 'brand-new-skill', version: '1.0.0', status: 'active' }), actor: 'Warwick' });
+    const written = readFileSync(path.join(registryDir, 'brand-new-skill', '1.0.0.md'), 'utf8');
+    expect(written).toContain('status: draft');
+    expect(written).not.toContain('status: active');
+
+    syncSkillRegistry(db);
+    const revisions = readSkillRevisions(db, 'brand-new-skill');
+    expect(revisions).toHaveLength(1);
+    expect(revisions[0].status).toBe('draft');
+    expect(readSkillCatalogue(db).find((entry) => entry.skillId === 'brand-new-skill')!.activeVersion).toBeNull();
+  });
+
+  it('rejects a revision naming a prompt template this build does not implement', () => {
+    const { db } = fixture();
+    // `buildStructuredExtractionPrompt` throws on an unknown template version, so
+    // publishing one breaks every extraction with an error that names the
+    // template rather than the publication that caused it.
+    const validation = validateSkillDraft(db, { text: draftDocument({ version: '2.1.0', promptTemplateVersion: 'source-extraction-prompt-v99' }) });
+    expect(validation.ok).toBe(false);
+    expect(validation.errors.join(' ')).toMatch(/not implemented by this build/i);
+    expect(() => uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0', promptTemplateVersion: 'source-extraction-prompt-v99' }), actor: 'Warwick' })).toThrow();
+  });
+
+  it('does not let one machine-wide upload directory leak into a caller that named its own', () => {
+    const shared = temporaryDirectory();
+    const { db } = fixture();
+    uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0' }), actor: 'Warwick', options: { externalDir: null, uploadDir: shared } });
+
+    // A caller that names its directories is asserting exactly which are in
+    // play. Adding a machine-global one behind its back made one database's
+    // upload visible to every other database on the host.
+    const isolated = loadSkillRegistry({ externalDir: null });
+    expect(isolated.some((asset) => asset.version === '2.1.0')).toBe(false);
+    const including = loadSkillRegistry({ externalDir: null, uploadDir: shared });
+    expect(including.some((asset) => asset.version === '2.1.0')).toBe(true);
+  });
+
+  it('refuses to follow a symlink planted at the upload destination', () => {
+    const { db } = fixture();
+    const decoy = temporaryDirectory();
+    const uploadDir = path.join(temporaryDirectory(), 'uploads');
+    mkdirSync(path.join(uploadDir, DEFAULT_EXTRACTION_SKILL_ID), { recursive: true });
+    const target = path.join(decoy, 'redirected.md');
+    symlinkSync(target, path.join(uploadDir, DEFAULT_EXTRACTION_SKILL_ID, '2.1.0.md'));
+
+    expect(() => uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0' }), actor: 'Warwick', options: { externalDir: null, uploadDir } })).toThrow();
+    expect(existsSync(target)).toBe(false);
   });
 });

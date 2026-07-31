@@ -104,7 +104,13 @@ export function preserveProviderOutput(db: DatabaseSync, input: PreserveProvider
   const responseSha256 = sha256(raw);
   const responseBytes = Buffer.byteLength(raw, 'utf8');
   const attemptLabel = input.attemptLabel ?? '';
-  const id = `provider-output:${input.sourceId}:${input.stage}:${String(input.callIndex).padStart(3, '0')}:${responseSha256.slice(0, 16)}`;
+  // The primary key must carry every field the uniqueness rule carries. Omitting
+  // the attempt meant a retry that received byte-identical output collided on the
+  // primary key and threw FROM INSIDE PRESERVATION — losing the completed
+  // response and converting it into a run failure, which is the exact outcome
+  // this module exists to prevent.
+  const attemptKey = attemptLabel ? `${attemptLabel}:` : '';
+  const id = `provider-output:${input.sourceId}:${input.stage}:${attemptKey}${String(input.callIndex).padStart(3, '0')}:${responseSha256.slice(0, 16)}`;
 
   let artefactPath: string | null = null;
   try {
@@ -126,7 +132,10 @@ export function preserveProviderOutput(db: DatabaseSync, input: PreserveProvider
     .get(input.sourceId, input.stage, attemptLabel, input.callIndex, responseSha256) as { id: string } | undefined;
   if (existing) return { id: String(existing.id), responseSha256, responseBytes, artefactPath, duplicate: true };
 
-  db.prepare(`INSERT INTO provider_raw_outputs
+  // `OR IGNORE` plus a re-read: two writers racing on the same response must
+  // both end up pointing at one row rather than one of them throwing. A
+  // preservation that can fail is not preservation.
+  db.prepare(`INSERT OR IGNORE INTO provider_raw_outputs
     (id, source_id, project_id, stage, call_index, attempt_label, provider_id, model_label,
      skill_id, skill_version, skill_sha256, prompt_template_version, prompt_sha256, packet_contract_version,
      window_keys_json, requested_at, received_at, duration_ms, response_sha256, response_bytes, artefact_path,
@@ -138,7 +147,10 @@ export function preserveProviderOutput(db: DatabaseSync, input: PreserveProvider
       responseSha256, responseBytes, artefactPath,
       Math.max(0, Math.floor(input.inputTokens)), Math.max(0, Math.floor(input.outputTokens)),
       input.inputTokenSource ?? 'estimated', input.outputTokenSource ?? 'estimated');
-  return { id, responseSha256, responseBytes, artefactPath, duplicate: false };
+  const stored = db.prepare('SELECT id FROM provider_raw_outputs WHERE source_id = ? AND stage = ? AND attempt_label = ? AND call_index = ? AND response_sha256 = ?')
+    .get(input.sourceId, input.stage, attemptLabel, input.callIndex, responseSha256) as { id: string } | undefined;
+  if (!stored) throw new Error(`Provider output for call ${input.callIndex} of ${input.sourceId} could not be preserved.`);
+  return { id: String(stored.id), responseSha256, responseBytes, artefactPath, duplicate: String(stored.id) !== id };
 }
 
 /**

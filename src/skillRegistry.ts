@@ -391,7 +391,11 @@ export function validateSkillDraft(db: DatabaseSync, input: ValidateSkillDraftIn
 
   const markers = REQUIRED_SKILL_MARKERS[asset.promptTemplateVersion];
   if (!markers) {
-    warnings.push(`Prompt template "${asset.promptTemplateVersion}" has no registered marker contract, so its placeholders could not be checked.`);
+    // Not a warning. `buildStructuredExtractionPrompt` throws on a template
+    // version this build does not implement, so a revision naming an unknown one
+    // is publishable and then breaks every extraction with an error that names
+    // the template rather than the publication that caused it.
+    errors.push(`Prompt template "${asset.promptTemplateVersion}" is not implemented by this build; known templates are ${Object.keys(REQUIRED_SKILL_MARKERS).join(', ')}.`);
   } else {
     const folded = asset.body.toLowerCase();
     const missing = markers.filter((marker) => !folded.includes(marker.toLowerCase()));
@@ -460,9 +464,24 @@ export function uploadSkillDraft(db: DatabaseSync, input: ValidateSkillDraftInpu
     throw new SkillRegistryError(`A revision file already exists at ${file}; published revisions are immutable`);
   }
   mkdirSync(skillDirectory, { recursive: true });
-  // Normalise line endings so the same document uploaded from Windows and from
-  // the API hashes identically; the body hash is the revision's identity.
-  writeFileSync(file, input.text.replace(/^﻿/, '').replace(/\r\n/g, '\n'), 'utf8');
+  // Two things happen to the document before it is written.
+  //
+  // 1. Line endings are normalised, so the same document uploaded from Windows
+  //    and from the API hashes identically. The body hash is the revision's
+  //    identity.
+  // 2. The declared `status` is forced to `draft`. `syncSkillRegistry`'s
+  //    bootstrap reads the FILE's status, not the database row, so a document
+  //    declaring `status: active` could promote itself on the next sync of a
+  //    database that had no active revision for that skill — an upload
+  //    activating something, which this function's entire contract forbids.
+  const normalized = input.text
+    .replace(/^﻿/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/^(\s*status:\s*).*$/m, '$1draft');
+  // `wx` refuses to write if anything already exists at the path, INCLUDING a
+  // symlink, so a link planted at the destination cannot redirect an upload into
+  // the Git-tracked seed directory.
+  writeFileSync(file, normalized, { encoding: 'utf8', flag: 'wx' });
 
   const at = nowIso();
   db.exec('BEGIN IMMEDIATE;');

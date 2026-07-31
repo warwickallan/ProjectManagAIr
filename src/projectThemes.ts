@@ -53,6 +53,17 @@ export const THEME_GENERIC_TOKEN_RATIO = 0.25;
 /** How far apart two anchors may be and still count as the same passage. */
 export const THEME_SEGMENT_RADIUS = 6;
 
+/**
+ * Below this many open rows, document frequency cannot distinguish a project's
+ * generic vocabulary from a theme's, so no lexical edge is drawn at all.
+ */
+export const MIN_ROWS_FOR_LEXICAL_EDGES = 12;
+
+/** Matches a name only at word boundaries, so "Ops" cannot match "workshops". */
+function wordBoundaryRegex(name: string): RegExp {
+  return new RegExp(`(?:^|[^a-z0-9])${name.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:[^a-z0-9]|$)`, 'i');
+}
+
 export type ThemeEdgeKind =
   | 'related-id'
   | 'supersession'
@@ -173,6 +184,25 @@ class UnionFind {
   }
 }
 
+/**
+ * A JSON array column, read defensively.
+ *
+ * `?? '[]'` covers NULL but not the empty string, and a single `''` in one row
+ * would throw out of `readThemeRows` — taking down every project route, because
+ * the deterministic views are on the project payload. A malformed value means
+ * "no tags", not "the project cannot be opened".
+ */
+function jsonStringArray(value: unknown): string[] {
+  const text = value === null || value === undefined ? '' : String(value).trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
 function readThemeRows(db: DatabaseSync, projectId: string): ThemeRow[] {
   const rows = db.prepare(`SELECT r.external_register_id, r.register_name, r.title, r.summary, r.related_ids_json, r.supersession_ids_json, r.work_package_tags_json, r.record_status,
       s.status, s.owner, s.due_date, sc.score, sc.band, sc.inputs_json
@@ -181,11 +211,31 @@ function readThemeRows(db: DatabaseSync, projectId: string): ThemeRow[] {
     JOIN register_row_scores sc ON sc.project_id = r.project_id AND sc.external_register_id = r.external_register_id
     WHERE r.project_id = ? ORDER BY r.external_register_id`).all(projectId) as Array<Record<string, unknown>>;
   const today = db.prepare("SELECT date('now') today").get() as { today: string };
+  // One ordered read instead of one query per row. The explicit ORDER BY is what
+  // makes `anchors[0]` — which reaches the selection hash as a record's evidence
+  // — a property of the data rather than of physical row order, which changes
+  // whenever a source is re-applied.
+  const anchorsByRow = new Map<string, Array<{ sourceId: string; segmentSeq: number }>>();
+  for (const anchor of db.prepare('SELECT external_register_id, source_id, segment_id FROM register_row_anchors WHERE project_id = ? ORDER BY external_register_id, source_id, segment_id, rowid').all(projectId) as Array<Record<string, unknown>>) {
+    const parsed = /:seg:(\d+)$/.exec(String(anchor.segment_id));
+    if (!parsed) continue;
+    const key = String(anchor.external_register_id);
+    anchorsByRow.set(key, [...(anchorsByRow.get(key) ?? []), { sourceId: String(anchor.source_id), segmentSeq: Number(parsed[1]) }]);
+  }
+  // The project's consultant owner, read once. `isProjectConsultantOwner` issues
+  // its own query per call, which made ownership classification an N+1 over every
+  // register row on the project-open path.
+  const consultantOwners = new Map<string, boolean>();
+  const classifyOwner = (owner: string | null): boolean => {
+    const key = owner ?? '';
+    if (!consultantOwners.has(key)) consultantOwners.set(key, isProjectConsultantOwner(db, projectId, owner));
+    return consultantOwners.get(key)!;
+  };
   return rows.map((row) => {
     const inputs = JSON.parse(String(row.inputs_json)) as Record<string, unknown>;
     const owner = row.owner === null || row.owner === undefined ? null : String(row.owner);
     const unowned = isUnownedOwner(owner);
-    const consultantOwned = !unowned && isProjectConsultantOwner(db, projectId, owner);
+    const consultantOwned = !unowned && classifyOwner(owner);
     const dueDate = row.due_date ? String(row.due_date) : null;
     return {
       id: String(row.external_register_id),
@@ -206,12 +256,15 @@ function readThemeRows(db: DatabaseSync, projectId: string): ThemeRow[] {
       unowned,
       overdue: Boolean(dueDate && dueDate < today.today && !CLOSED_STATUS.test(String(row.status))),
       superseded: String(row.record_status) === 'superseded',
-      anchors: (db.prepare('SELECT source_id, segment_id FROM register_row_anchors WHERE project_id = ? AND external_register_id = ?').all(projectId, String(row.external_register_id)) as Array<{ source_id: string; segment_id: string }>)
-        .map((anchor) => ({ sourceId: String(anchor.source_id), segmentSeq: Number(String(anchor.segment_id).split(':seg:')[1] ?? 0) }))
-        .filter((anchor) => Number.isFinite(anchor.segmentSeq)),
-      workPackages: (JSON.parse(String(row.work_package_tags_json ?? '[]')) as unknown[]).map(String).filter(Boolean),
-      relatedIds: (JSON.parse(String(row.related_ids_json ?? '[]')) as unknown[]).map(String).filter(Boolean),
-      supersedesIds: (JSON.parse(String(row.supersession_ids_json ?? '[]')) as unknown[]).map(String).filter(Boolean),
+      // An anchor whose segment id does not carry a parseable sequence is
+      // DROPPED, never defaulted. Defaulting to zero put every such anchor at
+      // the same point of the same source, and `shared-source-passage` is a
+      // structural edge trusted outright — so one malformed id shape swept every
+      // anchored row in a source into a single theme.
+      anchors: anchorsByRow.get(String(row.external_register_id)) ?? [],
+      workPackages: jsonStringArray(row.work_package_tags_json),
+      relatedIds: jsonStringArray(row.related_ids_json),
+      supersedesIds: jsonStringArray(row.supersession_ids_json),
     };
   });
 }
@@ -221,8 +274,11 @@ function readEntityNames(db: DatabaseSync, projectId: string): Array<{ id: strin
   const rows = db.prepare('SELECT external_register_id, entity_name, aliases_json FROM register_entities WHERE project_id = ?').all(projectId) as Array<Record<string, unknown>>;
   return rows.map((row) => ({
     id: String(row.external_register_id),
-    names: [String(row.entity_name), ...((JSON.parse(String(row.aliases_json ?? '[]')) as unknown[]).map(String))]
+    names: [String(row.entity_name), ...jsonStringArray(row.aliases_json)]
       .map((name) => name.trim())
+      // A short name is not a name for matching purposes: "Ops" as a substring
+      // matches "workshops". The word-boundary test below is the real guard;
+      // this is belt and braces.
       .filter((name) => name.length >= 3),
   }));
 }
@@ -293,16 +349,34 @@ export function buildProjectThemes(db: DatabaseSync, projectId: string): Project
   }
 
   for (const entity of readEntityNames(db, projectId)) {
-    const mentions = open.filter((row) => entity.names.some((name) => `${row.title} ${row.summary}`.toLowerCase().includes(name.toLowerCase())));
+    // Whole-word matching, not substring. An unanchored `includes` let the
+    // entity "Ops" join "workshops" to "laptops", and "Data" join three
+    // unrelated rows through "database", "metadata" and "data protection" — the
+    // exact generic-vocabulary grouping the rest of this module refuses to do.
+    const distinctiveName = (name: string) => {
+      const parts = tokens(name);
+      // A name made entirely of vocabulary this project uses everywhere cannot
+      // identify a theme, whatever the entity register calls it.
+      return parts.length > 0 && parts.some(distinctive);
+    };
+    const usable = entity.names.filter(distinctiveName);
+    if (usable.length === 0) continue;
+    const mentions = open.filter((row) => usable.some((name) => wordBoundaryRegex(name).test(`${row.title} ${row.summary}`)));
     // An entity everything mentions is the project's own name, not a theme.
     if (mentions.length < 2 || mentions.length > genericCutoff) continue;
     for (let index = 1; index < mentions.length; index += 1) {
-      link(mentions[0].id, mentions[index].id, 'entity', `Both name ${entity.names[0]}.`);
+      link(mentions[0].id, mentions[index].id, 'entity', `Both name ${usable[0]}.`);
     }
   }
 
   // Lexical similarity last, and only where it is strong AND distinctive.
-  for (let index = 0; index < open.length; index += 1) {
+  //
+  // With fewer than MIN_ROWS_FOR_LEXICAL_EDGES open rows, document frequency
+  // measures nothing: in a two-row project every token appears in at most two
+  // rows, so every token is "distinctive" and two rows about "customer data
+  // system update" group on exactly the vocabulary this module exists to
+  // ignore. Below that floor the grouping is structural only.
+  for (let index = 0; open.length >= MIN_ROWS_FOR_LEXICAL_EDGES && index < open.length; index += 1) {
     for (let next = index + 1; next < open.length; next += 1) {
       const left = tokenSets.get(open[index].id)!;
       const right = tokenSets.get(open[next].id)!;
