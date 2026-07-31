@@ -88,7 +88,12 @@ console.log('');
 console.log(renderFinalizeReport(result));
 
 // 0 completed, 1 partial (safe, retryable), 2 failed before any mutation.
-process.exit(result.state === 'COMPLETED' ? 0 : result.state === 'PARTIAL' ? 1 : 2);
+//
+// `process.exitCode`, not `process.exit()`. PowerShell runs this through a pipe,
+// pipe writes are asynchronous, and `process.exit` discards whatever has not
+// been flushed — which would truncate the very report the operator is told to
+// read. Setting the code lets Node drain stdout and exit on its own.
+process.exitCode = result.state === 'COMPLETED' ? 0 : result.state === 'PARTIAL' ? 1 : 2;
 
 function readUsage(): string {
   return [

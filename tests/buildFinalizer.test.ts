@@ -247,6 +247,15 @@ const remoteSha = (fx: Fixture, branch = 'build/example-v1'): string | null => {
   }
 };
 
+const localSha = (fx: Fixture, branch: string): string | null => {
+  try {
+    const line = git(fx.local, 'show-ref', '--verify', `refs/heads/${branch}`).trim();
+    return line ? line.split(/\s+/)[0] : null;
+  } catch {
+    return null;
+  }
+};
+
 /* ------------------------------------------------------------------ the happy path */
 
 describe('a valid handoff finalises in one action', () => {
@@ -351,14 +360,33 @@ describe('it refuses rather than guessing', () => {
     expect(remoteSha(fx, 'build/unrelated')).toBeNull();
   });
 
+  it('refuses a look-alike host carrying the same owner/repo path', async () => {
+    const fx = fixture();
+    // An internal mirror, a GitLab copy or a look-alike host can all carry the
+    // same `owner/repo`. Pushing there and then opening the pull request against
+    // api.github.com would be two different repositories.
+    git(fx.local, 'config', 'remote.origin.url', `https://github.example-evil.com/${fx.repository}.git`);
+    const manifestPath = writeManifest(fx);
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha));
+
+    expect(result.state).toBe('FAILED');
+    expect(result.errors.join(' ')).toMatch(/on github.example-evil.com/i);
+    expect(remoteSha(fx)).toBeNull();
+  });
+
   it('refuses a repository that is not the one the manifest names', async () => {
     const fx = fixture();
     const manifestPath = writeManifest(fx, { repository: 'someone-else/other-repo' });
     const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha));
 
     expect(result.state).toBe('FAILED');
-    expect(result.errors.join(' ')).toMatch(/manifest is for someone-else\/other-repo but origin resolves to/i);
-    expect(result.steps.some((step) => step.mutated)).toBe(false);
+    expect(result.errors.join(' ')).toMatch(/manifest is for someone-else\/other-repo on github.com but origin resolves to/i);
+    // Assert the world, not the record: no branch anywhere, and the repository
+    // check is the only step that ran after reading the manifest.
+    expect(remoteSha(fx)).toBeNull();
+    expect(localSha(fx, 'build/example-v1')).toBeNull();
+    expect(result.steps.map((step) => step.key)).toEqual(['manifest', 'repository']);
   });
 
   it('fails safely when the repository is mid-merge, and changes nothing', async () => {
@@ -381,7 +409,9 @@ describe('it refuses rather than guessing', () => {
     expect(result.state).toBe('FAILED');
     expect(result.errors.join(' ')).toMatch(/merge is in progress|unmerged paths/i);
     expect(remoteSha(fx)).toBeNull();
-    expect(result.steps.some((step) => step.mutated)).toBe(false);
+    expect(localSha(fx, 'build/example-v1')).toBeNull();
+    // The interrupted merge is still exactly as interrupted as it was.
+    expect(existsSync(path.join(fx.local, '.git', 'MERGE_HEAD'))).toBe(true);
   });
 
   it('proceeds when the only untidiness is modified tracked files, and says so', async () => {
@@ -423,8 +453,10 @@ describe('it refuses rather than guessing', () => {
 
     expect(result.state).toBe('FAILED');
     expect(result.errors.join(' ')).toMatch(/already exists at .*would need a force-push, which this tool never performs/i);
+    // The remote is untouched — which is the assertion that matters, since a
+    // check on the absence of a `push` step would pass even if the engine had
+    // pushed under a different step key.
     expect(remoteSha(fx)).toBe(fx.baselineSha);
-    expect(result.steps.every((step) => step.key !== 'push' || step.status !== 'ok')).toBe(true);
   });
 });
 
@@ -486,9 +518,15 @@ describe('running it again is safe', () => {
     // The pull request drifted to a different head.
     github.created[0].headSha = fx.baselineSha;
 
-    const second = await run(fx, writeManifest(fx, {}, 'second.json'), github);
+    // A different title, so an engine that updated before checking the head
+    // would be caught doing it.
+    const second = await run(fx, writeManifest(fx, { pullRequest: { title: 'A rewritten title', body: 'Body of the pull request.', draft: true } }, 'second.json'), github);
     expect(second.state).toBe('PARTIAL');
     expect(second.errors.join(' ')).toMatch(/its head is .*not/i);
+    // Nothing was written to a pull request that is not this build's.
+    expect(github.updates).toEqual([]);
+    expect(github.created[0].title).toBe('Example build');
+    expect(second.steps.find((step) => step.key === 'pull-request')!.mutated).toBe(false);
   });
 
   it('dry run verifies everything and changes nothing', async () => {
@@ -504,12 +542,90 @@ describe('running it again is safe', () => {
     expect(existsSync(manifestPath)).toBe(true);
     expect(result.steps.filter((step) => step.mutated)).toEqual([]);
     expect(result.steps.find((step) => step.key === 'bundle')!.status).toBe('ok');
+    // The read-only checks are performed for real, not skipped: a dry run that
+    // reports everything skipped has verified nothing.
+    expect(result.steps.find((step) => step.key === 'branch')!.status).toBe('ok');
+    expect(result.steps.find((step) => step.key === 'remote-read')!.status).toBe('ok');
+    // ...and it did not create the local branch it says a real run would.
+    expect(localSha(fx, 'build/example-v1')).toBeNull();
+  });
+
+  it('dry run surfaces a remote branch that would need a force-push, instead of reporting it is fine', async () => {
+    const fx = fixture();
+    git(fx.cloud, 'push', 'origin', `${fx.baselineSha}:refs/heads/build/example-v1`);
+    const manifestPath = writeManifest(fx);
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), null, { dryRun: true });
+
+    expect(result.state).toBe('FAILED');
+    expect(result.errors.join(' ')).toMatch(/would refuse rather than force-push/i);
+    expect(remoteSha(fx)).toBe(fx.baselineSha);
+  });
+
+  it('a dry run never overwrites the record of the real run that came before it', async () => {
+    const fx = fixture();
+    const manifestPath = writeManifest(fx);
+    const real = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha));
+    expect(real.state).toBe('COMPLETED');
+    const record = readFileSync(real.completionManifestPath!, 'utf8');
+
+    const dry = await run(fx, real.manifestPath, new FakeGitHub(() => fx.headSha), null, { dryRun: true });
+    expect(dry.completionManifestPath).toBeNull();
+    // The pull request number, the verified remote SHA and the Drive ids the
+    // real run recorded are still the only completion record on disk.
+    expect(readFileSync(real.completionManifestPath!, 'utf8')).toBe(record);
+    const view = readBuildHandoffs(fx.handoffRoot).handoffs[0];
+    expect(view.lastRun?.state).toBe('COMPLETED');
+    expect(view.lastRun?.pullRequest?.number).toBe(real.pullRequest!.number);
+    expect(view.lastRun?.remoteHeadSha).toBe(fx.headSha);
   });
 });
 
 /* ------------------------------------------------------------------ partial failure */
 
 describe('a failure after the push is recoverable, not destructive', () => {
+  it('does not report FAILED when the push worked and only the read-back failed', async () => {
+    const fx = fixture();
+    const manifestPath = writeManifest(fx);
+    // A git that works until the branch has been pushed, then fails the
+    // verifying `ls-remote`. A dropped connection a second after a successful
+    // push must not be reported as "nothing was changed".
+    const shim = path.join(fx.root, 'git-shim.sh');
+    const counter = path.join(fx.root, 'ls-remote-calls');
+    writeFileSync(shim, [
+      '#!/bin/sh',
+      'for arg in "$@"; do',
+      '  if [ "$arg" = "ls-remote" ]; then',
+      `    printf x >> ${JSON.stringify(counter)}`,
+      `    if [ "$(wc -c < ${JSON.stringify(counter)})" -gt 1 ]; then`,
+      '      echo "fatal: unable to access origin: Could not resolve host" >&2',
+      '      exit 128',
+      '    fi',
+      '  fi',
+      'done',
+      'exec git "$@"',
+    ].join('\n') + '\n', { encoding: 'utf8', mode: 0o755 });
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), null, { gitPath: shim });
+
+    // The branch really is on origin...
+    expect(remoteSha(fx)).toBe(fx.headSha);
+    // ...so this is a retryable PARTIAL, not a FAILED that says nothing happened.
+    expect(result.state).toBe('PARTIAL');
+    expect(result.steps.find((step) => step.key === 'push')!.status).toBe('ok');
+    expect(result.errors.join(' ')).toMatch(/reading origin\/build\/example-v1 back failed/i);
+    expect(result.errors.join(' ')).toMatch(/Run this again/i);
+    // An unconfirmed remote SHA means no pull request is opened against it.
+    expect(result.pullRequest).toBeNull();
+    expect(result.steps.find((step) => step.key === 'pull-request')!.status).toBe('skipped');
+    // The handoff stays pending so pressing Retry finishes it.
+    expect(existsSync(manifestPath)).toBe(true);
+
+    const retried = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha));
+    expect(retried.state).toBe('COMPLETED');
+    expect(retried.remoteHeadSha).toBe(fx.headSha);
+  });
+
   it('leaves the branch safely pushed when GitHub fails, and reports PARTIAL', async () => {
     const fx = fixture();
     const manifestPath = writeManifest(fx);
@@ -666,6 +782,71 @@ describe('the Google Drive mirror', () => {
     expect(remoteSha(fx)).toBe(fx.headSha);
   });
 
+  it('survives a deliverable that cannot be read, and still writes the completion record', async () => {
+    const fx = fixture();
+    // A directory where a file was meant. On Warwick's machine the same shape
+    // is a file locked by another process, or one too large to read. Whatever
+    // the cause, it happens AFTER the push, so throwing here would mean the
+    // branch was pushed and no record of it was ever written.
+    const notAFile = path.join(fx.root, 'output-folder');
+    mkdirSync(notAFile, { recursive: true });
+    const readable = path.join(fx.root, 'Handoff.md');
+    writeFileSync(readable, '# handoff\n', 'utf8');
+    const manifestPath = writeManifest(fx, {
+      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables' },
+      deliverables: [
+        { path: notAFile, classification: 'safe_for_drive', required: true, googleDoc: false },
+        { path: readable, classification: 'safe_for_drive', required: true, googleDoc: false },
+      ],
+    });
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), new FakeDrive());
+
+    expect(result.state).toBe('PARTIAL');
+    expect(result.deliverables[0].uploadStatus).toBe('unreadable');
+    // The failure names the file, so the operator knows which one to fix.
+    expect(result.deliverables[0].error).toContain('output-folder');
+    // The readable one still went, and the record exists on disk.
+    expect(result.deliverables[1].uploadStatus).toBe('uploaded');
+    expect(result.completionManifestPath).not.toBeNull();
+    expect(existsSync(result.completionManifestPath!)).toBe(true);
+    expect(readBuildHandoffs(fx.handoffRoot).handoffs[0].lastRun?.remoteHeadSha).toBe(fx.headSha);
+  });
+
+  it('never lets two deliverables with the same file name collapse into one Drive file', async () => {
+    const fx = fixture();
+    // The build contract's required deliverables plausibly share basenames
+    // across directories. Keyed on the basename alone, the second would
+    // overwrite the first and both would be reported as mirrored.
+    mkdirSync(path.join(fx.root, 'acceptance'), { recursive: true });
+    mkdirSync(path.join(fx.root, 'review'), { recursive: true });
+    writeFileSync(path.join(fx.root, 'acceptance', 'report.md'), 'ACCEPTANCE\n', 'utf8');
+    writeFileSync(path.join(fx.root, 'review', 'report.md'), 'REVIEW\n', 'utf8');
+    const manifestPath = writeManifest(fx, {
+      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables' },
+      deliverables: [
+        { path: path.join(fx.root, 'acceptance', 'report.md'), classification: 'safe_for_drive', required: true, googleDoc: false },
+        { path: path.join(fx.root, 'review', 'report.md'), classification: 'safe_for_drive', required: true, googleDoc: false },
+      ],
+    });
+    const drive = new FakeDrive();
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), drive);
+
+    expect(result.state).toBe('COMPLETED');
+    const ids = result.deliverables.map((entry) => entry.driveFileId);
+    expect(new Set(ids).size).toBe(2);
+    expect(result.deliverables.map((entry) => entry.title)).toEqual(['acceptance — report.md', 'review — report.md']);
+    // Both files are in Drive with their own content; neither overwrote the other.
+    const contents = [...drive.files.values()].filter((file) => file.name.endsWith('report.md')).map((file) => file.content).sort();
+    expect(contents).toEqual(['ACCEPTANCE\n', 'REVIEW\n']);
+
+    // ...and re-finalising the same build updates those same two files.
+    const again = await run(fx, result.manifestPath, new FakeGitHub(() => fx.headSha), drive);
+    expect(again.deliverables.map((entry) => entry.driveFileId)).toEqual(ids);
+    expect([...drive.files.values()].filter((file) => file.name.endsWith('report.md'))).toHaveLength(2);
+  });
+
   it('records a declared deliverable that does not exist rather than silently ignoring it', async () => {
     const fx = fixture();
     const manifestPath = writeManifest(fx, {
@@ -707,7 +888,12 @@ describe('credentials never reach a log or a manifest', () => {
   it('writes no credential into the completion manifest even when git quotes one back', async () => {
     const fx = fixture();
     // A remote whose URL embeds a token, exactly as a failing push would echo it.
-    git(fx.local, 'remote', 'set-url', 'origin', 'https://x-access-token:ghp_SECRETSECRETSECRETSECRET0123456789@github.com/warwickallan/ProjectManagAIr.git');
+    const leaky = `https://x-access-token:ghp_SECRETSECRETSECRETSECRET0123456789@github.com/${fx.repository}.git`;
+    git(fx.local, 'remote', 'set-url', 'origin', leaky);
+    // Rewrite the leaky URL back to the on-disk bare repository too, so this
+    // test never reaches the network: without this it passes only because a
+    // real `ls-remote` against github.com fails.
+    git(fx.local, 'config', `url.${fx.origin}/.insteadOf`, leaky);
     const manifestPath = writeManifest(fx);
 
     const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha));

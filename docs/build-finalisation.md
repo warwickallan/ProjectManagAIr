@@ -32,8 +32,12 @@ the suite.
 
 1. Read and validate the manifest.
 2. Verify the repository — `origin`'s configured URL must resolve to the
-   `owner/repo` the manifest names. (Configured, not `git remote get-url`, which
-   applies `insteadOf` rewriting.)
+   `owner/repo` the manifest names **on the host it names** (`remoteHost`,
+   default `github.com`). Both halves are compared: an internal mirror or a
+   look-alike host can carry the same `owner/repo`, and pushing there while
+   opening the pull request against `api.github.com` would be two different
+   repositories. (Configured URL, not `git remote get-url`, which applies
+   `insteadOf` rewriting.)
 3. Check the working tree is safe — see below.
 4. Verify the bundle: `git bundle verify`, and that it carries the named branch at
    the exact expected SHA.
@@ -106,6 +110,7 @@ Override with `PROJECTMANAGAIR_BUILD_HANDOFF_DIR`.
 {
   "manifestVersion": 1,
   "repository": "owner/repo",
+  "remoteHost": "github.com",                        // optional; origin must be on this host
   "bundlePath": "../source-intelligence-v1.bundle",   // or null when the branch is already on origin
   "branch": "build/example-v1",
   "baseBranch": "main",

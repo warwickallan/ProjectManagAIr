@@ -7,13 +7,14 @@
  *
  * CREDENTIALS
  * -----------
- * Nothing here reads a token from a file this project wrote, and nothing here
- * writes one. GitHub comes from `git credential fill`, which on Windows is the
+ * GitHub comes from `git credential fill`, which on Windows is the
  * Credential Manager entry the operator already signed in to and on macOS and
  * Linux is whichever helper they configured — the same credential `git push`
  * uses, so if push works this works. Google Drive uses a refresh token held in
  * the local runtime directory, outside Git, obtained once through an explicit
- * consent flow the operator starts.
+ * consent flow the operator starts. That refresh token is the only credential
+ * this build ever writes: it is written owner-only, into the runtime directory
+ * that is excluded from Git, by `writeDriveTokenStore` and nowhere else.
  *
  * A token is held in a local `const` for the duration of one call and never
  * logged, never put in an error message, never written to a manifest and never
@@ -22,6 +23,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, openAsBlob, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { DriveConnectionRequiredError, redactSecrets, type DriveFile, type DrivePort, type GitHubPort, type PullRequestRecord } from './buildFinalizer.js';
@@ -235,9 +237,16 @@ export function readDriveTokenStore(file: string): DriveTokenStore | null {
   }
 }
 
+/**
+ * The one place this build writes a credential: a long-lived Google refresh
+ * token, in the local runtime directory, outside Git.
+ *
+ * Written owner-read/write only. That is enforced on POSIX and is advisory on
+ * Windows, where the runtime directory sits under the operator's own profile.
+ */
 export function writeDriveTokenStore(file: string, refreshToken: string): void {
-  mkdirSync(path.dirname(file), { recursive: true });
-  writeFileSync(file, `${JSON.stringify({ refreshToken, obtainedAt: new Date().toISOString() }, null, 2)}\n`, 'utf8');
+  mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  writeFileSync(file, `${JSON.stringify({ refreshToken, obtainedAt: new Date().toISOString() }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
 }
 
 export interface DriveApiOptions {
@@ -423,6 +432,19 @@ export async function beginDriveAuthorization(options: {
   });
   const redirectUri = `http://127.0.0.1:${port}/oauth2/callback`;
 
+  // Loopback is not a security boundary. While this listener is open, any page
+  // the operator happens to visit can scan local ports and hit this callback
+  // with an authorisation code of its own; without these two the exchange would
+  // succeed and the refresh token stored would be the attacker's account, and
+  // every safe_for_drive deliverable would then be mirrored into their Drive.
+  //
+  // `state` binds the callback to the request this process started. PKCE binds
+  // the code to this process's verifier, so a code obtained elsewhere cannot be
+  // redeemed here even if the state leaked.
+  const state = randomBytes(32).toString('base64url');
+  const codeVerifier = randomBytes(64).toString('base64url');
+  const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
+
   const timer = setTimeout(() => {
     server.close();
     rejectCompleted(new Error('The Google authorisation was not completed within the time allowed.'));
@@ -434,6 +456,14 @@ export async function beginDriveAuthorization(options: {
       if (url.pathname !== '/oauth2/callback') { response.statusCode = 404; response.end('Not found'); return; }
       const code = url.searchParams.get('code');
       const error = url.searchParams.get('error');
+      if (url.searchParams.get('state') !== state) {
+        // Answer nothing useful and stay listening: a wrong state is either a
+        // stale tab or something injecting a code, and neither should end the
+        // consent the operator is in the middle of giving.
+        response.statusCode = 400;
+        response.end('Bad request');
+        return;
+      }
       const say = (message: string) => {
         response.setHeader('Content-Type', 'text/html; charset=utf-8');
         response.end(`<!doctype html><meta charset="utf-8"><title>Project ManagAIr</title><body style="font-family:system-ui;padding:40px"><h1>Project ManagAIr</h1><p>${message}</p><p>You can close this tab.</p>`);
@@ -449,6 +479,7 @@ export async function beginDriveAuthorization(options: {
             client_secret: client.clientSecret,
             redirect_uri: redirectUri,
             grant_type: 'authorization_code',
+            code_verifier: codeVerifier,
           }).toString(),
         });
         if (!exchanged.ok) throw new Error(`The Google token exchange failed with HTTP ${exchanged.status}.`);
@@ -476,6 +507,9 @@ export async function beginDriveAuthorization(options: {
     scope: DRIVE_SCOPE,
     access_type: 'offline',
     prompt: 'consent',
+    state,
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
   }).toString()}`;
 
   return { authorizationUrl, port, completed };

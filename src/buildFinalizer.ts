@@ -77,6 +77,12 @@ export const buildHandoffManifestSchema = z.object({
   manifestVersion: z.literal(MANIFEST_VERSION),
   /** `owner/repo`. Checked against the configured `origin` before anything is written. */
   repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'must be owner/repo'),
+  /**
+   * The host `origin` must point at. Defaults to github.com, because that is
+   * where the pull request is afterwards created; a manifest for anywhere else
+   * has to say so, rather than `owner/repo` matching a mirror by accident.
+   */
+  remoteHost: z.string().min(1).optional(),
   /** Absolute or manifest-relative path to a git bundle, when one is needed. */
   bundlePath: z.string().min(1).nullable().default(null),
   branch: z.string().min(1),
@@ -130,7 +136,7 @@ export interface DeliverableResult {
   required: boolean;
   sha256: string | null;
   bytes: number | null;
-  uploadStatus: 'uploaded' | 'updated' | 'unchanged' | 'skipped-classification' | 'missing' | 'failed';
+  uploadStatus: 'uploaded' | 'updated' | 'unchanged' | 'skipped-classification' | 'missing' | 'unreadable' | 'not-attempted' | 'failed';
   driveFileId: string | null;
   driveUrl: string | null;
   googleDocId: string | null;
@@ -468,20 +474,43 @@ export async function assessWorktree(git: GitRunner, repoRoot: string, targetBra
  * Repository identity
  * ------------------------------------------------------------------------------------ */
 
-/** `owner/repo` from any of the URL shapes git remotes actually use. */
-export function repositoryFromRemoteUrl(url: string): string | null {
-  const trimmed = (url ?? '').trim().replace(/\.git$/, '');
-  const patterns = [
-    /^https?:\/\/[^/]+\/([^/]+\/[^/]+)$/,
-    /^ssh:\/\/[^/]+\/([^/]+\/[^/]+)$/,
-    /^[^@]+@[^:]+:([^/]+\/[^/]+)$/,
-    /^file:\/\/.*\/([^/]+\/[^/]+)$/,
+/** The host a remote URL points at, and the `owner/repo` beneath it. */
+export interface RemoteIdentity {
+  /** Lower-cased hostname, or `(local)` for a `file://` remote. */
+  host: string;
+  repository: string;
+}
+
+/**
+ * `owner/repo` and the host it lives on, from the URL shapes git remotes use.
+ *
+ * The host matters. `owner/repo` alone is not an identity: an internal mirror, a
+ * GitLab copy or a look-alike host can carry the same path, and the pull request
+ * is afterwards created against `api.github.com/repos/<that path>` — a different
+ * repository from the one just pushed to. Both halves are compared.
+ */
+export function remoteIdentityFromUrl(url: string): RemoteIdentity | null {
+  const trimmed = (url ?? '').trim().replace(/\.git$/, '').replace(/\/+$/, '');
+  const patterns: Array<{ pattern: RegExp; host: number | null; repository: number }> = [
+    { pattern: /^https?:\/\/(?:[^/@]*@)?([^/:]+)(?::\d+)?\/([^/]+\/[^/]+)$/, host: 1, repository: 2 },
+    { pattern: /^ssh:\/\/(?:[^/@]*@)?([^/:]+)(?::\d+)?\/([^/]+\/[^/]+)$/, host: 1, repository: 2 },
+    { pattern: /^[^@/]+@([^:/]+):([^/]+\/[^/]+)$/, host: 1, repository: 2 },
+    { pattern: /^file:\/\/.*\/([^/]+\/[^/]+)$/, host: null, repository: 1 },
   ];
-  for (const pattern of patterns) {
+  for (const { pattern, host, repository } of patterns) {
     const match = trimmed.match(pattern);
-    if (match) return match[1];
+    if (match) return { host: host === null ? LOCAL_REMOTE_HOST : match[host].toLowerCase(), repository: match[repository] };
   }
   return null;
+}
+
+/** The host recorded for a `file://` remote, which is what the test fixtures use. */
+export const LOCAL_REMOTE_HOST = '(local)';
+export const DEFAULT_REMOTE_HOST = 'github.com';
+
+/** `owner/repo` alone, kept for callers that only need the path. */
+export function repositoryFromRemoteUrl(url: string): string | null {
+  return remoteIdentityFromUrl(url)?.repository ?? null;
 }
 
 /* ------------------------------------------------------------------------------------ *
@@ -539,6 +568,17 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
   const errors: string[] = [];
   const git = gitIn(options.repoRoot, { gitPath: options.gitPath });
 
+  /**
+   * Failures that leave a correct, pushed branch behind and are retryable by
+   * running again. Anything else is a hard failure that changed nothing.
+   *
+   * `remote-verify` joins this list once the push has actually succeeded: a
+   * transient `ls-remote` failure a second after a successful push must not be
+   * reported as "FAILED — nothing was changed", which is the opposite of what
+   * happened.
+   */
+  const SOFT_FAILURE_KEYS: string[] = ['pull-request', 'drive'];
+
   const record = (step: FinalizeStep) => {
     const redacted = { ...step, detail: redactSecrets(step.detail) };
     steps.push(redacted);
@@ -589,18 +629,19 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     record({ key: 'repository', title: 'Verify the repository', status: 'failed', detail: `No 'origin' remote is configured in ${options.repoRoot}.`, mutated: false });
     return finish(result, options, now);
   }
-  const actualRepository = repositoryFromRemoteUrl(remoteUrl.stdout);
-  if (actualRepository !== manifest.repository) {
+  const identity = remoteIdentityFromUrl(remoteUrl.stdout);
+  const expectedHost = (manifest.remoteHost ?? DEFAULT_REMOTE_HOST).toLowerCase();
+  if (identity?.repository !== manifest.repository || identity.host !== expectedHost) {
     record({
       key: 'repository',
       title: 'Verify the repository',
       status: 'failed',
-      detail: `This manifest is for ${manifest.repository} but origin resolves to ${actualRepository ?? remoteUrl.stdout.trim()}. Refusing to act on a different repository.`,
+      detail: `This manifest is for ${manifest.repository} on ${expectedHost} but origin resolves to ${identity ? `${identity.repository} on ${identity.host}` : remoteUrl.stdout.trim()}. Refusing to act on a different repository.`,
       mutated: false,
     });
     return finish(result, options, now);
   }
-  record({ key: 'repository', title: 'Verify the repository', status: 'ok', detail: `origin is ${actualRepository}.`, mutated: false });
+  record({ key: 'repository', title: 'Verify the repository', status: 'ok', detail: `origin is ${identity.repository} on ${identity.host}.`, mutated: false });
 
   /* ----------------------------------------------------------------- worktree */
 
@@ -634,6 +675,10 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
       return finish(result, options, now);
     }
     const heads = await git(['bundle', 'list-heads', bundlePath]);
+    if (heads.code !== 0) {
+      record({ key: 'bundle', title: 'Verify the bundle', status: 'failed', detail: `git bundle list-heads failed, so what the bundle carries is unknown: ${heads.stderr.trim() || heads.stdout.trim()}`, mutated: false });
+      return finish(result, options, now);
+    }
     const offered = heads.stdout.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
       const [sha, ref] = line.split(/\s+/, 2);
       return { sha, ref };
@@ -677,13 +722,35 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     // strongest statement that can honestly be made without mutating anything.
     record({ key: 'commit', title: 'Verify the expected commit exists', status: 'skipped', detail: 'Dry run: the verified bundle carries this commit and would supply it.', mutated: false });
     record({ key: 'ancestry', title: 'Verify the declared baseline', status: 'skipped', detail: 'Dry run: the commit was not fetched, so its ancestry cannot be checked without mutating the repository.', mutated: false });
-    record({ key: 'branch', title: 'Create or confirm the local branch', status: 'skipped', detail: 'Dry run: the branch was not created.', mutated: false });
-    record({ key: 'remote-read', title: 'Read the remote branch', status: 'skipped', detail: 'Dry run: the remote was not consulted for a branch that was not fetched.', mutated: false });
+
+    // The two refusals a dry run exists to surface are both read-only, so they
+    // are performed for real rather than skipped. Without these the dry run
+    // reported "everything looks fine" while checking almost nothing.
+    const dryBranch = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${manifest.branch}`]);
+    const dryBranchSha = dryBranch.code === 0 ? dryBranch.stdout.trim() : null;
+    if (dryBranchSha && dryBranchSha !== manifest.expectedHeadSha) {
+      record({ key: 'branch', title: 'Create or confirm the local branch', status: 'failed', detail: `A local branch ${manifest.branch} already exists at ${dryBranchSha}, which is not the expected ${manifest.expectedHeadSha}. A real run would refuse rather than move it.`, mutated: false });
+    } else {
+      record({ key: 'branch', title: 'Create or confirm the local branch', status: 'ok', detail: dryBranchSha ? 'The branch already points at the expected SHA.' : 'No local branch of that name exists; a real run would create one. Dry run: not created.', mutated: false });
+    }
+
+    const dryRemote = await git(['ls-remote', 'origin', `refs/heads/${manifest.branch}`], { timeoutMs: 120_000 });
+    if (dryRemote.code !== 0) {
+      record({ key: 'remote-read', title: 'Read the remote branch', status: 'failed', detail: `git ls-remote failed: ${dryRemote.stderr.trim() || dryRemote.stdout.trim()}`, mutated: false });
+    } else {
+      const dryRemoteSha = dryRemote.stdout.trim() ? dryRemote.stdout.trim().split(/\s+/)[0] : null;
+      if (dryRemoteSha && dryRemoteSha !== manifest.expectedHeadSha) {
+        record({ key: 'remote-read', title: 'Read the remote branch', status: 'failed', detail: `origin/${manifest.branch} already exists at ${dryRemoteSha}, which is not the expected ${manifest.expectedHeadSha}. A real run would refuse rather than force-push.`, mutated: false });
+      } else {
+        record({ key: 'remote-read', title: 'Read the remote branch', status: 'ok', detail: dryRemoteSha ? 'The remote branch already points at the expected SHA.' : 'The remote branch does not exist yet.', mutated: false });
+      }
+    }
+
     record({ key: 'push', title: 'Push to origin', status: 'skipped', detail: 'Dry run: nothing was pushed.', mutated: false });
     record({ key: 'remote-verify', title: 'Verify the remote SHA', status: 'skipped', detail: 'Dry run: nothing was pushed, so there is nothing to verify.', mutated: false });
     record({ key: 'pull-request', title: 'Open or update the draft pull request', status: 'skipped', detail: 'Dry run: no pull request was created or updated.', mutated: false });
     record({ key: 'drive', title: 'Mirror deliverables to Google Drive', status: 'skipped', detail: 'Dry run: nothing was uploaded.', mutated: false });
-    result.state = 'PARTIAL';
+    result.state = steps.some((step) => step.status === 'failed') ? 'FAILED' : 'PARTIAL';
     errors.push('Dry run: no mutation was performed, so the result is reported as PARTIAL by definition.');
     return finish(result, options, now, manifest);
   }
@@ -738,7 +805,15 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     }
     record({ key: 'branch', title: 'Create or confirm the local branch', status: 'ok', detail: `Created ${manifest.branch} at the expected SHA. No file was checked out.`, mutated: true });
   }
-  result.localHeadSha = options.dryRun && !existingSha ? null : (await git(['rev-parse', `refs/heads/${manifest.branch}`])).stdout.trim() || null;
+  if (options.dryRun && !existingSha) {
+    result.localHeadSha = null;
+  } else {
+    // `git rev-parse` echoes its argument to stdout when it cannot resolve it,
+    // so an unchecked exit code here writes the literal string
+    // `refs/heads/<branch>` into the completion manifest as a SHA.
+    const resolved = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${manifest.branch}`]);
+    result.localHeadSha = resolved.code === 0 && /^[0-9a-f]{40}$/.test(resolved.stdout.trim()) ? resolved.stdout.trim() : null;
+  }
 
   /* -------------------------------------------------------------- remote head */
 
@@ -780,6 +855,8 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     }
     record({ key: 'push', title: 'Push to origin', status: 'ok', detail: `Pushed ${manifest.branch} with upstream tracking.`, mutated: true });
   }
+  const pushed = steps.some((step) => step.key === 'push' && step.status === 'ok') || remoteShaBefore === manifest.expectedHeadSha;
+  if (pushed) SOFT_FAILURE_KEYS.push('remote-verify');
 
   /* ----------------------------------------------------------- verify remote */
 
@@ -790,13 +867,17 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     const remoteShaAfter = remoteAfter.code === 0 && remoteAfter.stdout.trim() ? remoteAfter.stdout.trim().split(/\s+/)[0] : null;
     result.remoteHeadSha = remoteShaAfter;
     if (remoteShaAfter !== manifest.expectedHeadSha) {
-      record({
-        key: 'remote-verify',
-        title: 'Verify the remote SHA',
-        status: 'failed',
-        detail: `After pushing, origin/${manifest.branch} reads ${remoteShaAfter ?? 'nothing'} but should read ${manifest.expectedHeadSha}.`,
-        mutated: false,
-      });
+      // A failed read and a wrong answer are different things, and saying which
+      // is the difference between "run it again" and "stop and look".
+      const detail = remoteAfter.code !== 0
+        ? `The push ${pushed ? 'succeeded' : 'was not needed'}, but reading origin/${manifest.branch} back failed: ${remoteAfter.stderr.trim() || remoteAfter.stdout.trim() || `git ls-remote exited ${remoteAfter.code}`}. The remote SHA is therefore unconfirmed. Run this again to re-read it; nothing was undone.`
+        : `After pushing, origin/${manifest.branch} reads ${remoteShaAfter ?? 'nothing'} but should read ${manifest.expectedHeadSha}.`;
+      record({ key: 'remote-verify', title: 'Verify the remote SHA', status: 'failed', detail, mutated: false });
+      // Unverified means no pull request: a PR must never be opened against a
+      // head this tool has not proved is on origin.
+      record({ key: 'pull-request', title: 'Open or update the draft pull request', status: 'skipped', detail: 'Skipped: the remote SHA was not confirmed, so no pull request was opened or updated.', mutated: false });
+      record({ key: 'drive', title: 'Mirror deliverables to Google Drive', status: 'skipped', detail: 'Skipped: the remote SHA was not confirmed.', mutated: false });
+      result.state = pushed ? 'PARTIAL' : 'FAILED';
       return finish(result, options, now);
     }
     record({ key: 'remote-verify', title: 'Verify the remote SHA', status: 'ok', detail: `origin/${manifest.branch} is ${remoteShaAfter}, confirmed by ls-remote.`, mutated: false });
@@ -815,14 +896,11 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     try {
       const existing = await options.github.findPullRequest({ repository: manifest.repository, branch: manifest.branch, baseBranch: manifest.baseBranch });
       if (existing) {
-        // Never a second pull request for the same head. Where the title or body
-        // has moved on, the existing one is updated in place.
-        const needsUpdate = existing.title !== manifest.pullRequest.title || existing.body !== prBody;
-        const current = needsUpdate
-          ? await options.github.updatePullRequest({ repository: manifest.repository, number: existing.number, title: manifest.pullRequest.title, body: prBody })
-          : existing;
-        result.pullRequest = { number: current.number, url: current.url, draft: current.draft, headSha: current.headSha, created: false };
-        if (current.headSha && current.headSha !== manifest.expectedHeadSha) {
+        // The head check comes FIRST. A pull request whose head is not the SHA
+        // this manifest describes is not this build's pull request, and its
+        // title and body must not be rewritten before discovering that.
+        if (existing.headSha && existing.headSha !== manifest.expectedHeadSha) {
+          result.pullRequest = { number: existing.number, url: existing.url, draft: existing.draft, headSha: existing.headSha, created: false };
           // Recorded and carried into the verdict rather than returned from
           // here: the branch is pushed and verified, so this is a PARTIAL to
           // retry, not a FAILED that suggests nothing happened.
@@ -830,17 +908,24 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
             key: 'pull-request',
             title: 'Open or update the draft pull request',
             status: 'failed',
-            detail: `Pull request #${current.number} exists for ${manifest.branch} but its head is ${current.headSha}, not ${manifest.expectedHeadSha}. Nothing was changed on it.`,
-            mutated: needsUpdate,
+            detail: `Pull request #${existing.number} exists for ${manifest.branch} but its head is ${existing.headSha}, not ${manifest.expectedHeadSha}. Nothing was changed on it.`,
+            mutated: false,
           });
         } else {
-        record({
-          key: 'pull-request',
-          title: 'Open or update the draft pull request',
-          status: 'ok',
-          detail: `${needsUpdate ? 'Updated' : 'Confirmed'} existing pull request #${current.number} — ${current.url}`,
-          mutated: needsUpdate,
-        });
+          // Never a second pull request for the same head. Where the title or
+          // body has moved on, the existing one is updated in place.
+          const needsUpdate = existing.title !== manifest.pullRequest.title || existing.body !== prBody;
+          const current = needsUpdate
+            ? await options.github.updatePullRequest({ repository: manifest.repository, number: existing.number, title: manifest.pullRequest.title, body: prBody })
+            : existing;
+          result.pullRequest = { number: current.number, url: current.url, draft: current.draft, headSha: current.headSha, created: false };
+          record({
+            key: 'pull-request',
+            title: 'Open or update the draft pull request',
+            status: 'ok',
+            detail: `${needsUpdate ? 'Updated' : 'Confirmed'} existing pull request #${current.number} — ${current.url}`,
+            mutated: needsUpdate,
+          });
         }
       } else {
         const created = await options.github.createPullRequest({
@@ -869,12 +954,20 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
 
   /* ------------------------------------------------------------------- drive */
 
-  await mirrorDeliverables(manifest, options, result, record, now);
+  try {
+    await mirrorDeliverables(manifest, options, result, record, now);
+  } catch (error) {
+    // Nothing in the Drive half may destroy the record of the Git half. This is
+    // the last line of defence behind the per-deliverable guards above.
+    const message = redactSecrets(error instanceof Error ? error.message : String(error));
+    result.drive.error = message;
+    record({ key: 'drive', title: 'Mirror deliverables to Google Drive', status: 'failed', detail: `The Drive mirror failed unexpectedly: ${message} The branch is pushed and verified on origin; re-run to retry only the mirror.`, mutated: false });
+  }
 
   /* ------------------------------------------------------------------ verdict */
 
-  const gitFailed = steps.some((step) => step.status === 'failed' && !['pull-request', 'drive'].includes(step.key));
-  const softFailed = steps.some((step) => step.status === 'failed' && ['pull-request', 'drive'].includes(step.key));
+  const gitFailed = steps.some((step) => step.status === 'failed' && !SOFT_FAILURE_KEYS.includes(step.key));
+  const softFailed = steps.some((step) => step.status === 'failed' && SOFT_FAILURE_KEYS.includes(step.key));
   result.state = gitFailed ? 'FAILED' : softFailed ? 'PARTIAL' : options.dryRun ? 'PARTIAL' : 'COMPLETED';
   if (options.dryRun) errors.push('Dry run: no mutation was performed, so the result is reported as PARTIAL by definition.');
   result.finishedAt = now().toISOString();
@@ -897,26 +990,46 @@ async function mirrorDeliverables(
   // uploaded, so a reader can see what was withheld and why.
   const declared = manifest.deliverables.map((entry): DeliverableResult => {
     const absolute = resolveRelative(options.manifestPath, entry.path);
-    const present = existsSync(absolute);
-    return {
+    const base: DeliverableResult = {
       path: absolute,
       title: entry.title ?? path.basename(absolute),
       classification: entry.classification,
       required: entry.required,
-      sha256: present ? sha256File(absolute) : null,
-      bytes: present ? statSync(absolute).size : null,
-      uploadStatus: !present ? 'missing' : entry.classification === 'safe_for_drive' ? 'failed' : 'skipped-classification',
+      sha256: null,
+      bytes: null,
+      // Not `failed`: nothing has been attempted yet. A manifest that declares no
+      // Drive destination must not leave a COMPLETED run carrying deliverables
+      // marked failed, which is what the previous initial value produced.
+      uploadStatus: 'not-attempted',
       driveFileId: null,
       driveUrl: null,
       googleDocId: null,
       googleDocUrl: null,
       uploadedAt: null,
-      error: present ? null : 'The file named by the manifest does not exist.',
+      error: null,
     };
+    if (!existsSync(absolute)) {
+      return { ...base, uploadStatus: 'missing', error: 'The file named by the manifest does not exist.' };
+    }
+    // Hashing is I/O and can fail for reasons that have nothing to do with the
+    // build: a directory named where a file was meant, a file locked by another
+    // Windows process, a file too large to read into memory. None of those may
+    // be allowed to throw out of here — the branch is already pushed by this
+    // point and an exception would mean no completion manifest is ever written.
+    try {
+      const stat = statSync(absolute);
+      if (!stat.isFile()) {
+        return { ...base, uploadStatus: 'unreadable', error: `${absolute} is not a regular file, so it cannot be hashed or uploaded.` };
+      }
+      return { ...base, sha256: sha256File(absolute), bytes: stat.size, uploadStatus: entry.classification === 'safe_for_drive' ? 'not-attempted' : 'skipped-classification' };
+    } catch (error) {
+      return { ...base, uploadStatus: 'unreadable', error: `${absolute} could not be read: ${redactSecrets(error instanceof Error ? error.message : String(error))}` };
+    }
   });
+  disambiguateTitles(declared);
   result.deliverables = declared;
 
-  const safe = declared.filter((entry) => entry.classification === 'safe_for_drive' && entry.uploadStatus !== 'missing');
+  const safe = declared.filter((entry) => entry.classification === 'safe_for_drive' && !['missing', 'unreadable'].includes(entry.uploadStatus));
   result.drive.requiredCount = declared.filter((entry) => entry.required && entry.classification === 'safe_for_drive').length;
 
   if (!manifest.drive) {
@@ -1019,12 +1132,45 @@ async function mirrorDeliverables(
       key: 'drive',
       title: 'Mirror deliverables to Google Drive',
       status: 'ok',
-      detail: `${result.drive.uploadedCount} deliverable(s) in ${result.drive.folderUrl}. ${declared.length - safe.length} withheld by classification.`,
+      detail: `${result.drive.uploadedCount} deliverable(s) in ${result.drive.folderUrl}. ${declared.filter((entry) => entry.uploadStatus === 'skipped-classification').length} withheld by classification, ${declared.filter((entry) => ['missing', 'unreadable'].includes(entry.uploadStatus)).length} unreadable or absent.`,
       mutated,
     });
   } catch (error) {
     result.drive.error = redactSecrets(error instanceof Error ? error.message : String(error));
     record({ key: 'drive', title: 'Mirror deliverables to Google Drive', status: 'failed', detail: result.drive.error, mutated: false });
+  }
+}
+
+/**
+ * Make every deliverable title unique within the build folder.
+ *
+ * The Drive file identity is the title inside the build folder, so two
+ * deliverables in different directories that share a basename — `reports/
+ * acceptance.md` and `review/acceptance.md`, which the build contract's required
+ * list makes entirely likely — would otherwise resolve to one Drive file, the
+ * second silently overwriting the first while both were reported as mirrored.
+ *
+ * The rename is derived from the declared path alone, so it is the same on every
+ * run and re-finalising the same build still updates the same file rather than
+ * creating a second one.
+ */
+function disambiguateTitles(declared: DeliverableResult[]): void {
+  const counts = new Map<string, number>();
+  for (const entry of declared) counts.set(entry.title, (counts.get(entry.title) ?? 0) + 1);
+  const used = new Set<string>();
+  for (const entry of declared) {
+    if ((counts.get(entry.title) ?? 0) > 1) {
+      const parent = path.basename(path.dirname(entry.path));
+      entry.title = parent ? `${parent} — ${entry.title}` : entry.title;
+    }
+    if (used.has(entry.title)) {
+      // Still colliding: fall back to a stable digest of the full path rather
+      // than letting two entries share a Drive file.
+      const suffix = createHash('sha256').update(entry.path).digest('hex').slice(0, 8);
+      const extension = path.extname(entry.title);
+      entry.title = `${entry.title.slice(0, entry.title.length - extension.length)} (${suffix})${extension}`;
+    }
+    used.add(entry.title);
   }
 }
 
@@ -1047,6 +1193,12 @@ async function ensureFolder(drive: DrivePort, parentId: string, name: string): P
  */
 function finish(result: FinalizeResult, options: FinalizeOptions, now: () => Date, manifest?: BuildHandoffManifest): FinalizeResult {
   result.finishedAt = now().toISOString();
+  // A dry run writes nothing. It used to write the completion manifest like any
+  // other run, which meant pressing "Dry run" on a card overwrote the durable
+  // record of the real finalisation that came before it — the Drive file ids,
+  // the pull request number and the verified remote SHA all disappeared from the
+  // only artefact that held them.
+  if (options.dryRun) return result;
   const locations = handoffLocations(options.handoffRoot);
   const completionName = `${path.basename(options.manifestPath, '.json')}${COMPLETION_SUFFIX}`;
   const completionDirectory = result.state === 'COMPLETED' ? locations.completed : locations.pending;
