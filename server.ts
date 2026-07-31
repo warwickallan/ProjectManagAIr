@@ -10,7 +10,7 @@ import { authStatus, markMessageRead, moveMessageToDeletedItems, pollDeviceCode,
 import { probeAIProviders, sendChatMessage } from './src/aiProvider.js';
 import { compareBlindExtractionToBenchmark } from './src/blindExtractionComparison.js';
 import { importProjectRegisterBenchmark } from './src/projectRegisters.js';
-import { recordRegisterEvent } from './src/registerProjection.js';
+import { recordRegisterEvent, validateOccurredAt } from './src/registerProjection.js';
 import { acknowledgeChangeset, applyReviewedChangeset, buildConsultantBrief, freezePacketAndCreateChangeset, pinOverviewMode, readSourceIntelligence, replayPacket, reviewChangeset } from './src/sourceIntelligence.js';
 import { createLifecycleSourceEnqueuer, retrySourceJob, runSourceExtractionJob, skipSourceAfterComprehension, startSourceJobSweeper, WatchedInboxScanner } from './src/sourcePipeline.js';
 import { createLocalOriginGuard } from './src/httpSecurity.js';
@@ -229,7 +229,18 @@ app.post('/api/projects/:projectId/packets/:packetId/replay', asyncRoute(async (
 app.post('/api/projects/:projectId/register-rows/:externalRegisterId/events', asyncRoute(async (request, response) => {
   const body = request.body as { actor?: string; eventType?: string; field?: string | null; newValue?: string | null; reason?: string; evidenceRef?: string | null; occurredAt?: string };
   if (!body.eventType || !body.reason) { response.status(400).json({ error: 'eventType and reason are required.' }); return; }
-  response.status(201).json(recordRegisterEvent(db(), String(request.params.projectId), String(request.params.externalRegisterId), { actor: String(body.actor ?? 'current-user'), eventType: body.eventType, field: body.field, newValue: body.newValue, reason: body.reason, evidenceRef: body.evidenceRef, occurredAt: body.occurredAt }));
+  // N8 — `occurred_at` decides event replay order and human precedence, and
+  // `register_row_events` is append-only: a future or implausibly old timestamp
+  // accepted here can never be corrected afterwards, only added to. Refuse it
+  // with a reason rather than clamping it silently. Omitting it keeps the
+  // existing behaviour of stamping the server's own clock.
+  let occurredAt: string | undefined;
+  if (body.occurredAt !== undefined && body.occurredAt !== null) {
+    const checked = validateOccurredAt(body.occurredAt, new Date().toISOString());
+    if (!checked.ok) { response.status(400).json({ error: checked.error }); return; }
+    occurredAt = checked.occurredAt;
+  }
+  response.status(201).json(recordRegisterEvent(db(), String(request.params.projectId), String(request.params.externalRegisterId), { actor: String(body.actor ?? 'current-user'), eventType: body.eventType, field: body.field, newValue: body.newValue, reason: body.reason, evidenceRef: body.evidenceRef, occurredAt }));
 }));
 app.post('/api/projects/:projectId/sources/:sourceId/retry', asyncRoute(async (request, response) => {
   const result = await retrySourceJob(db(), { sourceId: String(request.params.sourceId), provider: structuredExtractionProvider });

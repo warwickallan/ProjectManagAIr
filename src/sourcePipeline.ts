@@ -731,22 +731,41 @@ function insertRun(db: DatabaseSync, input: {
   return id;
 }
 
+/**
+ * Recompute per-register coverage from the rows that actually reached the packet.
+ *
+ * `lostByRegister` is what makes this honest. When rows were excluded — an
+ * unknown key, a conflicting duplicate reference — the surviving count no longer
+ * describes the source, and the packet must not say "no items were found" about
+ * a register whose items we dropped. That sentence would be sealed under
+ * `packet_sha256` as a false statement about the transcript, and it would
+ * satisfy the `category-explanation` gate with fabricated text.
+ */
 function aggregateCategoryCoverage(
   rows: Array<{ registerName: SourceIntelligenceCategory; row: SourcePacketRow }>,
   entries: ExtractionCoverage[],
+  lostByRegister: Map<string, number> = new Map(),
 ): ExtractionCoverage[] {
   return SOURCE_INTELLIGENCE_CATEGORIES.map((category) => {
     const categoryEntries = entries.filter((entry) => entry.key === category);
     const itemCount = rows.filter((row) => row.registerName === category).length;
+    const lost = lostByRegister.get(category) ?? 0;
     const statuses = new Set(categoryEntries.map((entry) => entry.status));
     let status: CoverageStatus;
     if (statuses.has('failed') || categoryEntries.length === 0) status = 'failed';
+    // Rows were dropped here, so this register's coverage is genuinely uncertain
+    // whatever the provider reported about it.
+    else if (lost > 0) status = 'uncertain';
     else if (statuses.has('uncertain')) status = 'uncertain';
     else if (itemCount > 0) status = 'populated';
     else if ([...statuses].every((value) => value === 'no-governance-content')) status = 'no-governance-content';
     else status = 'none-found';
     const explanations = categoryEntries.map((entry) => entry.explanation).filter((value): value is string => Boolean(value));
-    const explanation = explanations.length > 0 ? [...new Set(explanations)].join(' ') : itemCount === 0 ? `No ${category} items were found in the reviewed source windows.` : null;
+    const lossNote = lost > 0 ? `${lost} proposed ${category} row${lost === 1 ? '' : 's'} did not satisfy the row contract and were excluded; this register's coverage is incomplete.` : null;
+    const provided = explanations.length > 0 ? [...new Set(explanations)].join(' ') : null;
+    const explanation = lossNote
+      ? [provided, lossNote].filter(Boolean).join(' ')
+      : provided ?? (itemCount === 0 ? `No ${category} items were found in the reviewed source windows.` : null);
     return { key: category, status, itemCount, explanation };
   });
 }
@@ -1053,8 +1072,11 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
     if (existing && existing.serialized !== serialized) conflictingRefs.add(entry.row.client_ref);
     else if (!existing) rowsByRef.set(entry.row.client_ref, { ...entry, serialized });
   }
+  const conflictRegisters = new Map<string, string>();
+  for (const entry of outputs.flatMap((output) => output.rows)) if (conflictingRefs.has(entry.row.client_ref)) conflictRegisters.set(entry.row.client_ref, entry.registerName);
   const mergeConflicts = [...conflictingRefs].sort().map((clientRef) => ({
     clientRef,
+    registerName: conflictRegisters.get(clientRef) ?? null,
     reason: 'Overlapping extraction calls proposed different content for the same client_ref; every variant was excluded because neither can be preferred without a human decision.',
   }));
   for (const clientRef of conflictingRefs) rowsByRef.delete(clientRef);
@@ -1070,7 +1092,18 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
     if (skippedReason) windowCoverageByKey.set(String(window.seq), { key: String(window.seq), status: 'no-governance-content', itemCount: 0, explanation: skippedReason });
     if (!windowCoverageByKey.has(String(window.seq))) windowCoverageByKey.set(String(window.seq), { key: String(window.seq), status: 'failed', itemCount: 0, explanation: 'Provider omitted explicit coverage for this window.' });
   }
-  const categoryCoverage = aggregateCategoryCoverage(rows, outputs.flatMap((output) => output.categoryCoverage));
+  // Rows the provider emitted that failed row-level validation were dropped, not
+  // repaired. They are counted and reported so the loss is visible rather than
+  // being mistaken for a source that simply said less.
+  const rejectedRows = outputs.flatMap((output) => output.rejectedRows ?? []);
+  // Which registers lost rows, so coverage cannot describe them as empty.
+  const lostByRegister = new Map<string, number>();
+  for (const entry of rejectedRows) if (entry.registerName) lostByRegister.set(entry.registerName, (lostByRegister.get(entry.registerName) ?? 0) + 1);
+  for (const conflict of mergeConflicts) {
+    const register = conflict.registerName ?? null;
+    if (register) lostByRegister.set(register, (lostByRegister.get(register) ?? 0) + 1);
+  }
+  const categoryCoverage = aggregateCategoryCoverage(rows, outputs.flatMap((output) => output.categoryCoverage), lostByRegister);
   const sheets = Object.fromEntries(SOURCE_INTELLIGENCE_CATEGORIES.map((category) => [category, { rows: rows.filter((entry) => entry.registerName === category).map((entry) => entry.row) }])) as SourceIntelligencePacket['sheets'];
   const packet: SourceIntelligencePacket = {
     packet_type: 'project_register_delta',
@@ -1102,10 +1135,6 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
   // quarantine and the only survivable answer was to discharge everything.
   // Model dismissals are recorded as PROPOSALS, clearly attributed, and the
   // validator caps how much of the checklist may be answered this way.
-  // Rows the provider emitted that failed row-level validation were dropped, not
-  // repaired. They are counted and reported so the loss is visible rather than
-  // being mistaken for a source that simply said less.
-  const rejectedRows = outputs.flatMap((output) => output.rejectedRows ?? []);
   const proposedDismissals = outputs.flatMap((output) => output.markerDismissals ?? []);
   if (proposedDismissals.length > 0) {
     dismissSourceMarkers(db, source.id, proposedDismissals.map((dismissal) => ({
@@ -1274,7 +1303,13 @@ export async function runSourceExtractionJob(db: DatabaseSync, options: SourceJo
     } catch (error) {
       const failure = classifySourceFailure(error);
       releaseSourceJobLease(db, jobId);
-      const willRetry = failure.retryable && claim.attemptCount < claim.maxAttempts;
+      // Never re-run an extraction that already spent completed provider calls.
+      // Automatic retry is for a pass that produced nothing; once the model has
+      // answered, a second full multi-call pass costs the same again, doubles the
+      // token spend against a budget measured per job, and does it without the
+      // operator's consent. Those failures go to the quarantine lane instead.
+      const spentCalls = Number((db.prepare("SELECT count(*) count FROM extraction_runs WHERE source_id = ? AND status = 'completed'").get(source.id) as { count: number } | undefined)?.count ?? 0);
+      const willRetry = failure.retryable && claim.attemptCount < claim.maxAttempts && spentCalls === 0;
       const recoveryAction = recoveryActionFor(failure, {
         providerId: options.provider?.identity.providerId,
         attemptCount: claim.attemptCount,

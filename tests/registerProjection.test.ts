@@ -11,10 +11,13 @@ import {
   decisionStatus,
   isUnownedOwner,
   milestoneStatus,
+  OCCURRED_AT_FLOOR,
+  OCCURRED_AT_FUTURE_TOLERANCE_MS,
   readActiveScoringConfig,
   rebuildProjection,
   recordRegisterEvent,
   SCORING_VERSION,
+  validateOccurredAt,
 } from '../src/registerProjection';
 import { importProjectRegisterBenchmark, recomputeRegisterFieldParity } from '../src/projectRegisters';
 
@@ -445,6 +448,94 @@ describe('scoring configuration (C18)', () => {
       db.prepare("UPDATE scoring_config SET active = 0").run();
       db.prepare("UPDATE scoring_config SET active = 1, weights_json = '{\"register\":{}}' WHERE version = (SELECT version FROM scoring_config ORDER BY version DESC LIMIT 1)").run();
       expect(() => rebuildProjection(db, projectId, AS_OF)).toThrow(/is unusable/);
+    } finally {
+      context.close();
+    }
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * N8 — a client-supplied `occurred_at` is a one-way latch.
+ *
+ * `register_row_events` is trigger-enforced append-only, and `occurred_at`
+ * decides both the replay order and human precedence (`occurred_at > instant`).
+ * An event dated in the year 2999 therefore wins the replay for ever, sets
+ * `last_human_event_at` to that instant, and converts every future extracted
+ * update to that field into a permanent `conflict` that nothing can correct,
+ * only add to. An implausibly old timestamp is the same latch pointing the
+ * other way: it sorts below every real event and silently disables human
+ * precedence for that field.
+ * ------------------------------------------------------------------------- */
+
+describe('client-supplied occurredAt (N8)', () => {
+  const NOW = '2026-07-30T09:00:00.000Z';
+
+  it('refuses a future instant rather than clamping it', () => {
+    const far = validateOccurredAt('2999-01-01T00:00:00.000Z', NOW);
+    expect(far.ok).toBe(false);
+    expect(far.ok === false && far.error).toMatch(/in the future/);
+    // The reason has to be legible to the caller that sent it.
+    expect(far.ok === false && far.error).toMatch(/append-only/);
+
+    const justOver = new Date(new Date(NOW).valueOf() + OCCURRED_AT_FUTURE_TOLERANCE_MS + 1000).toISOString();
+    expect(validateOccurredAt(justOver, NOW).ok).toBe(false);
+  });
+
+  it('tolerates ordinary clock skew, because a desktop clock is not authoritative', () => {
+    const withinSkew = new Date(new Date(NOW).valueOf() + OCCURRED_AT_FUTURE_TOLERANCE_MS - 1000).toISOString();
+    expect(validateOccurredAt(withinSkew, NOW)).toEqual({ ok: true, occurredAt: withinSkew });
+    expect(validateOccurredAt(NOW, NOW)).toEqual({ ok: true, occurredAt: NOW });
+    expect(validateOccurredAt('2026-07-30T08:59:59.000Z', NOW)).toEqual({ ok: true, occurredAt: '2026-07-30T08:59:59.000Z' });
+  });
+
+  it('refuses an implausibly old instant, which is the same latch pointing backwards', () => {
+    const ancient = validateOccurredAt('1970-01-01T00:00:00.000Z', NOW);
+    expect(ancient.ok).toBe(false);
+    expect(ancient.ok === false && ancient.error).toMatch(new RegExp(`before ${OCCURRED_AT_FLOOR}`));
+    expect(validateOccurredAt('1999-12-31T23:59:59.999Z', NOW).ok).toBe(false);
+    expect(validateOccurredAt(OCCURRED_AT_FLOOR, NOW).ok).toBe(true);
+  });
+
+  it('refuses anything that is not a well-formed ISO-8601 instant', () => {
+    for (const value of ['', 'yesterday', '2026-07-30', '30/07/2026', '2026-07-30T09:00:00', '2026-13-01T00:00:00Z', '2026-02-31T00:00:00Z', 'NaN', null, undefined, 42, {}, ['2026-07-30T09:00:00.000Z']]) {
+      expect(validateOccurredAt(value, NOW).ok, `${JSON.stringify(value)} must be rejected`).toBe(false);
+    }
+  });
+
+  it('canonicalises an accepted instant to UTC, because precedence compares strings', () => {
+    // `'2026-07-30T08:00:00+02:00' > '2026-07-30T07:00:00.000Z'` is TRUE as a
+    // string comparison and false as an instant comparison, which is exactly
+    // the kind of silent precedence inversion the projector cannot survive.
+    expect(validateOccurredAt('2026-07-30T08:00:00+02:00', NOW)).toEqual({ ok: true, occurredAt: '2026-07-30T06:00:00.000Z' });
+    expect(validateOccurredAt('2026-07-30T09:00:00Z', NOW)).toEqual({ ok: true, occurredAt: '2026-07-30T09:00:00.000Z' });
+  });
+
+  it('is wired into the register-event route, which rejects with 400 instead of recording', () => {
+    // The domain function must stay permissive: replay of historic events, and
+    // the tests that record events dated after the current source, both depend
+    // on it. The validation therefore belongs at the boundary that accepts
+    // client input, and this asserts it is actually applied there.
+    const source = readFileSync(path.resolve('server.ts'), 'utf8');
+    const route = source.slice(source.indexOf("'/api/projects/:projectId/register-rows/:externalRegisterId/events'"));
+    const handler = route.slice(0, route.indexOf('app.post(', 1));
+    expect(handler).toMatch(/validateOccurredAt\(body\.occurredAt, new Date\(\)\.toISOString\(\)\)/);
+    expect(handler).toMatch(/response\.status\(400\)/);
+    // The validated value, not the raw body value, is what reaches the domain.
+    expect(handler).toMatch(/occurredAt = checked\.occurredAt/);
+    expect(handler).toMatch(/recordRegisterEvent\(db\(\), [^;]*occurredAt \}\)\)/);
+    expect(handler).not.toMatch(/occurredAt: body\.occurredAt/);
+  });
+
+  it('still stamps the server clock when the caller supplies no instant', () => {
+    const context = tempDb();
+    try {
+      const db = context.db;
+      const projectId = seedProject(db);
+      seedRegisterRow(db, projectId, { register: 'Actions', id: 'SYN-A-001' });
+      const before = new Date().toISOString();
+      const result = recordRegisterEvent(db, projectId, 'SYN-A-001', { actor: 'Casey Flint', eventType: 'note', reason: 'No timestamp supplied.' });
+      expect(result.occurredAt >= before).toBe(true);
+      expect(result.occurredAt <= new Date().toISOString()).toBe(true);
     } finally {
       context.close();
     }

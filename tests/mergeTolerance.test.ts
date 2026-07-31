@@ -59,7 +59,7 @@ describe('provider response tolerance is lossy, recorded and bounded', () => {
       expect(frozen).not.toContain('"client_ref":"shared-ref"');
       expect(frozen).toContain('"client_ref":"Actions-');
       // ...and its exclusion is recorded, not silent.
-      expect(result.mergeConflicts).toEqual([{ clientRef: 'shared-ref', reason: expect.stringContaining('neither can be preferred') }]);
+      expect(result.mergeConflicts).toEqual([{ clientRef: 'shared-ref', registerName: 'Actions', reason: expect.stringContaining('neither can be preferred') }]);
       const report = JSON.parse(String((f.db.prepare('SELECT validation_report_json FROM extraction_packets').get() as { validation_report_json: string }).validation_report_json)) as { issues: Array<{ rule: string; message: string }>; providerAnomalies: unknown[] };
       expect(report.issues.some((issue) => issue.rule === 'provider-merge-conflict' && issue.message.includes('shared-ref'))).toBe(true);
       expect(report.providerAnomalies).not.toHaveLength(0);

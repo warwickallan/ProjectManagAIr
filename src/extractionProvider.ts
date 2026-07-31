@@ -983,7 +983,11 @@ function formatIssues(error: z.ZodError): string {
  * written to the local artefacts directory, because the content is source-derived.
  */
 function captureRawOutput(context: OutputParseContext, raw: string): void {
-  const directory = process.env.PROJECTMANAGAIR_PROVIDER_OUTPUT_DIR;
+  // Capture is on by default. A merge or gate failure after several successful
+  // calls otherwise discards every one of them irrecoverably — which is exactly
+  // what destroyed a twenty-five-minute acceptance run, because the payload
+  // lives only in memory and `extraction_runs` stores nothing but its hash.
+  const directory = process.env.PROJECTMANAGAIR_PROVIDER_OUTPUT_DIR ?? DEFAULT_PROVIDER_OUTPUT_DIR;
   if (!directory) return;
   try {
     mkdirSync(directory, { recursive: true });
@@ -999,6 +1003,9 @@ function captureRawOutput(context: OutputParseContext, raw: string): void {
  * treated as malformed.
  */
 export const MAX_REJECTED_ROW_RATIO = 0.1;
+
+/** Where raw provider responses are kept when no explicit directory is configured. */
+export const DEFAULT_PROVIDER_OUTPUT_DIR = pathJoin(process.cwd(), 'artifacts', 'provider-output');
 
 /**
  * Validate rows individually so one malformed row does not discard a whole

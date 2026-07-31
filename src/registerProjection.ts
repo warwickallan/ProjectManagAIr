@@ -283,17 +283,62 @@ export function needsConsultantAttention(db: DatabaseSync, projectId: string, ow
   return isUnownedOwner(owner) || isProjectConsultantOwner(db, projectId, owner);
 }
 
+/* -------------------------------------------------------------------------- *
+ * N2 — the typed-detail tables, and which of their columns a human may correct.
+ *
+ * Every register that carries typed detail has exactly one detail table keyed by
+ * `project_register_rows.id`. The map is the single place that association is
+ * written down; `readTypedDetails` and the human-correction replay below both
+ * read it, so the two can never disagree about where a field lives.
+ * -------------------------------------------------------------------------- */
+
+const detailTableFor: Record<RegisterName, string | null> = {
+  Decisions: 'register_decision_details',
+  Actions: null,
+  Risks_Issues: 'register_risk_issue_details',
+  Config_Changes: 'register_config_change_details',
+  Open_Questions: 'register_open_question_details',
+  Milestones: 'register_milestone_details',
+  Entities: 'register_entities',
+  Sources: null,
+  Uncertainty: 'register_uncertainty',
+};
+
+/** Columns that identify the row rather than describe it. Never correctable. */
+const DETAIL_IDENTITY_COLUMNS = new Set(['register_row_id', 'project_id', 'external_register_id']);
+
+interface DetailColumn { name: string; integer: boolean; notNull: boolean }
+
+const detailColumnCache = new Map<string, Map<string, DetailColumn>>();
+
+/**
+ * The correctable columns of one detail table, discovered from the schema
+ * rather than restated here, so a migration that adds a typed field makes that
+ * field correctable without a second edit that someone can forget.
+ *
+ * `*_json` columns are excluded: they hold structured values (`aliases_json`)
+ * that a single `new_value` string cannot express unambiguously, and quietly
+ * accepting a string for them would recreate the very failure this fixes.
+ */
+function detailColumns(db: DatabaseSync, table: string): Map<string, DetailColumn> {
+  const cached = detailColumnCache.get(table);
+  if (cached) return cached;
+  const columns = new Map<string, DetailColumn>();
+  for (const info of db.prepare(`PRAGMA table_info(${table})`).all() as Array<Record<string, unknown>>) {
+    const name = String(info.name);
+    if (DETAIL_IDENTITY_COLUMNS.has(name) || name.endsWith('_json')) continue;
+    columns.set(name, { name, integer: String(info.type ?? '').toUpperCase().includes('INT'), notNull: Number(info.notnull ?? 0) === 1 });
+  }
+  // An empty result means the table is not present in this database yet; do not
+  // cache that, or the first read would poison every later one.
+  if (columns.size > 0) detailColumnCache.set(table, columns);
+  return columns;
+}
+
 export function readTypedDetails(db: DatabaseSync, registerName: string, rowId: string): JsonObject {
-  const query = registerName === 'Decisions' ? 'SELECT * FROM register_decision_details WHERE register_row_id = ?'
-    : registerName === 'Risks_Issues' ? 'SELECT * FROM register_risk_issue_details WHERE register_row_id = ?'
-      : registerName === 'Config_Changes' ? 'SELECT * FROM register_config_change_details WHERE register_row_id = ?'
-        : registerName === 'Open_Questions' ? 'SELECT * FROM register_open_question_details WHERE register_row_id = ?'
-          : registerName === 'Milestones' ? 'SELECT * FROM register_milestone_details WHERE register_row_id = ?'
-            : registerName === 'Entities' ? 'SELECT * FROM register_entities WHERE register_row_id = ?'
-              : registerName === 'Uncertainty' ? 'SELECT * FROM register_uncertainty WHERE register_row_id = ?'
-                : null;
-  if (!query) return {};
-  const source = db.prepare(query).get(rowId) as JsonObject | undefined;
+  const table = detailTableFor[registerName as RegisterName] ?? null;
+  if (!table) return {};
+  const source = db.prepare(`SELECT * FROM ${table} WHERE register_row_id = ?`).get(rowId) as JsonObject | undefined;
   if (!source) return {};
   const result: JsonObject = {};
   for (const [key, value] of Object.entries(source)) {
@@ -325,6 +370,100 @@ export function readTypedDetails(db: DatabaseSync, registerName: string, rowId: 
  */
 const EVENT_ORDER = 'ORDER BY occurred_at, rowid';
 
+/* -------------------------------------------------------------------------- *
+ * N2 — human corrections outside the four state fields.
+ *
+ * `register_row_state` materialises exactly four fields, so `stateFor` used to
+ * apply an event only when `Object.hasOwn(state, field)` held. Every other
+ * correction — `severity`, `mitigation`, `title` — was written to the
+ * append-only event log and then discarded: the projection, the typed detail
+ * tables, the operational tables and the score all continued to show the
+ * extracted value. It was worse than inert, because `contestedFields` in
+ * `sourceIntelligence.ts` DOES consider typed-detail keys, so the invisible
+ * event permanently converted every later extracted update to that field into a
+ * `conflict`. The human's edit did nothing except block the machine.
+ *
+ * The fix keeps the four state fields behaving exactly as they did and adds two
+ * further classes of correctable field, replayed from the same event log in the
+ * same deterministic order:
+ *
+ *   - `title` and `summary`, which the design lists under "Any: correct a field
+ *     (with reason)" and which are rendered on every surface in the product;
+ *   - every scalar column of the row's typed detail table, which is where
+ *     "change severity / likelihood" and the rest of §8.3 actually live.
+ *
+ * Corrections are materialised, not merely overlaid, for the same reason
+ * `register_row_state` is materialised: readers all over the codebase
+ * (`readRegisterState`, `briefContext`, the lenses) go straight to the detail
+ * tables and the operational tables, and an overlay applied in only one of them
+ * would leave the correction invisible in the others. Materialisation is
+ * idempotent because an event carries an absolute value, never a delta: writing
+ * it over a value already equal to it is a no-op, so a rebuild at a fixed as-of
+ * instant is byte-identical however many times it runs.
+ *
+ * What is NOT rewritten is `raw_row_json` / `project_register_row_fields`: that
+ * is the verbatim record of what the source asserted, it is the `before` side of
+ * every field diff, and it is the baseline the workbook parity comparison reads.
+ * The extracted value therefore stays recoverable after a correction, alongside
+ * `previous_value` on the event itself.
+ * -------------------------------------------------------------------------- */
+
+/** The four fields `register_row_state` materialises as columns. */
+const STATE_FIELDS = ['status', 'owner', 'due_date', 'resolution'] as const;
+
+/** Fields on the register row itself that a human may correct. */
+const ROW_CORRECTABLE_FIELDS = ['title', 'summary'] as const;
+
+/**
+ * Every field a human event may name for this register, in a stable order.
+ * A field outside this set cannot be projected anywhere, so `recordRegisterEvent`
+ * refuses it rather than recording an event that would be silently discarded.
+ */
+export function correctableFields(db: DatabaseSync, registerName: string): string[] {
+  const table = detailTableFor[registerName as RegisterName] ?? null;
+  const detail = table ? [...detailColumns(db, table).keys()] : [];
+  return [...new Set([...STATE_FIELDS, ...ROW_CORRECTABLE_FIELDS, ...detail])].sort(compareCodeUnits);
+}
+
+/** The value a correction should store for one detail column, or `undefined` when it cannot hold one. */
+function coerceDetailValue(column: DetailColumn, value: string | null): string | number | null | undefined {
+  // A NOT NULL column cannot be cleared. Refusing here rather than throwing at
+  // the database keeps a replay of historic events from failing outright.
+  if (value === null) return column.notNull ? undefined : null;
+  return column.integer ? (truthy(value) ? 1 : 0) : value;
+}
+
+/**
+ * Applies the human corrections that target this row's typed detail table:
+ * writes them through to the table and returns the corrected detail object the
+ * scorer and the operational projection then use.
+ */
+function correctedDetails(db: DatabaseSync, register: RegisterName, registerRowId: string, detail: JsonObject, corrections: Map<string, string | null>): JsonObject {
+  const table = detailTableFor[register];
+  if (!table || corrections.size === 0) return detail;
+  const columns = detailColumns(db, table);
+  const stored = Boolean(db.prepare(`SELECT 1 FROM ${table} WHERE register_row_id = ?`).get(registerRowId));
+  const result: JsonObject = { ...detail };
+  for (const [field, value] of corrections) {
+    const column = columns.get(field);
+    if (!column) continue;
+    const next = coerceDetailValue(column, value);
+    if (next === undefined) continue;
+    result[field] = next;
+    // With no detail row to write into, the correction still reaches the score
+    // and the operational tables through `result`; there is simply no typed row
+    // to materialise it in.
+    if (stored) db.prepare(`UPDATE ${table} SET ${column.name} = ? WHERE register_row_id = ?`).run(next, registerRowId);
+  }
+  return result;
+}
+
+/** The corrected value of a row-level field, or `null` when no correction is in force. */
+function correctedRowField(corrections: Map<string, string | null>, field: string): string | null {
+  const value = corrections.get(field);
+  return value === undefined || value === null ? null : text(value) || null;
+}
+
 function stateFor(db: DatabaseSync, projectId: string, row: Record<string, unknown>) {
   const state: Record<string, string | null> = {
     status: String(row.record_status),
@@ -332,12 +471,16 @@ function stateFor(db: DatabaseSync, projectId: string, row: Record<string, unkno
     due_date: row.due_date ? String(row.due_date) : null,
     resolution: null,
   };
+  // Every field event that is not one of the four state fields, last write wins,
+  // in the same deterministic event order.
+  const corrections = new Map<string, string | null>();
   const events = db.prepare(`SELECT * FROM register_row_events WHERE project_id = ? AND external_register_id = ? ${EVENT_ORDER}`).all(projectId, String(row.external_register_id)) as Array<Record<string, unknown>>;
   for (const event of events) {
     const field = event.field ? String(event.field) : null;
-    if (field && Object.hasOwn(state, field)) {
+    if (field) {
       const next = event.new_value === null ? null : String(event.new_value);
-      state[field] = field === 'owner' ? ownerOrNull(next) : next;
+      if (Object.hasOwn(state, field)) state[field] = field === 'owner' ? ownerOrNull(next) : next;
+      else corrections.set(field, next);
     }
     const eventType = String(event.event_type);
     if (['complete', 'close', 'resolve', 'ratify', 'reject', 'park', 'reopen'].includes(eventType)) {
@@ -348,7 +491,7 @@ function stateFor(db: DatabaseSync, projectId: string, row: Record<string, unkno
               : eventType === 'complete' ? 'completed' : 'resolved';
     }
   }
-  return { state, events };
+  return { state, corrections, events };
 }
 
 function scoreRow(db: DatabaseSync, projectId: string, row: Record<string, unknown>, detail: JsonObject, state: Record<string, string | null>, events: Array<Record<string, unknown>>, timestamp: string, config: ScoringConfig) {
@@ -553,12 +696,14 @@ function assertNotForeignRow(db: DatabaseSync, table: string, projectId: string,
   }
 }
 
-function insertOperational(db: DatabaseSync, projectId: string, register: RegisterName, id: string, raw: JsonObject, detail: JsonObject, state: Record<string, string | null>, score: { score: number; band: string }, timestamp: string) {
+function insertOperational(db: DatabaseSync, projectId: string, register: RegisterName, id: string, raw: JsonObject, detail: JsonObject, state: Record<string, string | null>, corrections: Map<string, string | null>, score: { score: number; band: string }, timestamp: string) {
   const table = operationalTableFor[register];
   if (!table) return null;
   assertNotForeignRow(db, table, projectId, id);
-  const title = text(rawValue(raw, ['title', 'decision', 'action', 'risk_issue', 'risk', 'issue', 'question', 'milestone', 'entity', 'source', 'uncertainty', 'name', 'summary', 'description', 'change', 'item', 'filename'])) || id;
-  const summary = text(rawValue(raw, ['summary', 'description', 'rationale', 'driver', 'mitigation', 'question', 'why_uncertain', 'notes', 'implications', 'item'])) || title;
+  // A human correction to `title`/`summary` outranks the extracted wording on
+  // every operational surface, exactly as a correction to `owner` does.
+  const title = correctedRowField(corrections, 'title') ?? (text(rawValue(raw, ['title', 'decision', 'action', 'risk_issue', 'risk', 'issue', 'question', 'milestone', 'entity', 'source', 'uncertainty', 'name', 'summary', 'description', 'change', 'item', 'filename'])) || id);
+  const summary = correctedRowField(corrections, 'summary') ?? (text(rawValue(raw, ['summary', 'description', 'rationale', 'driver', 'mitigation', 'question', 'why_uncertain', 'notes', 'implications', 'item'])) || title);
   const owner = state.owner ?? ownerOrNull(rawValue(raw, ['owner', 'assigned_to', 'lead', 'parked_with', 'decider', 'committed_by', 'made_by']));
   const storedOwner = owner ?? UNASSIGNED_OWNER;
   const status = state.status ?? 'open';
@@ -645,15 +790,19 @@ export function rebuildProjection(db: DatabaseSync, projectId: string, timestamp
     const register = String(row.register_name) as RegisterName;
     const id = String(row.external_register_id);
     const raw = JSON.parse(String(row.raw_row_json)) as JsonObject;
-    const detail = readTypedDetails(db, register, String(row.id));
-    const { state, events } = stateFor(db, projectId, row);
+    const { state, corrections, events } = stateFor(db, projectId, row);
+    // Replayed before scoring, so a corrected `severity` reaches the score and
+    // the band rather than only the display layer (N2).
+    const detail = correctedDetails(db, register, String(row.id), readTypedDetails(db, register, String(row.id)), corrections);
     const source = row.source_id ? db.prepare('SELECT event_date FROM source_documents WHERE id = ?').get(String(row.source_id)) as { event_date: string | null } | undefined : undefined;
     const rawDue = text(rawDueValue(register, raw));
     const resolved = resolveDate(rawDue, source?.event_date ?? null);
     if (!events.some((event) => event.field === 'due_date')) state.due_date = resolved.date;
-    db.prepare('UPDATE project_register_rows SET due_date = ?, due_date_raw = ?, due_date_confidence = ? WHERE id = ?').run(resolved.date, rawDue || null, resolved.confidence, String(row.id));
+    const correctedTitle = correctedRowField(corrections, 'title');
+    const correctedSummary = correctedRowField(corrections, 'summary');
+    db.prepare('UPDATE project_register_rows SET due_date = ?, due_date_raw = ?, due_date_confidence = ?, title = COALESCE(?, title), summary = COALESCE(?, summary) WHERE id = ?').run(resolved.date, rawDue || null, resolved.confidence, correctedTitle, correctedSummary, String(row.id));
     const score = scoreRow(db, projectId, row, detail, state, events, timestamp, config);
-    const projected = insertOperational(db, projectId, register, id, raw, detail, state, score, timestamp);
+    const projected = insertOperational(db, projectId, register, id, raw, detail, state, corrections, score, timestamp);
     const inputs = projected?.unrecognisedStatus ? { ...score.inputs, unrecognisedStatus: projected.unrecognisedStatus } : score.inputs;
     db.prepare('INSERT INTO register_row_state (project_id, external_register_id, register_name, status, owner, due_date, resolution, last_human_event_at, last_source_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(projectId, id, register, state.status, state.owner, state.due_date, state.resolution, events.at(-1)?.occurred_at ? String(events.at(-1)?.occurred_at) : null, row.last_updated_source_id ? String(row.last_updated_source_id) : row.source_id ? String(row.source_id) : null, timestamp);
@@ -664,12 +813,117 @@ export function rebuildProjection(db: DatabaseSync, projectId: string, timestamp
   return { projectId, rowCount: rows.length, scoringVersion: config.version, projectorVersion: PROJECTOR_VERSION };
 }
 
+/* -------------------------------------------------------------------------- *
+ * N8 — `occurred_at` is client-supplied, and `register_row_events` is
+ * trigger-enforced append-only.
+ *
+ * An event dated in the future wins the replay for ever, sets
+ * `last_human_event_at` to that instant, and — because human precedence
+ * compares `occurred_at > instant` — converts every later extracted update to
+ * that field into a permanent `conflict`. Nothing can correct it afterwards,
+ * because nothing in that table can be updated or deleted, only added to.
+ *
+ * So the timestamp is validated at the boundary that accepts it, and a bad one
+ * is refused with a reason rather than clamped: a caller whose clock or
+ * serialisation is wrong needs to find out.
+ *
+ * This function takes `now` as an argument rather than reading a clock, because
+ * this module has exactly one clock read by design (C5) and because a validator
+ * that cannot be pinned to an instant cannot be tested deterministically.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * How far ahead of the receiving server's clock a supplied instant may sit.
+ *
+ * Five minutes: comfortably larger than the drift of an unsynchronised desktop
+ * or a VM resumed from suspend, comfortably smaller than any interval over
+ * which "in the future" could be mistaken for a genuine record of the past.
+ */
+export const OCCURRED_AT_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
+
+/**
+ * The earliest instant that can plausibly describe a human acting on a register
+ * row in this product. Anything older is a parsing accident — a Unix epoch zero,
+ * a two-digit year, a millisecond value read as seconds — and it is a one-way
+ * latch in the other direction: it sorts below every real event for ever and
+ * silently disables human precedence for that field.
+ */
+export const OCCURRED_AT_FLOOR = '2000-01-01T00:00:00.000Z';
+
+/** ISO-8601 instant with an explicit UTC designator or numeric offset. */
+const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(?:[Zz]|([+-])(\d{2}):?(\d{2}))$/;
+
+/**
+ * True when the civil date and time written down actually exist.
+ *
+ * `new Date('2026-02-31T00:00:00Z')` does not throw in V8, it silently rolls
+ * over to 3 March. Accepting that would record an instant the caller never
+ * sent, which is exactly the class of silent rewrite this validation exists to
+ * prevent, so the components are checked before the string is parsed.
+ */
+function isRealCivilInstant(parts: RegExpExecArray): boolean {
+  const [, year, month, day, hour, minute, second, , offsetHour, offsetMinute] = parts;
+  const monthNumber = Number(month);
+  if (monthNumber < 1 || monthNumber > 12) return false;
+  const daysInMonth = new Date(Date.UTC(Number(year), monthNumber, 0)).getUTCDate();
+  if (Number(day) < 1 || Number(day) > daysInMonth) return false;
+  if (Number(hour) > 23 || Number(minute) > 59 || Number(second ?? 0) > 59) return false;
+  if (offsetHour !== undefined && (Number(offsetHour) > 23 || Number(offsetMinute) > 59)) return false;
+  return true;
+}
+
+export type OccurredAtCheck = { ok: true; occurredAt: string } | { ok: false; error: string };
+
+/**
+ * Validates a client-supplied `occurredAt` against `now` and canonicalises it to
+ * UTC. Canonicalisation is not clamping: it preserves the instant exactly, and
+ * it matters because every precedence comparison on `occurred_at` is a string
+ * comparison, under which `2026-07-30T23:00:00+02:00` sorts after an instant it
+ * actually precedes.
+ */
+export function validateOccurredAt(value: unknown, now: string): OccurredAtCheck {
+  const parts = typeof value === 'string' ? ISO_INSTANT.exec(value.trim()) : null;
+  if (!parts || !isRealCivilInstant(parts)) {
+    return { ok: false, error: 'occurredAt must be an ISO-8601 instant with an explicit UTC designator or offset, for example 2026-07-30T09:00:00.000Z.' };
+  }
+  const instant = new Date(parts[0]);
+  const instantMs = instant.valueOf();
+  if (!Number.isFinite(instantMs)) return { ok: false, error: `occurredAt "${parts[0]}" is not a real instant.` };
+  const nowMs = new Date(now).valueOf();
+  if (!Number.isFinite(nowMs)) throw new Error('validateOccurredAt requires a valid reference instant.');
+  if (instantMs > nowMs + OCCURRED_AT_FUTURE_TOLERANCE_MS) {
+    return { ok: false, error: `occurredAt ${instant.toISOString()} is in the future (server time ${new Date(nowMs).toISOString()}, tolerance ${OCCURRED_AT_FUTURE_TOLERANCE_MS / 1000}s). Register events are append-only and cannot be corrected, so a future timestamp is refused rather than recorded.` };
+  }
+  if (instantMs < new Date(OCCURRED_AT_FLOOR).valueOf()) {
+    return { ok: false, error: `occurredAt ${instant.toISOString()} is before ${OCCURRED_AT_FLOOR} and cannot describe a human acting on this register. Register events are append-only and cannot be corrected, so an implausible timestamp is refused rather than recorded.` };
+  }
+  return { ok: true, occurredAt: instant.toISOString() };
+}
+
 export function recordRegisterEvent(db: DatabaseSync, projectId: string, externalRegisterId: string, input: { actor: string; eventType: string; field?: string | null; newValue?: string | null; reason: string; evidenceRef?: string | null; occurredAt?: string }) {
-  const row = db.prepare('SELECT 1 FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(projectId, externalRegisterId);
+  const row = db.prepare('SELECT id, register_name, title, summary FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(projectId, externalRegisterId) as Record<string, unknown> | undefined;
   if (!row) throw new Error('Register row not found.');
+  const register = String(row.register_name);
+  // N2 — a field the projector cannot reach must not be recorded at all. The
+  // event log is append-only, so an unprojectable event is permanent, inert,
+  // and still able to block future extracted updates to that field.
+  if (input.field) {
+    const allowed = correctableFields(db, register);
+    if (!allowed.includes(input.field)) {
+      throw new Error(`"${input.field}" is not a correctable field on a ${register} row, so an event naming it could never be projected. Correctable fields: ${allowed.join(', ')}.`);
+    }
+  }
   const occurredAt = input.occurredAt ?? nowIso();
   const current = db.prepare('SELECT * FROM register_row_state WHERE project_id = ? AND external_register_id = ?').get(projectId, externalRegisterId) as Record<string, unknown> | undefined;
-  const previous = input.field ? current?.[input.field] ?? null : null;
+  // The value being replaced, wherever it actually lives. Reading only
+  // `register_row_state` recorded `previous_value = NULL` for every
+  // typed-detail, `title` and `summary` correction, which is the field diff the
+  // attention lane shows the consultant.
+  const previous = !input.field ? null
+    : (STATE_FIELDS as readonly string[]).includes(input.field) ? current?.[input.field] ?? null
+      : input.field === 'title' ? row.title ?? null
+        : input.field === 'summary' ? row.summary ?? null
+          : readTypedDetails(db, register, String(row.id))[input.field] ?? null;
   db.exec('BEGIN IMMEDIATE;');
   try {
     db.prepare('INSERT INTO register_row_events (id, project_id, external_register_id, occurred_at, actor, event_type, field, previous_value, new_value, reason, evidence_ref, source_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)')

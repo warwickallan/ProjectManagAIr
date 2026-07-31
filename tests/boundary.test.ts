@@ -199,15 +199,46 @@ export function findEmailPayloads(text: string): string[] {
   return headers.length >= emailHeaderThreshold ? [`${headers.length} RFC 822 headers at line start`] : [];
 }
 
-export function scanBoundaryContent(relativePath: string, buffer: Buffer): BoundaryFinding[] {
+/**
+ * Decode a file for text scanning, or return null when it is genuinely binary.
+ * Recognises UTF-16 by BOM and by the NUL-interleaving that ASCII-range UTF-16
+ * text always exhibits.
+ */
+export function decodeScannableText(buffer: Buffer): string | null {
+  if (buffer.length === 0) return '';
+  if (buffer[0] === 0xff && buffer[1] === 0xfe) return buffer.subarray(2).toString('utf16le');
+  if (buffer[0] === 0xfe && buffer[1] === 0xff) return buffer.subarray(2).swap16().toString('utf16le');
+  if (!buffer.includes(0)) return buffer.toString('utf8');
+  const sample = buffer.subarray(0, Math.min(buffer.length, 4096));
+  let evenNuls = 0;
+  let oddNuls = 0;
+  for (let index = 0; index < sample.length; index += 1) {
+    if (sample[index] !== 0) continue;
+    if (index % 2 === 0) evenNuls += 1;
+    else oddNuls += 1;
+  }
+  const half = Math.floor(sample.length / 2);
+  // ASCII-range UTF-16LE puts a NUL in every odd byte; UTF-16BE in every even one.
+  if (half > 0 && oddNuls >= half * 0.4 && evenNuls === 0) return buffer.toString('utf16le');
+  if (half > 0 && evenNuls >= half * 0.4 && oddNuls === 0) return Buffer.from(buffer).swap16().toString('utf16le');
+  return null;
+}
+
+function scanBoundaryContent(relativePath: string, buffer: Buffer): BoundaryFinding[] {
   const findings: BoundaryFinding[] = [];
   const push = (rule: BoundaryRule, matches: string[]) => {
     for (const match of matches) findings.push({ file: relativePath, rule, match });
   };
   push('live-document-file-type', findLiveDocumentFileTypes(relativePath));
   push('binary-document-signature', findBinaryDocumentSignatures(buffer));
-  if (buffer.includes(0)) return findings; // binary: the text matchers would be noise
-  const text = buffer.toString('utf8');
+  // A NUL byte usually means binary, where the text matchers would be noise —
+  // but UTF-16 text is full of NULs, and Windows PowerShell redirection produces
+  // UTF-16LE by default. This repository ships .ps1 launchers, so skipping those
+  // files outright left a real hole: the same leaked path passed the scan simply
+  // by being saved in a different encoding.
+  const text = decodeScannableText(buffer);
+  if (text === null) return findings; // genuinely binary
+
   push('windows-drive-path', findWindowsDrivePaths(text));
   push('unc-path', findUncPaths(text));
   push('posix-home-path', findPosixHomePaths(text));
@@ -454,5 +485,27 @@ describe('fixture and route boundary controls', () => {
     expect(repositoryFiles.some((name) => /\.(db|sqlite|sqlite3|db-wal|db-shm|db-journal)$/i.test(name))).toBe(false);
     expect(repositoryFiles.some((name) => /m365-auth\.local\.json|token/i.test(name))).toBe(false);
     expect(repositoryFiles.some((name) => /(^|[\\/])config[\\/].*\.local\.json$/i.test(name))).toBe(false);
+  });
+});
+
+describe('the boundary scan cannot be evaded by encoding', () => {
+  const leak = ['Projects root: C', ':', String.fromCharCode(92), 'Users', String.fromCharCode(92), 'warwick', String.fromCharCode(92), 'OneDrive - Fusion247', String.fromCharCode(92), 'Projects'].join('');
+
+  it('finds a leaked path in UTF-8, UTF-16LE, UTF-16BE and BOM-prefixed forms alike', () => {
+    const utf8 = Buffer.from(leak, 'utf8');
+    const utf16le = Buffer.from(leak, 'utf16le');
+    const utf16be = Buffer.from(leak, 'utf16le').swap16();
+    const bom = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(leak, 'utf16le')]);
+    for (const [label, buffer] of [['utf8', utf8], ['utf16le', utf16le], ['utf16be', utf16be], ['bom', bom]] as Array<[string, Buffer]>) {
+      const decoded = decodeScannableText(buffer);
+      expect(decoded, label).not.toBeNull();
+      expect(findWindowsDrivePaths(decoded!), label).not.toHaveLength(0);
+      expect(findCloudSyncPaths(decoded!), label).not.toHaveLength(0);
+    }
+  });
+
+  it('still treats genuinely binary content as binary', () => {
+    const binary = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x01, 0x02, 0x00, 0xff, 0x00, 0x7f, 0xfe, 0x00, 0x00, 0x00, 0x00]);
+    expect(decodeScannableText(binary)).toBeNull();
   });
 });

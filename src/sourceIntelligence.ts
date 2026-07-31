@@ -267,9 +267,87 @@ function makeWindows(segments: NormalizedSegment[]) {
 // emit U+2019, and every apostrophe-bearing pattern used to be blind to real
 // transcripts. Equally, ordinary prose must not be classified as mandatory
 // governance content — a HIGH marker obliges the extraction to account for it.
-const COMMITMENT_CUE = /\b(?:i(?:'ll| will| shall| need to| have to| am going to| ?'m going to)|we(?:'ll| will| need to| should)|let me|can you|could you|please|action|deadline|due|target|by then|before)\b/;
-const PAST_OR_HYPOTHETICAL = /\b(?:finished|completed|closed|did|was|were|had|already|last (?:week|month|year|time)|yesterday|used to|would have|previously)\b/;
+const COMMITMENT_CUE = /\b(?:i(?:'ll| will| shall| need to| have to| must| am going to| ?'m going to)|we(?:'ll| will| shall| need to| should| must| have to| are going to| ?'re going to)|you(?:'ll| will| need to| must)|(?:they|he|she)(?:'ll| will| must)|let me|let us|can you|could you|please|action|deadline|due|target|by then|before|no later than|promise[sd]?|committed to|commit to|undertake[sd]?|undertaking to)\b/;
+
+/* -------------------------------------------------------------------------- *
+ * N7 — deciding whether a date is being committed to.
+ *
+ * The veto used to be `PAST_OR_HYPOTHETICAL` tested against the whole segment,
+ * matching any past-tense word anywhere in it: `finished`, `completed`,
+ * `closed`, `did`, `was`, `had`, `already`. That is not a test of tense, it is a
+ * test for a vocabulary that ordinary forward-looking commitments use
+ * constantly — "I'll have the permit mapping COMPLETED by Friday", "we need to
+ * get the register CLOSED by the end of the week", "Tony WAS clear that we must
+ * deliver the counts by Monday". Five of six realistic date commitments were
+ * vetoed. A missed HIGH marker removes a mandatory discharge obligation, so the
+ * gate got quietly easier and the per-window recall checklist quietly shorter:
+ * the failure direction that loses governance content rather than adding noise.
+ *
+ * The question is not whether a past-tense word appears in the sentence. It is
+ * whether THIS DATE is being committed to going forward. Three rules, in order:
+ *
+ *   1. Scope. Only the clause containing the date phrase can veto it. "I'll
+ *      send the counts by Friday, we finished the last batch in March" commits
+ *      to Friday whatever the second clause says.
+ *   2. Evidence. The veto needs an explicit past-time expression — `last week`,
+ *      `yesterday`, `three weeks ago` — or an explicitly counterfactual
+ *      construction, not a past-tense verb.
+ *   3. Precedence. A future modal in the same clause is decisive: "I'll have
+ *      that closed by Friday" is a commitment however the verb is spelled.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * An explicit past-time expression: wording that can only place the date in the
+ * past. `last month` qualifies; `completed` does not.
+ */
+const PAST_TIME_EXPRESSION = /\b(?:last (?:week|month|year|time|night|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|yesterday|the other day|previously|earlier (?:this|last) (?:week|month|year)|(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|\d+) (?:day|days|week|weeks|month|months|year|years) ago|back in (?:january|february|march|april|may|june|july|august|september|october|november|december))\b/;
+
+/** Counterfactual and hypothetical constructions, which commit to nothing. */
+const HYPOTHETICAL = /\b(?:would have|could have|should have|might have|used to|if we had|if i had|had we|hypothetically)\b/;
+
+/** A forward-looking modal. Decisive: it outranks anything else in its clause. */
+const FUTURE_MODAL = /\b(?:i(?:'ll| will| shall| ?'m going to| am going to)|we(?:'ll| will| shall| ?'re going to| are going to)|you(?:'ll| will)|(?:they|he|she)(?:'ll| will)|will|shall|going to|needs? to|must|have to|has to|no later than|by then)\b/;
+
+/**
+ * Clause boundaries for the veto's scope. Sentence punctuation, commas, and the
+ * conjunctions that introduce a contrasting or subordinate clause.
+ */
+const CLAUSE_BOUNDARY = '[.!?;,]+|\\b(?:but|however|whereas|although|though|unlike|because|even if)\\b';
+
+/** The clause of `folded` containing the span `[start, end)`. */
+function clauseContaining(folded: string, start: number, end: number): string {
+  const boundary = new RegExp(CLAUSE_BOUNDARY, 'g');
+  let clauseStart = 0;
+  let clauseEnd = folded.length;
+  let match: RegExpExecArray | null;
+  while ((match = boundary.exec(folded)) !== null) {
+    const matchEnd = match.index + match[0].length;
+    // A boundary wholly before the date phrase moves the clause start; one
+    // wholly after it ends the clause. One overlapping the phrase is ignored.
+    if (matchEnd <= start) clauseStart = matchEnd;
+    else if (match.index >= end) { clauseEnd = match.index; break; }
+  }
+  return folded.slice(clauseStart, clauseEnd);
+}
+
+/** True when the matched date phrase is being committed to rather than recalled. */
+function commitsToDate(folded: string, match: RegExpMatchArray): boolean {
+  const start = match.index ?? 0;
+  const clause = clauseContaining(folded, start, start + match[0].length);
+  if (FUTURE_MODAL.test(clause)) return true;
+  return !PAST_TIME_EXPRESSION.test(clause) && !HYPOTHETICAL.test(clause);
+}
+
 const CONFIG_OBJECT = /\b(?:box|tick ?box|checkbox|field|setting|settings|config|configuration|flag|option|value|template|permit|permits|register|record|records|status|toggle|parameter|rule|workflow|form|screen|profile|role|permission|module)\b/;
+
+/**
+ * Verbs that can only describe acting on the system. `change`, `add` and `save`
+ * need a nameable configuration object to disambiguate them from ordinary
+ * speech; `tick`, `suppress` and `configure` do not, which is why the design's
+ * own example "let me tick that" is a HIGH marker with no object named.
+ */
+const SYSTEM_ONLY_VERB = /\b(?:tick|ticked|untick|unticked|suppress|suppressed|configure|configured|rename|renamed|enable|enabled|disable|disabled)\b/;
+const LIVE_CONFIG_ACT = /\b(?:i(?:'ll|'ve| have| just| will| am going to)|let me|we've|we have)\b.{0,80}?\b(?:add|added|change|changed|tick|ticked|save|saved|suppress|suppressed|configure|configured|rename|renamed|remove|removed|switch|switched|enable|enabled|disable|disabled)\b/;
 const DATE_PHRASE = /\b(?:by (?:the )?end of (?:the )?(?:week|month|day)|by (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|next (?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month)|\d{4}-\d{2}-\d{2}|\d{1,2}(?:st|nd|rd|th) (?:of )?(?:january|february|march|april|may|june|july|august|september|october|november|december))\b/;
 const SCHEDULED_TIME = /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b[^.?!]{0,40}\b(?:\d{1,2}(?:st|nd|rd|th)|\d{1,2}[:.]\d{2}|\d{1,2} ?(?:am|pm)|(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve) o'clock)\b/;
 
@@ -286,23 +364,33 @@ function preScan(document: NormalizedDocument) {
     },
     {
       // A date only obliges the extraction when someone is committing to it.
-      // "next Wednesday is a bank holiday" is information, not governance.
+      // "next Wednesday is a bank holiday" is information, not governance;
+      // "we finished that by Friday last month" is a recollection (N7).
       type: 'explicit-date',
-      test: (folded) => (DATE_PHRASE.test(folded) && COMMITMENT_CUE.test(folded) && !PAST_OR_HYPOTHETICAL.test(folded) ? folded.match(DATE_PHRASE) : null),
+      test: (folded) => {
+        if (!COMMITMENT_CUE.test(folded)) return null;
+        const match = folded.match(DATE_PHRASE);
+        return match && commitsToDate(folded, match) ? match : null;
+      },
     },
     {
       // A specific day paired with a specific time is a scheduling commitment
       // in its own right, per the design's worked examples.
       type: 'scheduled-time',
-      test: (folded) => (!PAST_OR_HYPOTHETICAL.test(folded) ? folded.match(SCHEDULED_TIME) : null),
+      test: (folded) => {
+        const match = folded.match(SCHEDULED_TIME);
+        return match && commitsToDate(folded, match) ? match : null;
+      },
     },
     {
-      // Live configuration acts need an object that can actually be configured;
-      // "I'll change my mind about the sandwich" is not a change to the system.
+      // Live configuration acts with an ambiguous verb need an object that can
+      // actually be configured; "I'll change my mind about the sandwich" is not
+      // a change to the system. A verb that only ever means "act on the system"
+      // stands on its own.
       type: 'live-config-act',
       test: (folded) => {
-        const match = folded.match(/\b(?:i(?:'ll|'ve| have| just| will| am going to)|let me|we've|we have)\b.{0,80}?\b(?:add|added|change|changed|tick|ticked|save|saved|suppress|suppressed|configure|configured|rename|renamed|remove|removed|switch|switched|enable|enabled|disable|disabled)\b/);
-        return match && CONFIG_OBJECT.test(folded) ? match : null;
+        const match = folded.match(LIVE_CONFIG_ACT);
+        return match && (CONFIG_OBJECT.test(folded) || SYSTEM_ONLY_VERB.test(match[0])) ? match : null;
       },
     },
   ];
@@ -621,7 +709,14 @@ export function validatePacket(db: DatabaseSync, rawPacket: unknown, options: Va
   const sourceTokens = source ? Math.ceil(Number(source.word_count) * 1.35) : 0;
   const repeated = totalRuns.reduce((total, run) => total + Number(run.source_tokens), 0);
   const repetition = sourceTokens ? repeated / sourceTokens : 0;
-  if (calls > 12 || inputTokens > 200000 || repetition > 2.5) issues.push({ rule: 'cost-budget', severity: 'blocker', message: `Configured extraction budget exceeded: ${calls} calls, ${inputTokens} input tokens, ${repetition.toFixed(2)}x source repetition.` });
+  // The budget is a property of the job, not of the surviving pass. Counting only
+  // `packet.execution.runs` meant tokens burned by an earlier failed attempt on
+  // the same source were recorded and then ignored, so a job could spend twice
+  // the limit and still validate green.
+  const jobRuns = source ? db.prepare('SELECT input_tokens, output_tokens, duration_ms, status FROM extraction_runs WHERE source_id = ?').all(String(source.id)) as Array<Record<string, unknown>> : [];
+  const jobCalls = jobRuns.length;
+  const jobInputTokens = jobRuns.reduce((total, run) => total + Number(run.input_tokens), 0);
+  if (jobCalls > 12 || jobInputTokens > 200000 || repetition > 2.5) issues.push({ rule: 'cost-budget', severity: 'blocker', message: `Configured extraction budget exceeded across every attempt on this source: ${jobCalls} calls, ${jobInputTokens} input tokens, ${repetition.toFixed(2)}x source repetition.` });
   if (calls > 6 || repetition > 2) issues.push({ rule: 'cost-drift', severity: 'warning', message: `Extraction cost is approaching its acceptance limit.` });
 
   const verdict = issues.some((issue) => issue.severity === 'blocker') ? 'quarantined' : issues.some((issue) => issue.severity === 'warning') ? 'warnings' : 'clean';
@@ -641,6 +736,10 @@ export function validatePacket(db: DatabaseSync, rawPacket: unknown, options: Va
       highMarkersDismissed: dismissedHigh.length,
       highMarkersDismissedByModel: modelProposed.length,
       anchoredRows: anchoredSegmentsByRef.size,
+      jobCalls,
+      jobInputTokens,
+      jobOutputTokens: jobRuns.reduce((total, run) => total + Number(run.output_tokens), 0),
+      jobDurationMs: jobRuns.reduce((total, run) => total + Number(run.duration_ms), 0),
     },
   };
 }
