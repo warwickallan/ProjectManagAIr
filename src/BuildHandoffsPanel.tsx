@@ -7,7 +7,8 @@ import { EmptyState, Section, StatusChip, formatDateTime, humanize } from './com
  * A cloud build session leaves a manifest and, where the branch is not already
  * on origin, a bundle. This panel shows what is waiting and finishes it in one
  * press: verify, fetch, push, confirm the remote SHA, open or update the draft
- * pull request, mirror the safe deliverables to Google Drive.
+ * pull request. GitHub is the canonical build record; the Google Drive mirror is
+ * an optional convenience and is shown as one.
  *
  * It holds no Git logic. Reading this page is a filesystem read — it cannot push
  * anything or spend a network call — and Finalise POSTs to a route that calls the
@@ -31,7 +32,13 @@ type DeliverableResult = {
   error: string | null;
 };
 
+type DriveStatus = 'disabled' | 'not_configured' | 'skipped' | 'mirrored' | 'failed';
+
+type GitHandoffSummary = { path: string | null; status: 'present' | 'missing' | 'not-declared' };
+
 type DriveSummary = {
+  status: DriveStatus;
+  required: boolean;
   attempted: boolean;
   folderId: string | null;
   folderName: string | null;
@@ -48,6 +55,7 @@ type LastRun = {
   localHeadSha: string | null;
   remoteHeadSha: string | null;
   pullRequest: { number: number; url: string; draft: boolean; headSha: string | null; created: boolean } | null;
+  gitHandoff: GitHandoffSummary;
   drive: DriveSummary;
   deliverables: DeliverableResult[];
   lastError: string | null;
@@ -74,6 +82,7 @@ type Handoff = {
   lastRun: LastRun | null;
   driveDeclared: boolean;
   driveFolderName: string | null;
+  gitHandoffPath: string | null;
   requiredDeliverables: number;
 };
 
@@ -85,6 +94,7 @@ type FinalizeResponse = {
   expectedHeadSha: string;
   remoteHeadSha: string | null;
   pullRequest: LastRun['pullRequest'];
+  gitHandoff: GitHandoffSummary;
   drive: DriveSummary;
   deliverables: DeliverableResult[];
   steps: Array<{ key: string; title: string; status: 'ok' | 'skipped' | 'failed'; detail: string; mutated: boolean }>;
@@ -144,7 +154,7 @@ export function BuildHandoffsPanel() {
       <p className="section-description">
         A cloud build leaves a manifest here, and a bundle when the branch is not already on origin. Finalise verifies the
         bundle and the exact SHA, creates the branch, pushes it, confirms what origin actually points at, opens or updates the
-        draft pull request, and mirrors the safe deliverables to Google Drive. It never merges, never force-pushes and never
+        draft pull request, and confirms the sanitised build record is committed. It never merges, never force-pushes and never
         touches your working tree. The same engine runs from <code>finish-projectmanagair-build.cmd</code>.
       </p>
       {error ? <p className="form-error" role="alert">{error}</p> : null}
@@ -195,6 +205,27 @@ export function BuildHandoffsPanel() {
   );
 }
 
+/** What the committed, canonical build record looks like right now. */
+function gitHandoffLabel(handoff: Handoff, gitHandoff: GitHandoffSummary | null) {
+  if (gitHandoff?.status === 'present') return <>Committed — <code>{gitHandoff.path}</code></>;
+  if (gitHandoff?.status === 'missing') return <>MISSING from the commit — <code>{gitHandoff.path}</code></>;
+  if (handoff.gitHandoffPath) return <>Declared, not yet verified — <code>{handoff.gitHandoffPath}</code></>;
+  return 'Not declared — this build cannot finalise until it commits one';
+}
+
+/** Plain words for the optional mirror. Never phrased as something outstanding. */
+function driveLabel(handoff: Handoff, drive: DriveSummary | null) {
+  if (!handoff.driveDeclared) return 'not enabled for this build';
+  switch (drive?.status) {
+    case 'mirrored': return `${drive.uploadedCount} deliverable(s) mirrored`;
+    case 'not_configured': return 'Drive is not connected on this machine';
+    case 'failed': return `not mirrored — ${drive.error ?? 'unknown reason'}`;
+    case 'skipped': return 'not run this time';
+    case 'disabled': return 'not enabled for this build';
+    default: return 'enabled, not attempted yet';
+  }
+}
+
 function HandoffCard({ handoff, busy, anyBusy, result, onFinalize, onConnectDrive }: {
   handoff: Handoff;
   busy: boolean;
@@ -205,6 +236,7 @@ function HandoffCard({ handoff, busy, anyBusy, result, onFinalize, onConnectDriv
 }) {
   const run = handoff.lastRun;
   const drive = result?.drive ?? run?.drive ?? null;
+  const gitHandoff = result?.gitHandoff ?? run?.gitHandoff ?? null;
   const deliverables = result?.deliverables ?? run?.deliverables ?? [];
   const pullRequest = result?.pullRequest ?? run?.pullRequest ?? null;
   const remoteSha = result?.remoteHeadSha ?? run?.remoteHeadSha ?? null;
@@ -241,18 +273,26 @@ function HandoffCard({ handoff, busy, anyBusy, result, onFinalize, onConnectDriv
         <div><dt>Local branch</dt><dd>{run?.localHeadSha ? (run.localHeadSha === handoff.expectedHeadSha ? 'At the expected SHA' : run.localHeadSha) : 'Not created yet'}</dd></div>
         <div><dt>Remote branch</dt><dd>{remoteSha ? (remoteSha === handoff.expectedHeadSha ? 'Verified at the expected SHA' : remoteSha) : 'Not pushed yet'}</dd></div>
         <div><dt>Pull request</dt><dd>{pullRequest ? <a href={pullRequest.url} target="_blank" rel="noreferrer">#{pullRequest.number}{pullRequest.draft ? ' (draft)' : ''}</a> : 'Not opened yet'}</dd></div>
-        <div><dt>Drive mirror</dt><dd>{handoff.driveDeclared ? (drive ? `${drive.uploadedCount} of ${drive.requiredCount} uploaded` : `${handoff.requiredDeliverables} required, not attempted`) : 'Not requested'}</dd></div>
+        <div><dt>Build record in Git</dt><dd>{gitHandoffLabel(handoff, gitHandoff)}</dd></div>
         <div><dt>Last finalised</dt><dd>{run ? formatDateTime(run.finishedAt) : 'Never'}</dd></div>
       </dl>
+
+      <p className="optional-mirror">
+        <span className="optional-tag">Optional</span> Google Drive mirror — {driveLabel(handoff, drive)}. A build is complete
+        without it: GitHub is the canonical record.
+      </p>
 
       {handoff.handoffDocumentPath ? <p className="inline-note">Handoff document: <code>{handoff.handoffDocumentPath}</code></p> : null}
 
       {drive?.connectionRequired ? (
         <div className="drive-connection" role="status">
-          <StatusChip value="watch" label="Google Drive connection required" />
-          <p>{drive.error ?? 'Google Drive has not been authorised on this machine yet.'}</p>
-          <p className="inline-note">The branch and the pull request are unaffected. Connect once, then press Retry — you will not have to find the files again.</p>
-          <button className="button" type="button" onClick={onConnectDrive}>Connect Google Drive</button>
+          <StatusChip value="watch" label="Google Drive not connected (optional)" />
+          <p>{drive.error ?? 'Google Drive has not been authorised on this machine.'}</p>
+          <p className="inline-note">
+            This does not affect the build. The pushed branch, the verified remote SHA, the pull request and the committed build
+            record are the finalisation; connect Drive only if you also want the optional mirror.
+          </p>
+          <button className="button secondary" type="button" onClick={onConnectDrive}>Connect Google Drive (optional)</button>
         </div>
       ) : null}
 

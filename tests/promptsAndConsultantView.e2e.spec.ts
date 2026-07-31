@@ -142,6 +142,9 @@ test('prompts are manageable and consultant views are complete without a provide
   await page.goto('/#/settings');
   await expect(page.getByRole('heading', { name: 'Build Handoffs' })).toBeVisible();
   await expect(page.getByText(/never merges, never force-pushes/i)).toBeVisible();
+  // GitHub is the canonical record, so the panel says so rather than presenting
+  // the Google Drive mirror as part of finishing a build.
+  await expect(page.getByText(/sanitised build record is committed/i)).toBeVisible();
 
   await page.goto(`/#/projects/${projectId}/overview`);
   await expect(page.getByRole('heading', { name: 'Meeting Brief' })).toBeVisible();

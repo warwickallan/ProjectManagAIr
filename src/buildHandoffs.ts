@@ -18,6 +18,7 @@ import {
   PENDING_DIR,
   discoverManifests,
   handoffLocations,
+  mayBeMirroredToDrive,
   type BuildHandoffManifest,
   type FinalizeResult,
 } from './buildFinalizer.js';
@@ -61,6 +62,7 @@ export interface BuildHandoffView {
     localHeadSha: string | null;
     remoteHeadSha: string | null;
     pullRequest: FinalizeResult['pullRequest'];
+    gitHandoff: FinalizeResult['gitHandoff'];
     drive: FinalizeResult['drive'];
     deliverables: FinalizeResult['deliverables'];
     lastError: string | null;
@@ -69,6 +71,8 @@ export interface BuildHandoffView {
 
   driveDeclared: boolean;
   driveFolderName: string | null;
+  /** Repository-relative path of the sanitised handoff — the canonical record. */
+  gitHandoffPath: string | null;
   requiredDeliverables: number;
 }
 
@@ -93,6 +97,7 @@ function readLastRun(manifestPath: string): BuildHandoffView['lastRun'] {
         localHeadSha: parsed.localHeadSha ?? null,
         remoteHeadSha: parsed.remoteHeadSha ?? null,
         pullRequest: parsed.pullRequest ?? null,
+        gitHandoff: parsed.gitHandoff ?? { path: null, status: 'not-declared' },
         drive: parsed.drive,
         deliverables: parsed.deliverables ?? [],
         lastError: (parsed.errors ?? [])[0] ?? null,
@@ -138,7 +143,8 @@ export function readBuildHandoffs(root: string): { root: string; pending: string
       lastRun: readLastRun(entry.path),
       driveDeclared: Boolean(manifest?.drive),
       driveFolderName: manifest?.drive?.folderName ?? null,
-      requiredDeliverables: (manifest?.deliverables ?? []).filter((entry2) => entry2.required && entry2.classification === 'safe_for_drive').length,
+      gitHandoffPath: manifest?.gitHandoffPath ?? null,
+      requiredDeliverables: (manifest?.deliverables ?? []).filter((entry2) => entry2.required && mayBeMirroredToDrive(entry2.classification)).length,
     };
   });
   return { root, pending: locations.pending, completed: locations.completed, handoffs };

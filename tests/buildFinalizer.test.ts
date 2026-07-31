@@ -15,14 +15,17 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DriveConnectionRequiredError,
   MANIFEST_VERSION,
   buildFolderName,
+  DELIVERABLE_CLASSIFICATIONS,
   buildHandoffManifestSchema,
   discoverManifests,
   finalizeBuild,
+  mayBeMirroredToDrive,
+  mayEnterPublicGit,
   newestPendingManifest,
   redactSecrets,
   renderFinalizeReport,
@@ -35,6 +38,11 @@ import {
   type PullRequestRecord,
 } from '../src/buildFinalizer';
 import { isKnownManifestPath, readBuildHandoffs, resolveHandoffRoot } from '../src/buildHandoffs';
+
+// Every case here clones repositories and runs real git. Five seconds is enough
+// on an idle machine and not enough on a busy one, and a flaky safety suite is
+// worse than a slow one.
+vi.setConfig({ testTimeout: 30_000 });
 
 const directories: string[] = [];
 
@@ -113,7 +121,12 @@ function fixture(repository = 'warwickallan/ProjectManagAIr'): Fixture {
   return { root, origin, cloud, local, handoffRoot, bundlePath, baselineSha, headSha, repository };
 }
 
-function writeManifest(fx: Fixture, overrides: Partial<BuildHandoffManifest> = {}, name = 'handoff.json'): string {
+/**
+ * Overrides are the manifest's INPUT shape, not its parsed output, so schema
+ * defaults (`drive.required`, `gitHandoffPath`) apply exactly as they do to a
+ * manifest a builder writes by hand.
+ */
+function writeManifest(fx: Fixture, overrides: Record<string, unknown> = {}, name = 'handoff.json'): string {
   const manifest: BuildHandoffManifest = buildHandoffManifestSchema.parse({
     manifestVersion: MANIFEST_VERSION,
     repository: fx.repository,
@@ -126,6 +139,9 @@ function writeManifest(fx: Fixture, overrides: Partial<BuildHandoffManifest> = {
     createdAt: '2026-07-31T12:00:00.000Z',
     origin: { model: 'claude-opus-5', session: 'test-session' },
     handoffDocumentPath: null,
+    // `feature.md` is the file the fixture commits on the build branch, so this
+    // is a real canonical record living in the real commit being pushed.
+    gitHandoffPath: 'feature.md',
     deliverables: [],
     drive: null,
     ...overrides,
@@ -277,7 +293,12 @@ describe('a valid handoff finalises in one action', () => {
 
     // The steps read as an account of what happened.
     const keys = result.steps.map((step) => step.key);
-    expect(keys).toEqual(['manifest', 'repository', 'worktree', 'bundle', 'fetch', 'commit', 'ancestry', 'branch', 'remote-read', 'push', 'remote-verify', 'pull-request', 'drive']);
+    expect(keys).toEqual(['manifest', 'repository', 'worktree', 'bundle', 'fetch', 'commit', 'ancestry', 'git-handoff', 'branch', 'remote-read', 'push', 'remote-verify', 'pull-request', 'drive']);
+    // GitHub is the canonical record: the sanitised handoff is proved present in
+    // the exact commit being pushed, not merely named by the manifest.
+    expect(result.gitHandoff).toEqual({ path: 'feature.md', status: 'present' });
+    // Drive was never asked for, and says so rather than reading as a failure.
+    expect(result.drive.status).toBe('disabled');
     expect(result.steps.filter((step) => step.status === 'failed')).toEqual([]);
   });
 
@@ -467,7 +488,7 @@ describe('choosing which handoff to finalise', () => {
     // connected. Selecting purely by modification time would then pick it again
     // forever and the second handoff would never be reached.
     const stuck = writeManifest(fx, {
-      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables' },
+      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables', required: true },
     }, 'stuck.json');
     const first = await run(fx, stuck, new FakeGitHub(() => fx.headSha), null);
     expect(first.state).toBe('PARTIAL');
@@ -479,6 +500,83 @@ describe('choosing which handoff to finalise', () => {
     // still reaches the one that needs it.
     await run(fx, fresh, new FakeGitHub(() => fx.headSha), new FakeDrive());
     expect(newestPendingManifest(fx.handoffRoot)!.path).toBe(stuck);
+  });
+});
+
+describe('GitHub is the canonical build record', () => {
+  it('refuses to push a build whose sanitised handoff is not in the commit', async () => {
+    const fx = fixture();
+    // The manifest claims a committed record that the commit does not carry.
+    const manifestPath = writeManifest(fx, { gitHandoffPath: 'docs/build-handoffs/never-committed.md' });
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha));
+
+    expect(result.state).toBe('FAILED');
+    expect(result.gitHandoff).toEqual({ path: 'docs/build-handoffs/never-committed.md', status: 'missing' });
+    expect(result.errors.join(' ')).toMatch(/is not in commit/i);
+    // Nothing was pushed: the canonical record has to exist before the record is made.
+    expect(remoteSha(fx)).toBeNull();
+  });
+
+  it('refuses a manifest that declares no committed build record at all', async () => {
+    const fx = fixture();
+    const manifestPath = writeManifest(fx, { gitHandoffPath: null });
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha));
+
+    expect(result.state).toBe('FAILED');
+    expect(result.gitHandoff.status).toBe('not-declared');
+    expect(result.errors.join(' ')).toMatch(/canonical build record/i);
+    expect(remoteSha(fx)).toBeNull();
+  });
+
+  it('completes with no Drive destination at all', async () => {
+    const fx = fixture();
+    const manifestPath = writeManifest(fx, { drive: null });
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), null);
+
+    expect(result.state).toBe('COMPLETED');
+    expect(result.drive.status).toBe('disabled');
+    expect(result.drive.attempted).toBe(false);
+    expect(result.steps.find((step) => step.key === 'drive')!.status).toBe('skipped');
+  });
+
+  it('classifies what may be committed and what may only be mirrored', () => {
+    // This repository is public. Only one classification may ever enter it.
+    expect(DELIVERABLE_CLASSIFICATIONS.filter(mayEnterPublicGit)).toEqual(['safe_for_public_git']);
+    expect(DELIVERABLE_CLASSIFICATIONS.filter(mayBeMirroredToDrive)).toEqual(['safe_for_public_git', 'safe_for_drive', 'optional_private_mirror']);
+    for (const forbidden of ['local_only', 'contains_customer_data', 'contains_secrets'] as const) {
+      expect(mayEnterPublicGit(forbidden)).toBe(false);
+      expect(mayBeMirroredToDrive(forbidden)).toBe(false);
+    }
+  });
+
+  it('mirrors an optional_private_mirror deliverable but never a local_only or customer one', async () => {
+    const fx = fixture();
+    const priv = path.join(fx.root, 'private-notes.md');
+    const local = path.join(fx.root, 'machine-config.json');
+    const customer = path.join(fx.root, 'transcript.vtt');
+    const secret = path.join(fx.root, 'token.txt');
+    for (const [file, body] of [[priv, 'private\n'], [local, '{}\n'], [customer, 'WEBVTT\n'], [secret, 'ghp_x\n']] as const) writeFileSync(file, body, 'utf8');
+    const manifestPath = writeManifest(fx, {
+      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables' },
+      deliverables: [
+        { path: priv, classification: 'optional_private_mirror', required: false, googleDoc: false, title: 'private-notes.md' },
+        { path: local, classification: 'local_only', required: false, googleDoc: false, title: 'machine-config.json' },
+        { path: customer, classification: 'contains_customer_data', required: false, googleDoc: false, title: 'transcript.vtt' },
+        { path: secret, classification: 'contains_secrets', required: false, googleDoc: false, title: 'token.txt' },
+      ],
+    });
+    const drive = new FakeDrive();
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), drive);
+
+    expect(result.state).toBe('COMPLETED');
+    expect(drive.uploads.filter((name) => !name.endsWith('.completion.json'))).toEqual(['private-notes.md']);
+    for (const withheld of ['machine-config.json', 'transcript.vtt', 'token.txt']) {
+      expect(result.deliverables.find((entry) => entry.title === withheld)!.uploadStatus).toBe('skipped-classification');
+    }
   });
 });
 
@@ -677,13 +775,13 @@ describe('a failure after the push is recoverable, not destructive', () => {
 /* ------------------------------------------------------------------ drive mirror */
 
 describe('the Google Drive mirror', () => {
-  function withDeliverables(fx: Fixture): { manifestPath: string; safe: string; customer: string } {
+  function withDeliverables(fx: Fixture, driveRequired = false): { manifestPath: string; safe: string; customer: string } {
     const safe = path.join(fx.root, 'handoff.md');
     const customer = path.join(fx.root, 'transcript.vtt');
     writeFileSync(safe, '# handoff\n', 'utf8');
     writeFileSync(customer, 'WEBVTT\n', 'utf8');
     const manifestPath = writeManifest(fx, {
-      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables' },
+      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables', required: driveRequired },
       deliverables: [
         { path: safe, classification: 'safe_for_drive', required: true, googleDoc: true, title: 'Handoff.md' },
         { path: customer, classification: 'contains_customer_data', required: false, googleDoc: false },
@@ -768,7 +866,7 @@ describe('the Google Drive mirror', () => {
     expect([...drive.folders.values()].filter((entry) => entry.name.startsWith('2026-07-31 — build-example-v1'))).toHaveLength(2);
   });
 
-  it('reports PARTIAL and stays retryable when Drive is not connected', async () => {
+  it('still COMPLETES when Drive is not connected, because Drive is optional', async () => {
     const fx = fixture();
     const { manifestPath } = withDeliverables(fx);
     const drive = new FakeDrive();
@@ -776,25 +874,43 @@ describe('the Google Drive mirror', () => {
 
     const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), drive);
 
-    expect(result.state).toBe('PARTIAL');
-    // The Git half completed and is not undone by the Drive failure.
+    // GitHub is canonical. Pushed, verified, PR'd, record committed: COMPLETED.
+    // Warwick is never made to configure a Google OAuth client to finish a build.
+    expect(result.state).toBe('COMPLETED');
     expect(remoteSha(fx)).toBe(fx.headSha);
     expect(result.pullRequest?.number).toBe(42);
+    expect(result.drive.status).toBe('not_configured');
     expect(result.drive.connectionRequired).toBe(true);
-    expect(result.errors.join(' ')).toContain('Google Drive connection required');
+    expect(result.steps.find((step) => step.key === 'drive')!.status).toBe('skipped');
+    // ...and the manifest moved to completed, because it is complete.
+    expect(existsSync(manifestPath)).toBe(false);
+  });
+
+  it('reports PARTIAL for an unconnected Drive only when the manifest opts in', async () => {
+    const fx = fixture();
+    const { manifestPath } = withDeliverables(fx, true);
+    const drive = new FakeDrive();
+    drive.ready = false;
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), drive);
+
+    expect(result.state).toBe('PARTIAL');
+    expect(result.drive.required).toBe(true);
+    expect(remoteSha(fx)).toBe(fx.headSha);
     expect(existsSync(manifestPath)).toBe(true);
 
     // Connect, retry: only the Drive work is redone.
     drive.ready = true;
     const retried = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), drive);
     expect(retried.state).toBe('COMPLETED');
+    expect(retried.drive.status).toBe('mirrored');
     expect(retried.steps.find((step) => step.key === 'push')!.status).toBe('skipped');
     expect(drive.uploads).toContain('Handoff.md');
   });
 
   it('reports PARTIAL when a required deliverable will not upload, and names it', async () => {
     const fx = fixture();
-    const { manifestPath } = withDeliverables(fx);
+    const { manifestPath } = withDeliverables(fx, true);
     const drive = new FakeDrive();
     drive.failUploadsFor.add('Handoff.md');
 
@@ -843,7 +959,7 @@ describe('the Google Drive mirror', () => {
     const readable = path.join(fx.root, 'Handoff.md');
     writeFileSync(readable, '# handoff\n', 'utf8');
     const manifestPath = writeManifest(fx, {
-      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables' },
+      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables', required: true },
       deliverables: [
         { path: notAFile, classification: 'safe_for_drive', required: true, googleDoc: false },
         { path: readable, classification: 'safe_for_drive', required: true, googleDoc: false },
@@ -900,7 +1016,7 @@ describe('the Google Drive mirror', () => {
   it('records a declared deliverable that does not exist rather than silently ignoring it', async () => {
     const fx = fixture();
     const manifestPath = writeManifest(fx, {
-      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables' },
+      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables', required: true },
       deliverables: [{ path: path.join(fx.root, 'never-written.md'), classification: 'safe_for_drive', required: true, googleDoc: false }],
     });
 

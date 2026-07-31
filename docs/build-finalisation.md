@@ -45,18 +45,47 @@ the suite.
    already exists somewhere unexpected is refused before anything moves.
 6. Verify the expected commit is present.
 7. Verify it descends from the declared baseline.
+7a. Verify the **canonical build record** — the sanitised handoff named by
+    `gitHandoffPath` — is present in that exact commit, read out of the commit's
+    own tree. GitHub is the canonical record, so a build without one does not
+    finalise, and the check happens before the push.
 8. Create the local branch, or confirm it already points at the expected SHA.
 9. Read the remote branch. A remote branch at a different SHA is refused.
 10. Push with upstream tracking.
 11. Verify with `ls-remote` what origin actually points at.
 12. Open a draft pull request, or find and update the existing one.
-13. Mirror the safe deliverables to Google Drive.
+13. Mirror deliverables to Google Drive, **if** the manifest declares a
+    destination. This is optional and cannot change the verdict.
 14. Write the completion manifest.
 15. Upload the completion manifest into the build folder, so the record of the
     finalisation lives beside the deliverables and not only on one machine. It
     is written before it is uploaded, so the Drive copy is the one version that
     cannot name its own Drive id; the local copy is rewritten afterwards so that
     it does.
+
+## Google Drive is optional
+
+Drive mirroring exists because, for a while, Git synchronisation was unreliable
+and builds had to be inspectable some other way. This tool is what made Git
+reliable, so Drive is now a convenience.
+
+A build is **COMPLETED** when the branch is pushed, the remote SHA is verified,
+the draft pull request exists, and the committed build record is present in that
+commit. Drive is reported separately:
+
+| `drive.status` | Meaning |
+|---|---|
+| `disabled` | the manifest declares no Drive destination |
+| `not_configured` | declared, but Drive is not connected on this machine |
+| `skipped` | deliberately not run (a dry run, or the remote was unconfirmed) |
+| `mirrored` | the deliverables are in the build folder |
+| `failed` | Drive was configured and something went wrong |
+
+None of those can turn a pushed, verified, pull-requested build into PARTIAL. A
+manifest that genuinely depends on the mirror — because a deliverable is
+deliberately kept out of public Git — may opt in with `drive.required: true`, and
+only then does a Drive failure downgrade the verdict. Nobody is required to
+create a Google OAuth client to finish a build.
 
 ## Running it the first time
 
@@ -154,16 +183,26 @@ Override with `PROJECTMANAGAIR_BUILD_HANDOFF_DIR`.
   "pullRequest": { "title": "…", "bodyPath": "./handoff.md", "draft": true },
   "createdAt": "2026-07-31T12:00:00.000Z",
   "origin": { "model": "claude-opus-5", "session": "…" },
-  "handoffDocumentPath": "…/F247_…_Handoff.md",
+  "handoffDocumentPath": "…/F247_…_Handoff.md",       // the full local handoff, outside Git
+  "gitHandoffPath": "docs/build-handoffs/build-example-v1.md",  // the canonical record, in Git
   "deliverables": [
     { "path": "…/handoff.md", "classification": "safe_for_drive", "required": true, "googleDoc": true },
     { "path": "…/transcript.vtt", "classification": "contains_customer_data", "required": false }
   ],
-  "drive": { "folderId": "…", "folderName": "ProjectManagAIr", "buildDeliverablesFolder": "Build Deliverables" }
+  "drive": null                                      // optional; omit it and Drive reports `disabled`
 }
 ```
 
-Paths may be absolute or relative to the manifest. `drive: null` skips mirroring.
+Paths may be absolute or relative to the manifest.
+
+`gitHandoffPath` is repository-relative and is **required in practice**: the
+finaliser proves that file is in the exact commit before it pushes, because
+GitHub is the canonical build record.
+
+`drive: null` means no mirroring, which is the normal case. A Drive block takes
+`{ "folderId": "…", "folderName": "ProjectManagAIr", "buildDeliverablesFolder": "Build Deliverables", "required": false }`;
+leave `required` alone unless the mirror genuinely matters, because it is the
+only thing that lets a Drive problem downgrade a finished build.
 
 ## Authentication
 
@@ -186,9 +225,20 @@ proves a token embedded in a remote URL does not reach the completion manifest.
 
 ## The data boundary
 
-Only `safe_for_drive` uploads. `contains_customer_data`, `contains_secrets` and
-`local_only` stay on the machine — recorded in the completion manifest with their
-hashes, so what was withheld is visible.
+This repository is **public**, so the classification decides two different
+questions — what may be committed, and what may be mirrored:
+
+| Classification | Public Git | Drive mirror |
+|---|---|---|
+| `safe_for_public_git` | yes | yes |
+| `safe_for_drive` | no | yes |
+| `optional_private_mirror` | no | yes, when Drive is configured |
+| `local_only` | no | no |
+| `contains_customer_data` | no | no |
+| `contains_secrets` | no | no |
+
+There is no inferred classification and no default that lets a file through: a
+file a builder has not classified cannot be declared at all.
 
 Never uploaded merely because they sit beside a handoff: customer source
 documents, transcripts, email content, databases and their WAL and SHM files, raw

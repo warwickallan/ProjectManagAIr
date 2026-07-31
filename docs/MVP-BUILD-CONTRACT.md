@@ -599,33 +599,92 @@ This sequence is approved for implementation.
 
 ## Standing order: how a build is handed over
 
-Added 2026-07-31. This applies to every Project ManagAIr build from now on.
+Added 2026-07-31, corrected the same day when GitHub synchronisation became
+reliable. This applies to every Project ManagAIr build from now on.
 
-A build is **not** handed over because a Markdown file exists somewhere on a
-local disk. It is handed over when a manifest exists that the local finaliser can
-act on without a human running Git commands or uploading files.
+**GitHub is the canonical build record.** Google Drive was introduced only so
+that a build could be inspected while Git synchronisation was unreliable. The
+local finaliser exists to make Git synchronisation reliable, so Drive is now an
+optional convenience and is never part of the completion contract.
 
-Every builder finishes by writing:
+### 1. Every build commits its own record
+
+Every build commits a **sanitised** build handoff to
+`docs/build-handoffs/<branch-name>.md`, plus whatever non-sensitive operating
+documentation the build needs. The committed handoff must let Warwick — or
+anyone reading the repository, including a model with no other context —
+understand:
+
+- what was built and why;
+- the baseline SHA and the exact head SHA;
+- the branch and the pull request;
+- tests, production build and end-to-end results;
+- migrations applied;
+- user-visible behaviour;
+- residual risks;
+- the completion verdict — COMPLETED, PARTIAL or FAILED;
+- any action genuinely still required.
+
+The file is named for the **branch**, never the head SHA: naming it after the SHA
+would change the SHA, which is a commit that then needs another commit. The exact
+final SHA belongs in the finaliser's completion record and in the pull request,
+both of which are written after the commit exists.
+
+### 2. This repository is public
+
+Only files classified `safe_for_public_git` may be committed. **Never** commit
+customer documents, transcripts, emails, production or copied databases, WAL or
+SHM files, raw provider responses containing customer data, credentials, private
+Bellrock information, unredacted logs, git bundles, or local machine
+configuration.
+
+The manifest classifies every deliverable as one of:
+
+| Classification | May enter public Git | May be mirrored to Drive |
+|---|---|---|
+| `safe_for_public_git` | yes | yes |
+| `safe_for_drive` | no | yes |
+| `optional_private_mirror` | no | yes, when Drive is configured |
+| `local_only` | no | no |
+| `contains_customer_data` | no | no |
+| `contains_secrets` | no | no |
+
+There is no inferred classification. A file a builder has not classified cannot
+be declared, and nothing undeclared is ever committed or uploaded.
+
+### 3. The handoff a builder leaves behind
 
 1. **A handoff manifest** at `Data\staging\build-handoffs\pending\<name>.json`,
-   in the schema documented in [`docs/build-finalisation.md`](build-finalisation.md).
-2. **A git bundle**, where the branch is not already on `origin`.
-3. **A deliverables list inside the manifest**, every entry classified as
-   `safe_for_drive`, `contains_customer_data`, `contains_secrets` or
-   `local_only`. An unclassified file is not uploaded. The default is to withhold.
+   in the schema documented in [`docs/build-finalisation.md`](build-finalisation.md),
+   naming its `gitHandoffPath`.
+2. **A git bundle**, where the branch is not already on `origin`. The bundle is
+   `local_only` and is never committed or uploaded.
+3. **A classified deliverables list** inside the manifest.
 
-Warwick then performs exactly one action — `finish-projectmanagair-build.cmd`, or
-**Finalise** in Settings → Build Handoffs — which verifies the bundle and the
-exact SHA, pushes the branch, verifies what origin points at, opens or updates the
-draft pull request, mirrors the safe deliverables to the Google Drive
-`ProjectManagAIr` folder, and writes a completion manifest recording each
-deliverable's local path, classification, SHA-256, Drive file id, Drive URL,
-upload status and timestamp.
+### 4. What COMPLETED means
 
-**Required deliverables, at minimum:** the final handoff; the completion manifest;
-the acceptance or verification report; the adversarial-review report where one
-exists; merge-readiness or residual-risk notes; and any user guide needed to
-operate what was delivered.
+Warwick performs exactly one action — `finish-projectmanagair-build.cmd`, or
+**Finalise** in Settings → Build Handoffs. The build is **COMPLETED** when, and
+only when:
 
-**Do not** rely on local absolute paths alone in a handoff. **Do not** ask Warwick
-to locate, attach, upload or copy a deliverable between systems.
+- the branch is pushed to `origin`;
+- `ls-remote` confirms origin points at the exact expected SHA;
+- the draft pull request is created or confirmed;
+- the sanitised handoff named by `gitHandoffPath` is proved present in that exact
+  commit.
+
+Google Drive is reported separately as `disabled`, `not_configured`, `skipped`,
+`mirrored` or `failed`, and **cannot** change that verdict. A missing Google
+OAuth client never turns a pushed, verified, pull-requested build into PARTIAL,
+and no one is required to configure Drive to finish a build. A manifest may opt
+in with `drive.required` where a deliverable is deliberately kept out of public
+Git and its mirroring genuinely matters; that is the exception, not the contract.
+
+**Required in the committed record, at minimum:** what was built; baseline and
+head SHA; branch and pull request; tests, build and end-to-end results;
+migrations; user-visible behaviour; residual risks; the verdict; and anything
+still outstanding.
+
+**Do not** rely on local absolute paths alone. **Do not** ask Warwick to locate,
+attach, upload or copy a deliverable between systems. **Do not** make Drive a
+precondition for anything.

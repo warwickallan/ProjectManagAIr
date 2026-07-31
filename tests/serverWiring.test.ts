@@ -109,6 +109,16 @@ describe('server wiring of the consultant views', () => {
     }
   });
 
+  it('keeps the Cockpit honest that Google Drive is optional and Git is canonical', () => {
+    const panel = readFileSync(path.join(process.cwd(), 'src', 'BuildHandoffsPanel.tsx'), 'utf8');
+    // The card leads with the committed build record...
+    expect(panel).toContain('Build record in Git');
+    expect(panel).toContain('GitHub is the canonical record');
+    // ...and never presents the mirror as something a build is waiting on.
+    expect(panel).toContain('Connect Google Drive (optional)');
+    expect(panel).not.toContain('Google Drive connection required');
+  });
+
   it('serves no route that returns skill or prompt text from a run', () => {
     // A revision body is a reusable template and may be served. An ASSEMBLED
     // prompt contains customer source windows and must not be, in any form.

@@ -501,3 +501,21 @@ select.input { appearance: auto; }
 .handoff-steps li strong { display: block; color: #24345b; }
 .handoff-steps li.step-failed strong { color: #97372f; }
 .handoff-steps li.step-skipped strong { color: var(--subtle); }
+
+/* The Drive mirror is optional and must not read like an outstanding task. */
+.optional-mirror {
+  margin: 0.35rem 0 0;
+  font-size: 0.82rem;
+  color: var(--muted, #5c6470);
+}
+.optional-mirror .optional-tag {
+  display: inline-block;
+  margin-right: 0.4rem;
+  padding: 0.05rem 0.4rem;
+  border: 1px solid currentColor;
+  border-radius: 0.6rem;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}

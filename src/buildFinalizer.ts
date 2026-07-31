@@ -53,13 +53,47 @@ const sha40 = z.string().regex(/^[0-9a-f]{40}$/, 'must be a full 40-character SH
 /**
  * How a deliverable may be handled.
  *
- * Only `safe_for_drive` is ever uploaded automatically. The other three are
- * refusals with different reasons, and they are refusals a builder must make
- * deliberately: the default when a builder does not classify a file is to treat
- * it as `local_only`, never to guess that it is safe.
+ * This repository is PUBLIC, so `safe_for_public_git` is a deliberate statement
+ * about a file that anyone on the internet may read — never a default. There is
+ * no inferred classification: a builder that does not classify a file cannot
+ * declare it at all, and nothing unclassified is ever committed or uploaded.
+ *
+ *   safe_for_public_git     may be committed to this public repository, and
+ *                           mirrored to Drive if Drive is configured.
+ *   safe_for_drive          not for public Git; may be mirrored to Drive.
+ *   optional_private_mirror kept out of public Git on purpose; mirrored only
+ *                           when a Drive destination is explicitly declared.
+ *   local_only              never leaves the machine.
+ *   contains_customer_data  never leaves the machine, and never enters Git.
+ *   contains_secrets        never leaves the machine, and never enters Git.
  */
-export const DELIVERABLE_CLASSIFICATIONS = ['safe_for_drive', 'contains_customer_data', 'contains_secrets', 'local_only'] as const;
+export const DELIVERABLE_CLASSIFICATIONS = [
+  'safe_for_public_git',
+  'safe_for_drive',
+  'optional_private_mirror',
+  'local_only',
+  'contains_customer_data',
+  'contains_secrets',
+] as const;
 export type DeliverableClassification = typeof DELIVERABLE_CLASSIFICATIONS[number];
+
+/** The only classification that may be committed to a public repository. */
+export const GIT_COMMITTABLE: readonly DeliverableClassification[] = ['safe_for_public_git'];
+
+/**
+ * What may go to Drive, when a Drive destination is declared. Drive is a private
+ * folder, so it is a superset of what public Git may hold — but never a route
+ * for customer data, secrets or anything marked local_only.
+ */
+export const DRIVE_MIRRORABLE: readonly DeliverableClassification[] = ['safe_for_public_git', 'safe_for_drive', 'optional_private_mirror'];
+
+export function mayEnterPublicGit(classification: DeliverableClassification): boolean {
+  return GIT_COMMITTABLE.includes(classification);
+}
+
+export function mayBeMirroredToDrive(classification: DeliverableClassification): boolean {
+  return DRIVE_MIRRORABLE.includes(classification);
+}
 
 export const deliverableSchema = z.object({
   /** Absolute path, or a path relative to the manifest's own directory. */
@@ -100,14 +134,31 @@ export const buildHandoffManifestSchema = z.object({
     model: z.string().min(1),
     session: z.string().min(1).nullable().default(null),
   }).strict(),
-  /** The human-readable handoff, kept outside Git. */
+  /** The full, possibly machine-specific handoff, kept outside Git. */
   handoffDocumentPath: z.string().min(1).nullable().default(null),
+  /**
+   * Repository-relative path of the SANITISED handoff committed to Git — the
+   * canonical build record. GitHub is the canonical record, so a build that
+   * names one is not COMPLETED until that file is proved present in the exact
+   * commit being pushed.
+   */
+  gitHandoffPath: z.string().min(1).nullable().default(null),
   deliverables: z.array(deliverableSchema).default([]),
+  /**
+   * Optional. Google Drive is a convenience mirror, not part of the completion
+   * contract: omit this and Drive reports `disabled` and changes nothing about
+   * the verdict.
+   */
   drive: z.object({
-    /** Omit to skip Drive mirroring entirely; a build that declares it must complete it. */
     folderId: z.string().min(1),
     folderName: z.string().min(1).default('ProjectManagAIr'),
     buildDeliverablesFolder: z.string().min(1).default('Build Deliverables'),
+    /**
+     * Opt in to Drive being load-bearing. Off by default: a missing OAuth client
+     * or a Drive outage must never turn a pushed, verified, PR'd build into
+     * PARTIAL.
+     */
+    required: z.boolean().default(false),
   }).strict().nullable().default(null),
 }).strict();
 
@@ -156,7 +207,26 @@ export interface FinalizeResult {
   localHeadSha: string | null;
   remoteHeadSha: string | null;
   pullRequest: { number: number; url: string; draft: boolean; headSha: string | null; created: boolean } | null;
+  /** Whether the canonical record — the sanitised handoff — is in the pushed commit. */
+  gitHandoff: {
+    path: string | null;
+    /** `present` in the exact commit, `missing` from it, or `not-declared`. */
+    status: 'present' | 'missing' | 'not-declared';
+  };
   drive: {
+    /**
+     * Google Drive is optional and is never part of the completion contract
+     * unless the manifest opts in with `drive.required`.
+     *
+     *   disabled       the manifest declares no Drive destination
+     *   not_configured declared, but Drive is not connected on this machine
+     *   skipped        deliberately not run (a dry run)
+     *   mirrored       deliverables are in the build folder
+     *   failed         Drive was configured and something went wrong
+     */
+    status: 'disabled' | 'not_configured' | 'skipped' | 'mirrored' | 'failed';
+    /** True only when the manifest opted in; otherwise a Drive failure cannot change the verdict. */
+    required: boolean;
     attempted: boolean;
     folderId: string | null;
     folderName: string | null;
@@ -612,7 +682,8 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     localHeadSha: null,
     remoteHeadSha: null,
     pullRequest: null,
-    drive: { attempted: false, folderId: null, folderName: null, folderUrl: null, requiredCount: 0, uploadedCount: 0, connectionRequired: false, error: null, completionRecordId: null, completionRecordUrl: null },
+    gitHandoff: { path: manifest?.gitHandoffPath ?? null, status: 'not-declared' },
+    drive: { status: 'disabled', required: false, attempted: false, folderId: null, folderName: null, folderUrl: null, requiredCount: 0, uploadedCount: 0, connectionRequired: false, error: null, completionRecordId: null, completionRecordUrl: null },
     deliverables: [],
     steps,
     errors,
@@ -733,6 +804,15 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     // strongest statement that can honestly be made without mutating anything.
     record({ key: 'commit', title: 'Verify the expected commit exists', status: 'skipped', detail: 'Dry run: the verified bundle carries this commit and would supply it.', mutated: false });
     record({ key: 'ancestry', title: 'Verify the declared baseline', status: 'skipped', detail: 'Dry run: the commit was not fetched, so its ancestry cannot be checked without mutating the repository.', mutated: false });
+    record({
+      key: 'git-handoff',
+      title: 'Verify the committed build record',
+      status: manifest.gitHandoffPath ? 'skipped' : 'failed',
+      detail: manifest.gitHandoffPath
+        ? `Dry run: ${manifest.gitHandoffPath} cannot be read out of a commit that was not fetched.`
+        : 'This manifest declares no gitHandoffPath. GitHub is the canonical build record, so a build must commit a sanitised handoff and name it here.',
+      mutated: false,
+    });
 
     // The two refusals a dry run exists to surface are both read-only, so they
     // are performed for real rather than skipped. Without these the dry run
@@ -789,6 +869,38 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     return finish(result, options, now);
   }
   record({ key: 'ancestry', title: 'Verify the declared baseline', status: 'ok', detail: `${manifest.expectedHeadSha.slice(0, 12)} descends from ${manifest.baselineSha.slice(0, 12)}.`, mutated: false });
+
+  /* ------------------------------------------------- the canonical Git record */
+
+  // GitHub is the canonical build record. A build whose sanitised handoff is not
+  // in the commit being pushed is not finished, however well the push itself
+  // goes — so this is checked against the commit's own tree, before the push,
+  // rather than trusted from the manifest.
+  if (!manifest.gitHandoffPath) {
+    result.gitHandoff = { path: null, status: 'not-declared' };
+    record({
+      key: 'git-handoff',
+      title: 'Verify the committed build record',
+      status: 'failed',
+      detail: 'This manifest declares no gitHandoffPath. GitHub is the canonical build record, so a build must commit a sanitised handoff and name it here.',
+      mutated: false,
+    });
+    return finish(result, options, now);
+  }
+  const committedHandoff = await git(['cat-file', '-e', `${manifest.expectedHeadSha}:${manifest.gitHandoffPath}`]);
+  if (committedHandoff.code !== 0) {
+    result.gitHandoff = { path: manifest.gitHandoffPath, status: 'missing' };
+    record({
+      key: 'git-handoff',
+      title: 'Verify the committed build record',
+      status: 'failed',
+      detail: `${manifest.gitHandoffPath} is not in commit ${manifest.expectedHeadSha}. The canonical build record must be committed on the branch being pushed; commit it and produce a new bundle.`,
+      mutated: false,
+    });
+    return finish(result, options, now);
+  }
+  result.gitHandoff = { path: manifest.gitHandoffPath, status: 'present' };
+  record({ key: 'git-handoff', title: 'Verify the committed build record', status: 'ok', detail: `${manifest.gitHandoffPath} is present in ${manifest.expectedHeadSha.slice(0, 12)}.`, mutated: false });
 
   /* ------------------------------------------------------------ local branch */
 
@@ -887,7 +999,8 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
       // Unverified means no pull request: a PR must never be opened against a
       // head this tool has not proved is on origin.
       record({ key: 'pull-request', title: 'Open or update the draft pull request', status: 'skipped', detail: 'Skipped: the remote SHA was not confirmed, so no pull request was opened or updated.', mutated: false });
-      record({ key: 'drive', title: 'Mirror deliverables to Google Drive', status: 'skipped', detail: 'Skipped: the remote SHA was not confirmed.', mutated: false });
+      result.drive.status = 'skipped';
+      record({ key: 'drive', title: 'Mirror deliverables to Google Drive (optional)', status: 'skipped', detail: 'Skipped: the remote SHA was not confirmed.', mutated: false });
       result.state = pushed ? 'PARTIAL' : 'FAILED';
       return finish(result, options, now);
     }
@@ -972,13 +1085,19 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     // the last line of defence behind the per-deliverable guards above.
     const message = redactSecrets(error instanceof Error ? error.message : String(error));
     result.drive.error = message;
-    record({ key: 'drive', title: 'Mirror deliverables to Google Drive', status: 'failed', detail: `The Drive mirror failed unexpectedly: ${message} The branch is pushed and verified on origin; re-run to retry only the mirror.`, mutated: false });
+    result.drive.status = 'failed';
+    record({ key: 'drive', title: DRIVE_STEP_TITLE, status: 'failed', detail: `The optional Drive mirror failed unexpectedly: ${message} The branch is pushed and verified on origin; re-run to retry only the mirror.`, mutated: false });
   }
 
   /* ------------------------------------------------------------------ verdict */
 
+  // Google Drive is an optional mirror. Unless the manifest explicitly opted in
+  // with `drive.required`, a Drive failure is reported in `drive.status` and in
+  // the errors, and changes nothing about the verdict: a build that is pushed,
+  // verified, PR'd and carrying its committed record in Git is COMPLETED.
+  const driveCounts = Boolean(manifest.drive?.required);
   const gitFailed = steps.some((step) => step.status === 'failed' && !SOFT_FAILURE_KEYS.includes(step.key));
-  const softFailed = steps.some((step) => step.status === 'failed' && SOFT_FAILURE_KEYS.includes(step.key));
+  const softFailed = steps.some((step) => step.status === 'failed' && SOFT_FAILURE_KEYS.includes(step.key) && (step.key !== 'drive' || driveCounts));
   result.state = gitFailed ? 'FAILED' : softFailed ? 'PARTIAL' : options.dryRun ? 'PARTIAL' : 'COMPLETED';
   if (options.dryRun) errors.push('Dry run: no mutation was performed, so the result is reported as PARTIAL by definition.');
   result.finishedAt = now().toISOString();
@@ -1070,7 +1189,7 @@ async function mirrorDeliverables(
       if (!stat.isFile()) {
         return { ...base, uploadStatus: 'unreadable', error: `${absolute} is not a regular file, so it cannot be hashed or uploaded.` };
       }
-      return { ...base, sha256: sha256File(absolute), bytes: stat.size, uploadStatus: entry.classification === 'safe_for_drive' ? 'not-attempted' : 'skipped-classification' };
+      return { ...base, sha256: sha256File(absolute), bytes: stat.size, uploadStatus: mayBeMirroredToDrive(entry.classification) ? 'not-attempted' : 'skipped-classification' };
     } catch (error) {
       return { ...base, uploadStatus: 'unreadable', error: `${absolute} could not be read: ${redactSecrets(error instanceof Error ? error.message : String(error))}` };
     }
@@ -1078,28 +1197,32 @@ async function mirrorDeliverables(
   disambiguateTitles(declared);
   result.deliverables = declared;
 
-  const safe = declared.filter((entry) => entry.classification === 'safe_for_drive' && !['missing', 'unreadable'].includes(entry.uploadStatus));
-  result.drive.requiredCount = declared.filter((entry) => entry.required && entry.classification === 'safe_for_drive').length;
+  const safe = declared.filter((entry) => mayBeMirroredToDrive(entry.classification) && !['missing', 'unreadable'].includes(entry.uploadStatus));
+  result.drive.requiredCount = declared.filter((entry) => entry.required && mayBeMirroredToDrive(entry.classification)).length;
+  result.drive.required = Boolean(manifest.drive?.required);
 
   if (!manifest.drive) {
-    record({ key: 'drive', title: 'Mirror deliverables to Google Drive', status: 'skipped', detail: 'The manifest declares no Drive destination.', mutated: false });
+    result.drive.status = 'disabled';
+    record({ key: 'drive', title: DRIVE_STEP_TITLE, status: 'skipped', detail: 'Google Drive mirroring is not enabled for this build. GitHub is the canonical record.', mutated: false });
     return;
   }
   result.drive.attempted = true;
   result.drive.folderName = manifest.drive.folderName;
 
   if (options.dryRun) {
-    record({ key: 'drive', title: 'Mirror deliverables to Google Drive', status: 'skipped', detail: 'Dry run: nothing was uploaded.', mutated: false });
+    result.drive.status = 'skipped';
+    record({ key: 'drive', title: DRIVE_STEP_TITLE, status: 'skipped', detail: 'Dry run: nothing was uploaded.', mutated: false });
     return;
   }
   if (!options.drive) {
     result.drive.connectionRequired = true;
-    result.drive.error = 'Google Drive connection required.';
+    result.drive.status = 'not_configured';
+    result.drive.error = 'Google Drive is not configured on this machine.';
     record({
       key: 'drive',
-      title: 'Mirror deliverables to Google Drive',
-      status: 'failed',
-      detail: 'Google Drive connection required. Connect Drive in the Cockpit, then retry this handoff; the pushed branch and the pull request are unaffected.',
+      title: DRIVE_STEP_TITLE,
+      status: manifest.drive.required ? 'failed' : 'skipped',
+      detail: `Google Drive is not configured on this machine, so the optional mirror was not run.${manifest.drive.required ? ' This manifest marks Drive required, so the build is PARTIAL until it is connected.' : ' The Git finalisation is unaffected.'}`,
       mutated: false,
     });
     return;
@@ -1110,14 +1233,15 @@ async function mirrorDeliverables(
   } catch (error) {
     const connectionRequired = error instanceof DriveConnectionRequiredError;
     result.drive.connectionRequired = connectionRequired;
+    result.drive.status = connectionRequired ? 'not_configured' : 'failed';
     result.drive.error = redactSecrets(error instanceof Error ? error.message : String(error));
     record({
       key: 'drive',
-      title: 'Mirror deliverables to Google Drive',
-      status: 'failed',
+      title: DRIVE_STEP_TITLE,
+      status: manifest.drive.required ? 'failed' : 'skipped',
       detail: connectionRequired
-        ? `Google Drive connection required. ${result.drive.error}`
-        : `Google Drive is not usable: ${result.drive.error}`,
+        ? `Google Drive is not connected on this machine, so the optional mirror was not run: ${result.drive.error}${manifest.drive.required ? '' : ' The Git finalisation is unaffected.'}`
+        : `The optional Google Drive mirror is not usable: ${result.drive.error}${manifest.drive.required ? '' : ' The Git finalisation is unaffected.'}`,
       mutated: false,
     });
     return;
@@ -1165,30 +1289,36 @@ async function mirrorDeliverables(
     }
 
     result.drive.uploadedCount = declared.filter((entry) => ['uploaded', 'updated'].includes(entry.uploadStatus)).length;
-    const outstanding = declared.filter((entry) => entry.required && entry.classification === 'safe_for_drive' && !['uploaded', 'updated'].includes(entry.uploadStatus));
+    const outstanding = declared.filter((entry) => entry.required && mayBeMirroredToDrive(entry.classification) && !['uploaded', 'updated'].includes(entry.uploadStatus));
     if (outstanding.length > 0) {
-      result.drive.error = `${outstanding.length} required deliverable(s) did not upload.`;
+      result.drive.status = 'failed';
+      result.drive.error = `${outstanding.length} deliverable(s) did not reach the optional Drive mirror.`;
       record({
         key: 'drive',
-        title: 'Mirror deliverables to Google Drive',
+        title: DRIVE_STEP_TITLE,
         status: 'failed',
-        detail: `${result.drive.uploadedCount} of ${result.drive.requiredCount} required deliverable(s) uploaded. Outstanding: ${outstanding.map((entry) => `${entry.title} (${entry.error ?? 'unknown reason'})`).join('; ')}`,
+        detail: `${result.drive.uploadedCount} of ${result.drive.requiredCount} deliverable(s) reached the optional Drive mirror. Outstanding: ${outstanding.map((entry) => `${entry.title} (${entry.error ?? 'unknown reason'})`).join('; ')}${manifest.drive.required ? '' : ' The Git finalisation is unaffected.'}`,
         mutated,
       });
       return;
     }
+    result.drive.status = 'mirrored';
     record({
       key: 'drive',
-      title: 'Mirror deliverables to Google Drive',
+      title: DRIVE_STEP_TITLE,
       status: 'ok',
       detail: `${result.drive.uploadedCount} deliverable(s) in ${result.drive.folderUrl}. ${declared.filter((entry) => entry.uploadStatus === 'skipped-classification').length} withheld by classification, ${declared.filter((entry) => ['missing', 'unreadable'].includes(entry.uploadStatus)).length} unreadable or absent.`,
       mutated,
     });
   } catch (error) {
+    result.drive.status = 'failed';
     result.drive.error = redactSecrets(error instanceof Error ? error.message : String(error));
-    record({ key: 'drive', title: 'Mirror deliverables to Google Drive', status: 'failed', detail: result.drive.error, mutated: false });
+    record({ key: 'drive', title: DRIVE_STEP_TITLE, status: 'failed', detail: `${result.drive.error}${manifest.drive.required ? '' : ' This is the optional mirror; the Git finalisation is unaffected.'}`, mutated: false });
   }
 }
+
+/** One title, used everywhere, so the Cockpit and the report agree it is optional. */
+const DRIVE_STEP_TITLE = 'Mirror deliverables to Google Drive (optional)';
 
 /**
  * Make every deliverable title unique within the build folder.
@@ -1287,9 +1417,11 @@ export function renderFinalizeReport(result: FinalizeResult): string {
   lines.push(`  Expected SHA ${result.expectedHeadSha}`);
   lines.push(`  Remote SHA   ${result.remoteHeadSha ?? 'not verified'}`);
   if (result.pullRequest) lines.push(`  Pull request #${result.pullRequest.number} ${result.pullRequest.draft ? '(draft) ' : ''}${result.pullRequest.url}`);
+  lines.push(`  Build record ${result.gitHandoff.path ?? 'not declared'} (${result.gitHandoff.status} in Git — the canonical record)`);
+  lines.push(`  Drive mirror ${result.drive.status}${result.drive.required ? ' (required by this manifest)' : ' (optional)'}`);
   if (result.drive.attempted) {
     lines.push(`  Drive folder ${result.drive.folderUrl ?? 'not created'}`);
-    lines.push(`  Deliverables ${result.drive.uploadedCount} of ${result.drive.requiredCount} required uploaded`);
+    lines.push(`  Deliverables ${result.drive.uploadedCount} of ${result.drive.requiredCount} mirrorable uploaded`);
     for (const entry of result.deliverables) {
       lines.push(`    ${entry.uploadStatus.padEnd(22)} ${entry.title}${entry.driveFileId ? ` — ${entry.driveFileId}` : ''}`);
     }
