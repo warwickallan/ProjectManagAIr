@@ -1,7 +1,10 @@
 # build/local-build-finalizer-v1 — the local build finaliser
 
 **Baseline** `6de535f17ada80f8b30c92626ca10cdd1e9e2228`
-**Base branch** `build/source-intelligence-acceptance-prompts-v1`
+**Base branch** `main` — this branch also carries the commits of
+`build/source-intelligence-acceptance-prompts-v1`, which could not be pushed
+either, so both builds arrive in one pull request and both have a record in
+`docs/build-handoffs`.
 **Built by** claude-opus-5, 31 July 2026
 **Verdict** COMPLETED on the build; the push, the pull request and the exact head
 SHA are recorded by the finaliser's completion record and in the pull request,

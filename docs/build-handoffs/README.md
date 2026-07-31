@@ -17,5 +17,9 @@ client information, unredacted logs, git bundles or local machine
 configuration. Those stay on the machine, classified in the handoff manifest so a
 reader can see what was withheld and why.
 
+A build made before the standing order existed can still get a record here,
+written afterwards on a later branch and saying so. A record that arrives late is
+worth more than no record.
+
 `docs/build-finalisation.md` describes the finaliser that reads these, and
 `docs/MVP-BUILD-CONTRACT.md` holds the standing order that requires them.
