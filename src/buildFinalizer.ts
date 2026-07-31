@@ -387,14 +387,22 @@ export function discoverManifests(root: string): DiscoveredManifest[] {
 }
 
 /**
- * The newest pending manifest that actually parses.
+ * The pending manifest the no-argument command should act on.
+ *
+ * Never-attempted handoffs come first, newest of those; only then the newest
+ * previously-attempted one. Without that, a handoff stuck at PARTIAL — because
+ * Drive is not connected yet, say — would be selected forever and a second
+ * pending handoff behind it would never be reached at all.
  *
  * An invalid file is skipped rather than fatal: one malformed manifest left
  * behind by a failed build must not stop the next good one from finalising, and
  * the Cockpit lists the malformed file with its parse error either way.
  */
 export function newestPendingManifest(root: string): DiscoveredManifest | null {
-  return discoverManifests(root).find((entry) => entry.state === 'pending' && entry.manifest !== null) ?? null;
+  const pending = discoverManifests(root).filter((entry) => entry.state === 'pending' && entry.manifest !== null);
+  const attempted = (entry: DiscoveredManifest) =>
+    existsSync(path.join(path.dirname(entry.path), `${path.basename(entry.path, '.json')}${COMPLETION_SUFFIX}`));
+  return pending.find((entry) => !attempted(entry)) ?? pending[0] ?? null;
 }
 
 /* ------------------------------------------------------------------------------------ *

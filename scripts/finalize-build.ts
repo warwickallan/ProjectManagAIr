@@ -24,13 +24,16 @@ import {
 import { GitHubRestPort, GoogleDriveRestPort, beginDriveAuthorization, driveCredentialPaths } from '../src/buildFinalizerPorts.js';
 import { resolveHandoffRoot } from '../src/buildHandoffs.js';
 
-const repoRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-
 function arg(name: string): string | null {
   const index = process.argv.indexOf(`--${name}`);
   return index >= 0 && process.argv[index + 1] && !process.argv[index + 1].startsWith('--') ? process.argv[index + 1] : null;
 }
 const flag = (name: string) => process.argv.includes(`--${name}`);
+
+// Normally the repository this script sits in. The first finalisation is the
+// exception: the finaliser is on the branch being pushed, so a standalone copy
+// runs from `.runtime/finaliser` and is told which workspace to act on.
+const repoRoot = path.resolve(arg('repo-root') ?? path.dirname(path.dirname(fileURLToPath(import.meta.url))));
 
 const handoffRoot = arg('handoff-root') ?? resolveHandoffRoot(repoRoot);
 
@@ -87,6 +90,17 @@ const result: FinalizeResult = await finalizeBuild({
 console.log('');
 console.log(renderFinalizeReport(result));
 
+// A second handoff behind this one is easy to miss, and missing it is how a
+// build sits unpushed for a week.
+const remaining = discoverManifests(handoffRoot).filter((entry) => entry.state === 'pending' && entry.path !== result.manifestPath);
+if (remaining.length > 0) {
+  console.log('');
+  console.log(`${remaining.length} other handoff(s) are still pending. Run this again to take the next one:`);
+  for (const entry of remaining) {
+    console.log(`  ${entry.manifest ? `${entry.manifest.branch} @ ${entry.manifest.expectedHeadSha.slice(0, 12)}` : `UNREADABLE — ${entry.error}`}`);
+  }
+}
+
 // 0 completed, 1 partial (safe, retryable), 2 failed before any mutation.
 //
 // `process.exitCode`, not `process.exit()`. PowerShell runs this through a pipe,
@@ -102,6 +116,7 @@ function readUsage(): string {
     '  (no arguments)          finalise the newest readable pending handoff',
     '  --manifest <path>       finalise one named handoff',
     '  --handoff-root <path>   override the handoff directory',
+    '  --repo-root <path>      act on this workspace instead of the one this script sits in',
     '  --list                  list pending and completed handoffs',
     '  --dry-run               verify everything and change nothing',
     '  --connect-drive         run the one-time Google Drive consent flow',

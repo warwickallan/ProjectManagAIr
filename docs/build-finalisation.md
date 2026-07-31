@@ -58,6 +58,36 @@ the suite.
     cannot name its own Drive id; the local copy is rewritten afterwards so that
     it does.
 
+## Running it the first time
+
+The finaliser lives on the branch it is pushing, so the very first finalisation
+cannot run from the working tree — the command is not there yet. A standalone
+copy is therefore delivered alongside the handoff, under
+`<workspace>\.runtime\finaliser`, which is git-ignored:
+
+```
+.runtime\finaliser\finish-projectmanagair-build.cmd
+.runtime\finaliser\scripts\finish-projectmanagair-build.ps1
+.runtime\finaliser\scripts\finalize-build.ts
+.runtime\finaliser\src\buildFinalizer.ts
+.runtime\finaliser\src\buildFinalizerPorts.ts
+.runtime\finaliser\src\buildHandoffs.ts
+```
+
+Double-click that `.cmd`. The launcher walks up from wherever it sits until it
+finds a prepared workspace (one with `node_modules\tsx`), uses that workspace's
+Node runtime and `Data` folder, and passes it to the engine as `--repo-root`.
+From the repository root — which is where it lives once the branch is merged —
+that walk stops immediately and behaves exactly as before.
+
+## Choosing which handoff runs
+
+With no arguments, the command takes the newest pending handoff **that has never
+been attempted**, and only then the newest previously-attempted one. Without
+that rule a handoff stuck at PARTIAL (Drive not connected, say) would be
+selected forever and a second handoff behind it would never be reached. After
+each run the command lists any handoffs still pending.
+
 ## What "the working tree is safe" means, and why it is narrow
 
 Fetching a ref and pushing it does not read, write or check out a single file.

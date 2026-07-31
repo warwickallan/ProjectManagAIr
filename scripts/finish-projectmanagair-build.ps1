@@ -18,10 +18,23 @@ $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
 
+# The first time this build is finalised, the finaliser is not yet in the
+# checked-out working tree — it is on the branch being pushed. A standalone copy
+# is therefore delivered under `.runtime\finaliser`, and running from there must
+# still find the workspace's Node runtime, its node_modules and its Data folder.
+# Walk up until a prepared workspace is found; from the repository root this
+# stops immediately and behaves exactly as before.
+$workspaceRoot = $repoRoot
+while (-not (Test-Path -LiteralPath (Join-Path $workspaceRoot 'node_modules\tsx\dist\cli.mjs'))) {
+    $parent = Split-Path -Parent $workspaceRoot
+    if ([string]::IsNullOrEmpty($parent) -or $parent -eq $workspaceRoot) { break }
+    $workspaceRoot = $parent
+}
+
 function Resolve-NodeExecutable {
     # The portable runtime the rest of Project ManagAIr uses, then whatever is on
     # PATH. Nothing is installed and nothing is downloaded.
-    $portable = Join-Path $repoRoot '.runtime\node-v22.23.1-win-x64\node.exe'
+    $portable = Join-Path $workspaceRoot '.runtime\node-v22.23.1-win-x64\node.exe'
     if (Test-Path -LiteralPath $portable) { return $portable }
     $onPath = Get-Command node -ErrorAction SilentlyContinue
     if ($onPath) { return $onPath.Source }
@@ -35,7 +48,7 @@ if (-not $nodeExe) {
     exit 3
 }
 
-$tsx = Join-Path $repoRoot 'node_modules\tsx\dist\cli.mjs'
+$tsx = Join-Path $workspaceRoot 'node_modules\tsx\dist\cli.mjs'
 if (-not (Test-Path -LiteralPath $tsx)) {
     Write-Host 'Project ManagAIr local Node dependencies are missing.' -ForegroundColor Red
     Write-Host 'Run this from a prepared Project ManagAIr workspace with node_modules present. Nothing is installed automatically.'
@@ -53,7 +66,11 @@ Write-Host 'Project ManagAIr — finishing the build' -ForegroundColor Cyan
 Write-Host ''
 
 $entry = Join-Path $repoRoot 'scripts\finalize-build.ts'
-& $nodeExe $tsx $entry @args
+# The engine acts on the workspace, which is not necessarily where this script
+# lives. An explicit --repo-root from the caller always wins.
+$forwarded = @($args)
+if ($forwarded -notcontains '--repo-root') { $forwarded += @('--repo-root', $workspaceRoot) }
+& $nodeExe $tsx $entry @forwarded
 $code = $LASTEXITCODE
 
 Write-Host ''

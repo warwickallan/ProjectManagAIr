@@ -460,6 +460,28 @@ describe('it refuses rather than guessing', () => {
   });
 });
 
+describe('choosing which handoff to finalise', () => {
+  it('takes a never-attempted handoff ahead of one already stuck at PARTIAL', async () => {
+    const fx = fixture();
+    // The older handoff runs first and sticks at PARTIAL because Drive is not
+    // connected. Selecting purely by modification time would then pick it again
+    // forever and the second handoff would never be reached.
+    const stuck = writeManifest(fx, {
+      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables' },
+    }, 'stuck.json');
+    const first = await run(fx, stuck, new FakeGitHub(() => fx.headSha), null);
+    expect(first.state).toBe('PARTIAL');
+
+    const fresh = writeManifest(fx, {}, 'fresh.json');
+    expect(newestPendingManifest(fx.handoffRoot)!.path).toBe(fresh);
+
+    // ...and once nothing is unattempted, the newest is taken again, so Retry
+    // still reaches the one that needs it.
+    await run(fx, fresh, new FakeGitHub(() => fx.headSha), new FakeDrive());
+    expect(newestPendingManifest(fx.handoffRoot)!.path).toBe(stuck);
+  });
+});
+
 /* ------------------------------------------------------------------ idempotence */
 
 describe('running it again is safe', () => {
