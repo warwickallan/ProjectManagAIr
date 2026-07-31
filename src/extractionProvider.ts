@@ -94,6 +94,29 @@ export interface StructuredExtractionRequest {
   promptSha256: string;
   skillSha256: string;
   callIndex: number;
+  /**
+   * Called with the provider's complete raw response the instant it arrives and
+   * BEFORE any parsing, schema validation, canonicalisation or merging.
+   *
+   * A provider implementation must call this before it looks at the bytes. It is
+   * the caller's only opportunity to preserve a completed model response: once
+   * the parser has thrown, the response exists nowhere but in a truncated error
+   * excerpt, and a full multi-call pass has to be paid for again. The callback
+   * returns an opaque handle the caller can use to record the parse outcome
+   * against the response it preserved.
+   */
+  preserveRawOutput?: (event: RawProviderResponse) => string | null;
+}
+
+/** One complete, unparsed provider response, exactly as it was received. */
+export interface RawProviderResponse {
+  raw: string;
+  requestedAt: string;
+  receivedAt: string;
+  durationMs: number;
+  /** Populated when the transport carries usage; null when only estimates exist. */
+  reportedInputTokens?: number | null;
+  reportedOutputTokens?: number | null;
 }
 
 export interface ExtractionCoverage {
@@ -1100,7 +1123,13 @@ export class FakeStructuredExtractionProvider implements StructuredExtractionPro
   }
 
   async extract(request: StructuredExtractionRequest): Promise<StructuredExtractionResult> {
+    const requestedAt = new Date().toISOString();
+    const started = Date.now();
     const result = await this.handler(request);
+    // A synthetic provider preserves too. Otherwise every test of the
+    // preservation path would have to use a real CLI, and the guarantee would be
+    // exercised only by the one run it is most expensive to repeat.
+    request.preserveRawOutput?.({ raw: stable(result.output), requestedAt, receivedAt: new Date().toISOString(), durationMs: Date.now() - started });
     return { output: result.output, usage: normalizeUsage(result.usage) };
   }
 }
@@ -1186,6 +1215,8 @@ export class ClaudeCodeStructuredExtractionProvider implements StructuredExtract
   }
 
   async extract(request: StructuredExtractionRequest, signal?: AbortSignal): Promise<StructuredExtractionResult> {
+    const requestedAt = new Date().toISOString();
+    const started = Date.now();
     try {
       const run = await runCliCommand({
         providerId: this.identity.providerId,
@@ -1198,10 +1229,12 @@ export class ClaudeCodeStructuredExtractionProvider implements StructuredExtract
         signal,
         timeoutMs: this.timeoutMs,
       });
-      // Persist the raw response for every call, not only failing ones. A
-      // downstream merge or gate failure otherwise discards a multi-call
-      // extraction with no way to recover the model's work, which is exactly how
-      // twenty-five minutes of output was lost during acceptance.
+      // Persist the raw response for every call, not only failing ones, and
+      // BEFORE the parser is allowed to see it. A downstream parse, merge or
+      // gate failure otherwise discards a multi-call extraction with no way to
+      // recover the model's work — which is exactly how twenty-five minutes of
+      // completed output was lost during the previous acceptance attempt.
+      request.preserveRawOutput?.({ raw: run.stdout, requestedAt, receivedAt: new Date().toISOString(), durationMs: Date.now() - started });
       captureRawOutput({ providerId: this.identity.providerId }, run.stdout);
       const output = parseStructuredExtractionOutputText(run.stdout, {
         providerId: this.identity.providerId,
@@ -1346,6 +1379,8 @@ export class CodexCliStructuredExtractionProvider implements StructuredExtractio
   }
 
   async extract(request: StructuredExtractionRequest, signal?: AbortSignal): Promise<StructuredExtractionResult> {
+    const requestedAt = new Date().toISOString();
+    const started = Date.now();
     try {
       const run = await runCliCommand({
         providerId: this.identity.providerId,
@@ -1358,6 +1393,10 @@ export class CodexCliStructuredExtractionProvider implements StructuredExtractio
         signal,
         timeoutMs: this.timeoutMs,
       });
+      // The whole event stream, before it is interpreted. `parseCodexJsonl`
+      // throws on a stream that carried an error and no agent message, so
+      // preserving after it would lose the diagnostic as well as the output.
+      request.preserveRawOutput?.({ raw: run.stdout, requestedAt, receivedAt: new Date().toISOString(), durationMs: Date.now() - started });
       const parsed = parseCodexJsonl(run.stdout, this.identity.providerId);
       const output = parseStructuredExtractionOutputText(parsed.message, {
         providerId: this.identity.providerId,

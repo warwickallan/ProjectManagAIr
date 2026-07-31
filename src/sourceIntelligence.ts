@@ -1136,7 +1136,13 @@ export function applyReviewedChangeset(db: DatabaseSync, changesetId: string) {
     rebuildProjection(db, String(changeset.project_id), timestamp);
     db.prepare("UPDATE register_changesets SET review_status = 'applied', applied_at = ? WHERE id = ?").run(timestamp, changesetId);
     db.prepare("UPDATE source_processing_jobs SET status = 'complete', current_stage = 'complete', completed_at = ?, updated_at = ? WHERE packet_id = ?").run(timestamp, timestamp, String(packet.id));
-    db.prepare('UPDATE consultant_briefs SET stale = 1 WHERE project_id = ?').run(String(changeset.project_id));
+    // Applying a changeset changes the register, so every cached consultant view
+    // for this project now describes a state that no longer exists. They are
+    // marked stale with a reason and KEPT: nothing regenerates on its own, and a
+    // stale brief is still the best reasoning anyone has until someone asks for
+    // a new one.
+    db.prepare("UPDATE consultant_briefs SET stale = 1, stale_reason = ?, stale_at = ? WHERE project_id = ? AND stale = 0")
+      .run(`Changeset ${changesetId} was applied to the register on ${timestamp}, so this view describes a superseded state.`, timestamp, String(changeset.project_id));
     db.exec('COMMIT;');
   } catch (error) {
     db.exec('ROLLBACK;');
@@ -1274,7 +1280,28 @@ function briefContext(db: DatabaseSync, projectId: string) {
 }
 
 function readCachedBrief(db: DatabaseSync, projectId: string, mode: string, selectionHash: string) {
-  const existing = db.prepare('SELECT * FROM consultant_briefs WHERE project_id = ? AND mode = ? AND selection_hash = ? AND stale = 0').get(projectId, mode, selectionHash) as Record<string, unknown> | undefined;
+  // Migration 013 widened the cache key to the full identity of what produced a
+  // view. This legacy reader is only ever asked for the *deterministic* template,
+  // which depends on nothing but the selection, so it looks up the deterministic
+  // cache key directly rather than matching any row that happens to share a
+  // selection hash — otherwise a model-generated brief would be served from the
+  // zero-call path and reported as deterministic.
+  const existing = db.prepare('SELECT * FROM consultant_briefs WHERE project_id = ? AND mode = ? AND cache_key = ? AND stale = 0').get(projectId, mode, deterministicCacheKey(selectionHash)) as Record<string, unknown> | undefined;
+  return existing ? { id: String(existing.id), selectionHash, briefMarkdown: String(existing.brief_markdown), citations: JSON.parse(String(existing.citations_json)) as string[], generationMode: String(existing.provider_id), stale: false } : null;
+}
+
+/** The cache key a deterministic template renders under. Never a provider's. */
+function deterministicCacheKey(selectionHash: string): string {
+  return `deterministic-template:${selectionHash}`;
+}
+
+/** The cache key the legacy grounded-brief route renders under. */
+function providerCacheKey(provider: GroundedBriefProvider, selectionHash: string): string {
+  return `${provider.identity.providerId}:${provider.identity.modelLabel}:${selectionHash}`;
+}
+
+function readCachedBriefByKey(db: DatabaseSync, projectId: string, mode: string, selectionHash: string, cacheKey: string) {
+  const existing = db.prepare('SELECT * FROM consultant_briefs WHERE project_id = ? AND mode = ? AND cache_key = ? AND stale = 0').get(projectId, mode, cacheKey) as Record<string, unknown> | undefined;
   return existing ? { id: String(existing.id), selectionHash, briefMarkdown: String(existing.brief_markdown), citations: JSON.parse(String(existing.citations_json)) as string[], generationMode: String(existing.provider_id), stale: false } : null;
 }
 
@@ -1293,15 +1320,20 @@ export function buildDeterministicBrief(db: DatabaseSync, projectId: string, mod
   const lines = sections.flatMap(([title, rows]) => [`## ${title}`, ...(rows.slice(0, 6).length ? rows.slice(0, 6).map((row) => `- ${row.title} — ${row.status}${row.owner ? `; owner ${row.owner}` : ''}${row.dueDate ? `; due ${row.dueDate}` : ''} [${row.id}]`) : ['- Nothing currently selected.']), '']);
   const briefMarkdown = lines.join('\n').trim();
   const citations = selected.map((row) => row.id);
-  const id = `brief:${projectId}:${mode}:${selectionHash.slice(0, 16)}`;
-  db.prepare('INSERT INTO consultant_briefs (id, project_id, mode, selection_hash, brief_markdown, citations_json, provider_id, generated_at, stale) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0) ON CONFLICT(project_id, mode, selection_hash) DO UPDATE SET brief_markdown = excluded.brief_markdown, citations_json = excluded.citations_json, provider_id = excluded.provider_id, generated_at = excluded.generated_at, stale = 0')
-    .run(id, projectId, mode, selectionHash, briefMarkdown, JSON.stringify(citations), 'deterministic-template', nowIso());
+  const id = `brief:${projectId}:${mode}:deterministic:${selectionHash.slice(0, 16)}`;
+  db.prepare(`INSERT INTO consultant_briefs (id, project_id, mode, selection_hash, cache_key, brief_markdown, citations_json, selected_ids_json, themes_json, provider_id, model_label, generated_at, stale)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', 'deterministic-template', NULL, ?, 0)
+    ON CONFLICT(project_id, mode, cache_key) DO UPDATE SET brief_markdown = excluded.brief_markdown, citations_json = excluded.citations_json, selected_ids_json = excluded.selected_ids_json, provider_id = excluded.provider_id, generated_at = excluded.generated_at, stale = 0, stale_reason = NULL, stale_at = NULL`)
+    .run(id, projectId, mode, selectionHash, deterministicCacheKey(selectionHash), briefMarkdown, JSON.stringify(citations), JSON.stringify(citations), nowIso());
   return { id, selectionHash, briefMarkdown, citations, generationMode: 'deterministic-template', stale: false, selectedRecords: selected };
 }
 
 export async function buildConsultantBrief(db: DatabaseSync, projectId: string, mode: string, provider: GroundedBriefProvider) {
   const { selected, selectionHash } = briefContext(db, projectId);
-  const existing = readCachedBrief(db, projectId, mode, selectionHash);
+  // Keyed by this provider and model, not by the selection alone: a cached
+  // narrative produced by a different model is a different artefact, and serving
+  // it under this provider's name would misreport its provenance.
+  const existing = readCachedBriefByKey(db, projectId, mode, selectionHash, providerCacheKey(provider, selectionHash));
   if (existing && existing.generationMode === provider.identity.providerId) return existing;
   if (!provider.isAvailable()) return buildDeterministicBrief(db, projectId, mode);
   const prompt = `Create a concise Implementation Consultant brief from this bounded evidence pack. Group repetition, explain significance, propose meeting order, identify challenges and decisions. Do not introduce unsupported facts. Every non-heading factual line must end with one or more cited selected IDs in square brackets. Return markdown only.\n${stable({ mode, records: selected })}`;
@@ -1325,9 +1357,11 @@ export async function buildConsultantBrief(db: DatabaseSync, projectId: string, 
       return buildDeterministicBrief(db, projectId, mode);
     }
     const citations = [...new Set([...validation.markdown.matchAll(/\[([A-Z][A-Z0-9-]*-\d+|SRC-\d+)\]/g)].map((match) => match[1]))];
-    const id = `brief:${projectId}:${mode}:${selectionHash.slice(0, 16)}`;
-    db.prepare('INSERT INTO consultant_briefs (id, project_id, mode, selection_hash, brief_markdown, citations_json, provider_id, generated_at, stale) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0) ON CONFLICT(project_id, mode, selection_hash) DO UPDATE SET brief_markdown = excluded.brief_markdown, citations_json = excluded.citations_json, provider_id = excluded.provider_id, generated_at = excluded.generated_at, stale = 0')
-      .run(id, projectId, mode, selectionHash, validation.markdown, JSON.stringify(citations), provider.identity.providerId, createdAt);
+    const id = `brief:${projectId}:${mode}:${provider.identity.providerId}:${selectionHash.slice(0, 16)}`;
+    db.prepare(`INSERT INTO consultant_briefs (id, project_id, mode, selection_hash, cache_key, brief_markdown, citations_json, selected_ids_json, themes_json, provider_id, model_label, generated_at, stale)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, 0)
+      ON CONFLICT(project_id, mode, cache_key) DO UPDATE SET brief_markdown = excluded.brief_markdown, citations_json = excluded.citations_json, selected_ids_json = excluded.selected_ids_json, provider_id = excluded.provider_id, model_label = excluded.model_label, generated_at = excluded.generated_at, stale = 0, stale_reason = NULL, stale_at = NULL`)
+      .run(id, projectId, mode, selectionHash, providerCacheKey(provider, selectionHash), validation.markdown, JSON.stringify(citations), JSON.stringify(selected.map((row) => row.id)), provider.identity.providerId, provider.identity.modelLabel, createdAt);
     db.prepare('INSERT INTO consultant_brief_runs (id, project_id, brief_id, selection_hash, provider_id, model_label, prompt_sha256, output_sha256, input_tokens, output_tokens, duration_ms, status, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)')
       .run(randomUUID(), projectId, id, selectionHash, provider.identity.providerId, provider.identity.modelLabel, promptSha256, outputSha256, Math.max(0, Math.floor(result.usage.inputTokens)), Math.max(0, Math.floor(result.usage.outputTokens)), durationMs, 'complete', createdAt);
     return { id, selectionHash, briefMarkdown: validation.markdown, citations, generationMode: provider.identity.providerId, stale: false, selectedRecords: selected };

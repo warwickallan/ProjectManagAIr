@@ -9,7 +9,7 @@ const serverCommand = process.env.PLAYWRIGHT_DEV_SERVER === '1'
 
 export default defineConfig({
   testDir: './tests',
-  testMatch: ['e2e.spec.ts', 'sourceIntelligence.e2e.spec.ts'],
+  testMatch: ['e2e.spec.ts', 'sourceIntelligence.e2e.spec.ts', 'promptsAndConsultantView.e2e.spec.ts'],
   fullyParallel: false,
   retries: 0,
   reporter: [['list'], ['html', { open: 'never' }]],

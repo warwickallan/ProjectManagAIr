@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useApi, type ProjectResponse } from './api';
 import { AIChatPanel } from './AIChatPanel';
+import { ConsultantViewPanel } from './ConsultantViewPanel';
 import { ActivityList, AttentionList, EmptyState, ErrorState, FreshnessNotice, LoadingState, PageIntro, ProgressBar, Section, SourceProcessingAlerts, SourceProcessingNotice, StatusChip, formatDate, formatDateTime, humanize, sourceProcessingView } from './components';
 
 type Project = ProjectResponse['project'];
@@ -170,6 +171,7 @@ function OverviewTab({ project, attention, attentionLabel, overview, brief, onCh
         </dl>
       </section>
       {overview ? <AdaptiveOverview projectId={project.id} overview={overview} onChanged={onChanged} /> : null}
+      <ConsultantViewPanel projectId={project.id} deterministicViews={(project.consultantViews ?? []) as never} />
       {brief ? <ConsultantBriefPanel brief={brief} /> : null}
       <Section id="attention" title={attentionLabel} kicker="Legacy operational attention" count={attention.length} className="attention-panel"><AttentionList items={attention} emptyLabel="This project has nothing assigned to your attention." /></Section>
       <RegisterComparison project={project} compact />

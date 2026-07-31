@@ -319,6 +319,30 @@ export const consultantBriefSchema = z.object({
   stale: z.boolean(),
   selectedRecords: z.array(overviewRecordSchema).default([]),
 });
+/**
+ * The deterministic Meeting Brief and Needs Warwick views.
+ *
+ * Carried on the project payload because they cost nothing to compute and must
+ * be on screen the moment the project opens. A generated synthesis is NOT here:
+ * it is fetched from its own route, so nothing about opening a project can be
+ * mistaken for a request to spend a provider call.
+ */
+export const consultantViewSchema = z.object({
+  mode: z.string().min(1),
+  themeEngineVersion: z.string().min(1),
+  themes: z.array(z.looseObject({ id: z.string(), label: z.string(), memberIds: z.array(z.string()) })).default([]),
+  sections: z.array(z.object({
+    key: z.string().min(1),
+    title: z.string().min(1),
+    description: z.string(),
+    rowIds: z.array(z.string()),
+  })).default([]),
+  records: z.array(z.looseObject({ id: z.string(), registerName: z.string(), title: z.string() })).default([]),
+  selectedIds: z.array(z.string()).default([]),
+  selectionHash: z.string().min(1),
+  providerCalls: z.literal(0),
+});
+
 export const registerRowSchema = z.object({
   id: z.string().min(1),
   projectId: z.string().min(1),
@@ -428,6 +452,7 @@ export const projectSchema = z.object({
   sourceIntelligence: sourceIntelligenceSchema.default({ changesets: [], sources: [] }),
   projectOverview: projectOverviewSchema.optional(),
   consultantBrief: consultantBriefSchema.optional(),
+  consultantViews: z.array(consultantViewSchema).default([]),
 });
 
 export const portfolioDataSchema = z.object({

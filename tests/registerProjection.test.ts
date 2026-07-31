@@ -211,6 +211,12 @@ describe('deterministic scoring (C5)', () => {
  * ------------------------------------------------------------------------- */
 
 describe('event ordering (C6)', () => {
+  // 25 attempts x 2 insertion orders builds fifty complete databases, and each
+  // one runs every migration. That is a little under four seconds of schema work
+  // on its own, so the default five-second budget was always marginal and
+  // migration 013 pushed it over. The repetition is the point of the test — a
+  // rowid ordering flake will not show up in one attempt — so the budget moves,
+  // not the loop.
   it('projects the same state whichever order two equal-timestamp events are inserted, every time', () => {
     const owners = new Set<string>();
     for (let attempt = 0; attempt < 25; attempt += 1) {
@@ -240,7 +246,7 @@ describe('event ordering (C6)', () => {
       }
     }
     expect([...owners].sort()).toEqual(['first>second:Blair Ross', 'second>first:Avery Lane']);
-  });
+  }, 30_000);
 
   it('rests on a rowid that is monotonic on insert and order-preserving across VACUUM', () => {
     const context = tempDb();

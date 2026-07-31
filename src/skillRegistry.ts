@@ -38,7 +38,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { DatabaseSync } from 'node:sqlite';
@@ -79,6 +79,43 @@ const repoRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 /** The shipped seed directory: versioned data assets committed to the repository. */
 export const SEED_SKILL_DIR = path.join(repoRoot, 'skills');
+
+/**
+ * Where an uploaded draft is written when no external registry directory is
+ * configured.
+ *
+ * Never the seed directory. `skills/` is tracked by Git, and an uploaded
+ * revision is written by an operator who may legitimately paste organisation- or
+ * customer-specific guidance into it. `/.runtime/` is git-ignored, so an upload
+ * cannot leak into a commit by accident.
+ */
+export const DEFAULT_UPLOAD_SKILL_DIR = path.join(repoRoot, '.runtime', 'skills');
+
+/**
+ * The directory an upload writes to: the configured external registry directory
+ * when there is one, otherwise the git-ignored local runtime directory.
+ */
+export function resolveWritableSkillDir(options: LoadSkillRegistryOptions = {}): string {
+  const env = options.env ?? process.env;
+  const external = options.externalDir !== undefined ? options.externalDir : (env[SKILL_REGISTRY_DIR_ENV] ?? '').trim() || null;
+  return external ?? (options.uploadDir ?? DEFAULT_UPLOAD_SKILL_DIR);
+}
+
+/**
+ * Which code path actually resolves each skill id.
+ *
+ * Deliberately compiled in rather than declared in a revision: a revision must
+ * never be able to claim it is in force somewhere it is not. A skill id absent
+ * from this map is registered, versioned and inspectable but nothing reads it —
+ * and the UI says exactly that instead of implying the model is using it.
+ */
+export const SKILL_CONSUMERS: Readonly<Record<string, string>> = Object.freeze({
+  'source-extraction': 'Structured extraction pass over each source window.',
+  'consultant-brief': 'On-demand consultant synthesis for Meeting Brief and Needs Warwick.',
+});
+
+/** Maximum size of an uploaded revision. A skill is instructions, not a corpus. */
+export const MAX_SKILL_UPLOAD_BYTES = 256 * 1024;
 
 /* ------------------------------------------------------------------------------------ *
  * Errors
@@ -137,6 +174,12 @@ export interface SkillRevisionFrontMatter {
   promptTemplateVersion: string;
   status: SkillStatus;
   notes: string;
+  /** Human-readable label. Falls back to a title-cased skill id when absent. */
+  name: string;
+  /** One sentence on what this skill is for, shown in Settings. */
+  purpose: string | null;
+  /** Set only where a revision is written for one provider family. */
+  providerProfile: string | null;
 }
 
 export interface SkillRevisionAsset extends SkillRevisionFrontMatter {
@@ -151,6 +194,19 @@ export interface SkillRevisionAsset extends SkillRevisionFrontMatter {
 }
 
 const REQUIRED_KEYS = ['skillId', 'version', 'promptTemplateVersion', 'status', 'notes'] as const;
+
+/**
+ * Optional front matter. Presentation and routing metadata only: nothing here
+ * can change what the validator accepts, which is the whole point of the
+ * registry boundary.
+ */
+const OPTIONAL_KEYS = ['name', 'purpose', 'providerProfile'] as const;
+const KNOWN_KEYS: readonly string[] = [...REQUIRED_KEYS, ...OPTIONAL_KEYS];
+
+/** `source-extraction` → `Source Extraction`, used when a revision names no label. */
+function titleCaseSkillId(skillId: string): string {
+  return skillId.split('-').filter(Boolean).map((part) => part[0].toUpperCase() + part.slice(1)).join(' ');
+}
 
 /**
  * Parse one revision file: `---` fenced `key: value` front matter, then the body.
@@ -179,8 +235,8 @@ export function parseSkillRevision(text: string, file: string, source: SkillSour
     const value = line.slice(separator + 1).trim();
     if (!key) throw new SkillRegistryError(`Front matter line ${index + 1} has an empty key`, file);
     if (values.has(key)) throw new SkillRegistryError(`Front matter key "${key}" appears more than once`, file);
-    if (!(REQUIRED_KEYS as readonly string[]).includes(key)) {
-      throw new SkillRegistryError(`Unknown front matter key "${key}"; expected ${REQUIRED_KEYS.join(', ')}`, file);
+    if (!KNOWN_KEYS.includes(key)) {
+      throw new SkillRegistryError(`Unknown front matter key "${key}"; expected one of ${KNOWN_KEYS.join(', ')}`, file);
     }
     values.set(key, value);
   }
@@ -225,12 +281,204 @@ export function parseSkillRevision(text: string, file: string, source: SkillSour
     promptTemplateVersion,
     status: status as SkillStatus,
     notes,
+    name: values.get('name')?.trim() || titleCaseSkillId(skillId),
+    purpose: values.get('purpose')?.trim() || null,
+    providerProfile: values.get('providerProfile')?.trim() || null,
     body,
     sha256: sha256(body),
     source,
     file,
     characters: body.length,
   };
+}
+
+/* ------------------------------------------------------------------------------------ *
+ * Draft validation and upload
+ * ------------------------------------------------------------------------------------ */
+
+/**
+ * Placeholders a revision of a given prompt template must still contain.
+ *
+ * A revision may rewrite the guidance completely; it may not silently delete the
+ * hooks the prompt assembler needs, because the result would be a prompt that
+ * omits the source, the categories or the output contract and a pass that fails
+ * for a reason nobody can see from the registry.
+ *
+ * These are substrings, matched case-insensitively, deliberately chosen to be
+ * things the instructions genuinely have to say rather than templating syntax.
+ */
+export const REQUIRED_SKILL_MARKERS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  'source-extraction-prompt-v2': ['rows', 'windowCoverage', 'categoryCoverage', 'anchors', 'client_ref'],
+  'consultant-brief-prompt-v1': ['markdown', 'cite'],
+});
+
+export interface SkillDraftValidation {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+  /** Present only when the document parsed; null when it did not. */
+  frontMatter: (SkillRevisionFrontMatter & { sha256: string; characters: number }) | null;
+}
+
+export interface ValidateSkillDraftInput {
+  text: string;
+  /** Original upload file name, used only to report a mismatch back to the operator. */
+  fileName?: string | null;
+  /** The skill id the operator believes they are uploading a revision of. */
+  expectedSkillId?: string | null;
+  currentPacketContractVersion?: number;
+}
+
+/**
+ * Validate an uploaded revision without writing anything.
+ *
+ * Everything the upload route enforces is enforced here, so "Validate draft" in
+ * the UI and the upload itself can never disagree about whether a document is
+ * acceptable.
+ */
+export function validateSkillDraft(db: DatabaseSync, input: ValidateSkillDraftInput): SkillDraftValidation {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const text = input.text ?? '';
+
+  if (!text.trim()) return { ok: false, errors: ['The uploaded document is empty.'], warnings, frontMatter: null };
+  const bytes = Buffer.byteLength(text, 'utf8');
+  if (bytes > MAX_SKILL_UPLOAD_BYTES) {
+    return { ok: false, errors: [`The uploaded document is ${bytes} bytes; the limit is ${MAX_SKILL_UPLOAD_BYTES}.`], warnings, frontMatter: null };
+  }
+  // A lone surrogate or a NUL byte means this is not the UTF-8 Markdown the
+  // registry stores, and hashing it would produce a revision nobody can reread.
+  if (text.includes('\u0000')) {
+    return { ok: false, errors: ['The uploaded document contains NUL bytes; a skill revision must be UTF-8 Markdown.'], warnings, frontMatter: null };
+  }
+
+  let asset: SkillRevisionAsset;
+  const declaredId = text.match(/^\s*---\s*\n(?:.*\n)*?\s*skillId:\s*([^\n]*)/)?.[1]?.trim() ?? '';
+  const declaredVersion = text.match(/^\s*---\s*\n(?:.*\n)*?\s*version:\s*([^\n]*)/)?.[1]?.trim() ?? '';
+  // parseSkillRevision also checks the path agrees with the front matter, so the
+  // draft is parsed against the path it would be written to.
+  const notionalPath = path.join('registry', declaredId || 'unknown', `${declaredVersion || 'unknown'}.md`);
+  try {
+    asset = parseSkillRevision(text, notionalPath, 'external');
+  } catch (error) {
+    return {
+      ok: false,
+      errors: [error instanceof SkillRegistryError ? error.message.replace(` (${notionalPath})`, '') : String(error)],
+      warnings,
+      frontMatter: null,
+    };
+  }
+
+  if (input.expectedSkillId && asset.skillId !== input.expectedSkillId) {
+    errors.push(`The document declares skillId "${asset.skillId}" but was uploaded against "${input.expectedSkillId}".`);
+  }
+  // A brand new skill id is legitimate, but it is a different act from revising
+  // an existing skill and the operator should see that it is what they did.
+  const known = db.prepare('SELECT count(*) count FROM extraction_skills WHERE skill_id = ?').get(asset.skillId) as { count: number };
+  if (Number(known.count) === 0) warnings.push(`"${asset.skillId}" is a new skill id; this upload registers it for the first time.`);
+
+  const existing = db.prepare('SELECT status, sha256 FROM extraction_skills WHERE skill_id = ? AND version = ?').get(asset.skillId, asset.version) as { status: string; sha256: string } | undefined;
+  if (existing) {
+    errors.push(`Version ${asset.version} of ${asset.skillId} is already registered (${existing.status}). Published versions are immutable — choose a new version number.`);
+  }
+  const highest = db.prepare('SELECT version FROM extraction_skills WHERE skill_id = ?').all(asset.skillId) as Array<{ version: string }>;
+  if (highest.length > 0) {
+    const latest = highest.map((row) => row.version).sort(compareSkillVersions).at(-1)!;
+    if (compareSkillVersions(asset.version, latest) <= 0) {
+      errors.push(`Version ${asset.version} does not follow the highest registered version ${latest}; versions must increase.`);
+    }
+  }
+
+  const markers = REQUIRED_SKILL_MARKERS[asset.promptTemplateVersion];
+  if (!markers) {
+    warnings.push(`Prompt template "${asset.promptTemplateVersion}" has no registered marker contract, so its placeholders could not be checked.`);
+  } else {
+    const folded = asset.body.toLowerCase();
+    const missing = markers.filter((marker) => !folded.includes(marker.toLowerCase()));
+    if (missing.length > 0) errors.push(`The revision does not mention required contract elements: ${missing.join(', ')}.`);
+  }
+
+  const contract = input.currentPacketContractVersion ?? PACKET_CONTRACT_VERSION;
+  if (contract !== PACKET_CONTRACT_VERSION) {
+    errors.push(`This build accepts packet contract version ${PACKET_CONTRACT_VERSION}; the caller asserted ${contract}.`);
+  }
+
+  if (input.fileName && path.basename(input.fileName) !== `${asset.version}.md`) {
+    warnings.push(`The uploaded file was named "${path.basename(input.fileName)}"; it will be stored as ${asset.version}.md.`);
+  }
+  if (asset.status === 'active') {
+    warnings.push('The document declares status "active". An upload always creates a draft; publishing is a separate, confirmed action.');
+  }
+
+  return {
+    ok: errors.length === 0,
+    errors,
+    warnings,
+    frontMatter: {
+      skillId: asset.skillId,
+      version: asset.version,
+      promptTemplateVersion: asset.promptTemplateVersion,
+      status: asset.status,
+      notes: asset.notes,
+      name: asset.name,
+      purpose: asset.purpose,
+      providerProfile: asset.providerProfile,
+      sha256: asset.sha256,
+      characters: asset.characters,
+    },
+  };
+}
+
+export interface UploadSkillDraftResult {
+  skillId: string;
+  version: string;
+  status: SkillStatus;
+  sha256: string;
+  path: string;
+  warnings: string[];
+}
+
+/**
+ * Register an uploaded revision as a NEW DRAFT.
+ *
+ * Never a publication. The document's own `status` is ignored beyond a warning:
+ * a revision becomes active only through {@link promoteSkillRevision}, which is
+ * a separate, confirmed, audited action. Nor can an upload overwrite anything —
+ * a version that already exists is rejected before a byte is written.
+ */
+export function uploadSkillDraft(db: DatabaseSync, input: ValidateSkillDraftInput & { actor: string; options?: LoadSkillRegistryOptions }): UploadSkillDraftResult {
+  if (!input.actor?.trim()) throw new SkillRegistryError('Uploading a draft requires a named actor');
+  const validation = validateSkillDraft(db, input);
+  if (!validation.ok || !validation.frontMatter) {
+    throw new SkillRegistryError(`Draft rejected: ${validation.errors.join(' ')}`);
+  }
+  const front = validation.frontMatter;
+  const directory = resolveWritableSkillDir(input.options ?? {});
+  const skillDirectory = path.join(directory, front.skillId);
+  const file = path.join(skillDirectory, `${front.version}.md`);
+  if (existsSync(file)) {
+    throw new SkillRegistryError(`A revision file already exists at ${file}; published revisions are immutable`);
+  }
+  mkdirSync(skillDirectory, { recursive: true });
+  // Normalise line endings so the same document uploaded from Windows and from
+  // the API hashes identically; the body hash is the revision's identity.
+  writeFileSync(file, input.text.replace(/^﻿/, '').replace(/\r\n/g, '\n'), 'utf8');
+
+  const at = nowIso();
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    db.prepare(`INSERT INTO extraction_skills
+      (skill_id, version, sha256, prompt_template_version, status, source, notes, created_at, promoted_at, retired_at, name, purpose, provider_profile, packet_contract_version, body_path, body_characters, uploaded_by)
+      VALUES (?, ?, ?, ?, 'draft', 'external', ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(front.skillId, front.version, front.sha256, front.promptTemplateVersion, front.notes, at,
+        front.name, front.purpose, front.providerProfile, PACKET_CONTRACT_VERSION, file, front.characters, input.actor);
+    audit(db, { skillId: front.skillId, version: front.version, event: 'registered', toStatus: 'draft', actor: input.actor, note: `uploaded draft (${front.characters} characters)` });
+    db.exec('COMMIT;');
+  } catch (error) {
+    db.exec('ROLLBACK;');
+    throw error;
+  }
+  return { skillId: front.skillId, version: front.version, status: 'draft', sha256: front.sha256, path: file, warnings: validation.warnings };
 }
 
 function readRevisionsFrom(directory: string, source: SkillSource): SkillRevisionAsset[] {
@@ -257,6 +505,16 @@ export interface LoadSkillRegistryOptions {
   seedDir?: string;
   /** Overrides `PROJECTMANAGAIR_SKILL_REGISTRY_DIR`. */
   externalDir?: string | null;
+  /**
+   * The git-ignored local directory uploads land in when no external registry
+   * directory is configured. Scanned by default: a revision that was uploaded
+   * and registered but never loadable again would be a version the registry
+   * knows about and can no longer show, compare or send.
+   *
+   * `null` excludes it — {@link loadSeedSkillBody} does exactly that, because
+   * the built-in default must be the shipped text and nothing else.
+   */
+  uploadDir?: string | null;
 }
 
 /**
@@ -274,6 +532,12 @@ export function loadSkillRegistry(options: LoadSkillRegistryOptions = {}): Skill
 
   const byKey = new Map<string, SkillRevisionAsset>();
   for (const asset of readRevisionsFrom(seedDir, 'seed')) byKey.set(`${asset.skillId}@${asset.version}`, asset);
+  // Uploads land here when no external directory is configured. Loaded before
+  // the external directory so an organisation's registry still wins.
+  const uploadDir = options.uploadDir !== undefined ? options.uploadDir : DEFAULT_UPLOAD_SKILL_DIR;
+  if (uploadDir && uploadDir !== externalDir) {
+    for (const asset of readRevisionsFrom(uploadDir, 'external')) byKey.set(`${asset.skillId}@${asset.version}`, asset);
+  }
   if (externalDir) {
     if (!existsSync(externalDir)) {
       throw new SkillRegistryError(`${SKILL_REGISTRY_DIR_ENV} points at ${externalDir}, which does not exist`);
@@ -287,7 +551,7 @@ export function loadSkillRegistry(options: LoadSkillRegistryOptions = {}): Skill
 
 /** The shipped seed body for one skill id, used to keep the built-in default honest. */
 export function loadSeedSkillBody(skillId = DEFAULT_EXTRACTION_SKILL_ID, options: LoadSkillRegistryOptions = {}): string {
-  const seeds = loadSkillRegistry({ ...options, externalDir: null }).filter((asset) => asset.skillId === skillId);
+  const seeds = loadSkillRegistry({ ...options, externalDir: null, uploadDir: null }).filter((asset) => asset.skillId === skillId);
   if (seeds.length === 0) throw new SkillRegistryError(`No shipped seed revision exists for skill "${skillId}"`);
   const declaredActive = seeds.filter((asset) => asset.status === 'active');
   return (declaredActive.length > 0 ? declaredActive : seeds).at(-1)!.body;
@@ -308,6 +572,13 @@ export interface SkillRevisionRecord {
   createdAt: string;
   promotedAt: string | null;
   retiredAt: string | null;
+  name: string;
+  purpose: string | null;
+  providerProfile: string | null;
+  packetContractVersion: number;
+  bodyPath: string | null;
+  bodyCharacters: number | null;
+  uploadedBy: string | null;
 }
 
 function nowIso(): string {
@@ -326,6 +597,13 @@ function toRecord(row: Record<string, unknown>): SkillRevisionRecord {
     createdAt: String(row.created_at),
     promotedAt: row.promoted_at ? String(row.promoted_at) : null,
     retiredAt: row.retired_at ? String(row.retired_at) : null,
+    name: row.name ? String(row.name) : titleCaseSkillId(String(row.skill_id)),
+    purpose: row.purpose ? String(row.purpose) : null,
+    providerProfile: row.provider_profile ? String(row.provider_profile) : null,
+    packetContractVersion: row.packet_contract_version === null || row.packet_contract_version === undefined ? PACKET_CONTRACT_VERSION : Number(row.packet_contract_version),
+    bodyPath: row.body_path ? String(row.body_path) : null,
+    bodyCharacters: row.body_characters === null || row.body_characters === undefined ? null : Number(row.body_characters),
+    uploadedBy: row.uploaded_by ? String(row.uploaded_by) : null,
   };
 }
 
@@ -467,9 +745,10 @@ function registerAssets(db: DatabaseSync, assets: SkillRevisionAsset[], actor: s
       // `active` in a file is an intent, not a transition. It is recorded as `candidate`
       // and, where the skill has no active revision, promoted through the audited path below.
       const status: SkillStatus = asset.status === 'active' ? 'candidate' : asset.status;
-      db.prepare(`INSERT INTO extraction_skills (skill_id, version, sha256, prompt_template_version, status, source, notes, created_at, promoted_at, retired_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`)
-        .run(asset.skillId, asset.version, asset.sha256, asset.promptTemplateVersion, status, asset.source, asset.notes, nowIso(), status === 'retired' ? nowIso() : null);
+      db.prepare(`INSERT INTO extraction_skills (skill_id, version, sha256, prompt_template_version, status, source, notes, created_at, promoted_at, retired_at, name, purpose, provider_profile, packet_contract_version, body_path, body_characters)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(asset.skillId, asset.version, asset.sha256, asset.promptTemplateVersion, status, asset.source, asset.notes, nowIso(), status === 'retired' ? nowIso() : null,
+          asset.name, asset.purpose, asset.providerProfile, PACKET_CONTRACT_VERSION, asset.file, asset.characters);
       audit(db, { skillId: asset.skillId, version: asset.version, event: 'registered', toStatus: status, actor, note: `source=${asset.source}` });
       result.registered.push({ skillId: asset.skillId, version: asset.version, status, source: asset.source });
       continue;
@@ -483,16 +762,23 @@ function registerAssets(db: DatabaseSync, assets: SkillRevisionAsset[], actor: s
     const templateChanged = String(existing.prompt_template_version) !== asset.promptTemplateVersion;
     const notesChanged = String(existing.notes ?? '') !== asset.notes;
     const sourceChanged = String(existing.source) !== asset.source;
-    if (templateChanged || notesChanged || sourceChanged) {
-      db.prepare('UPDATE extraction_skills SET prompt_template_version = ?, notes = ?, source = ? WHERE skill_id = ? AND version = ?')
-        .run(asset.promptTemplateVersion, asset.notes, asset.source, asset.skillId, asset.version);
+    // Presentation metadata is not part of the revision's identity — the body
+    // hash is — so a renamed or re-described revision refreshes in place rather
+    // than demanding a new version number.
+    const labelChanged = String(existing.name ?? '') !== asset.name
+      || String(existing.purpose ?? '') !== String(asset.purpose ?? '')
+      || String(existing.provider_profile ?? '') !== String(asset.providerProfile ?? '')
+      || String(existing.body_path ?? '') !== asset.file;
+    if (templateChanged || notesChanged || sourceChanged || labelChanged) {
+      db.prepare('UPDATE extraction_skills SET prompt_template_version = ?, notes = ?, source = ?, name = ?, purpose = ?, provider_profile = ?, body_path = ?, body_characters = ?, packet_contract_version = COALESCE(packet_contract_version, ?) WHERE skill_id = ? AND version = ?')
+        .run(asset.promptTemplateVersion, asset.notes, asset.source, asset.name, asset.purpose, asset.providerProfile, asset.file, asset.characters, PACKET_CONTRACT_VERSION, asset.skillId, asset.version);
       audit(db, {
         skillId: asset.skillId,
         version: asset.version,
         event: 'refreshed',
         toStatus: String(existing.status) as SkillStatus,
         actor,
-        note: [templateChanged ? `promptTemplateVersion=${asset.promptTemplateVersion}` : null, notesChanged ? 'notes' : null, sourceChanged ? `source=${asset.source}` : null].filter(Boolean).join(' '),
+        note: [templateChanged ? `promptTemplateVersion=${asset.promptTemplateVersion}` : null, notesChanged ? 'notes' : null, sourceChanged ? `source=${asset.source}` : null, labelChanged ? 'metadata' : null].filter(Boolean).join(' '),
       });
       result.refreshed.push({ skillId: asset.skillId, version: asset.version, status: String(existing.status) as SkillStatus, source: asset.source });
     } else {
@@ -510,7 +796,13 @@ function registerAssets(db: DatabaseSync, assets: SkillRevisionAsset[], actor: s
  * is never overwritten by a process restart.
  */
 export function ensureSkillRegistrySynced(db: DatabaseSync, options: SyncSkillRegistryOptions & { skillId?: string } = {}): SkillRegistrySyncResult | null {
-  if (readActiveSkillRevision(db, options.skillId ?? DEFAULT_EXTRACTION_SKILL_ID)) return null;
+  const hasActive = Boolean(readActiveSkillRevision(db, options.skillId ?? DEFAULT_EXTRACTION_SKILL_ID));
+  // A database that predates a shipped skill has an active extraction revision
+  // and would previously have been left without the newer registry assets
+  // forever. Registration is not promotion, so picking them up here cannot
+  // displace anything an operator has decided.
+  const unregistered = hasActive && loadSkillRegistry(options).some((asset) => !db.prepare('SELECT 1 FROM extraction_skills WHERE skill_id = ? AND version = ?').get(asset.skillId, asset.version));
+  if (hasActive && !unregistered) return null;
   return syncSkillRegistry(db, options);
 }
 
@@ -842,4 +1134,388 @@ export function readExtractionPacketProvenance(db: DatabaseSync, packetId: strin
     packetContractVersion: Number(row.packet_contract_version),
     packetSha256: String(row.packet_sha256),
   };
+}
+
+/* ------------------------------------------------------------------------------------ *
+ * Retirement
+ * ------------------------------------------------------------------------------------ */
+
+/**
+ * Retire a revision that is not in force.
+ *
+ * The active revision is deliberately not retirable here: retiring it would
+ * leave the skill with no contract at all, and the honest way to stop using a
+ * revision is to promote or roll back to another one, which retires it as part
+ * of an atomic transition.
+ */
+export function retireSkillRevision(db: DatabaseSync, input: { skillId?: string; version: string; actor: string; note?: string | null }): { skillId: string; version: string; retiredAt: string; changed: boolean } {
+  const skillId = input.skillId ?? DEFAULT_EXTRACTION_SKILL_ID;
+  if (!input.actor?.trim()) throw new SkillRegistryError('Retirement requires a named actor; an unattributed transition is not an audit record');
+  const target = requireRevision(db, skillId, input.version);
+  if (target.status === 'active') {
+    throw new SkillRegistryError(`Revision ${skillId}@${input.version} is the active revision. Promote or roll back to another revision instead; that retires this one atomically`);
+  }
+  if (target.status === 'retired') return { skillId, version: input.version, retiredAt: target.retiredAt ?? target.createdAt, changed: false };
+  const pins = db.prepare('SELECT project_id FROM extraction_skill_pins WHERE skill_id = ? AND version = ?').all(skillId, input.version) as Array<{ project_id: string }>;
+  if (pins.length > 0) {
+    throw new SkillRegistryError(`Revision ${skillId}@${input.version} is pinned by ${pins.length} project(s); remove the pins before retiring it`);
+  }
+  const at = nowIso();
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    db.prepare("UPDATE extraction_skills SET status = 'retired', retired_at = ? WHERE skill_id = ? AND version = ?").run(at, skillId, input.version);
+    audit(db, { skillId, version: input.version, event: 'retired', fromStatus: target.status, toStatus: 'retired', actor: input.actor, note: input.note ?? null });
+    db.exec('COMMIT;');
+  } catch (error) {
+    db.exec('ROLLBACK;');
+    throw error;
+  }
+  return { skillId, version: input.version, retiredAt: at, changed: true };
+}
+
+/* ------------------------------------------------------------------------------------ *
+ * Reading a revision body
+ * ------------------------------------------------------------------------------------ */
+
+export interface SkillRevisionBody {
+  skillId: string;
+  version: string;
+  status: SkillStatus;
+  sha256: string;
+  /** The instructional text. A reusable template — never an assembled prompt. */
+  text: string;
+  characters: number;
+  /** Drafts may be replaced by uploading a new version; published revisions cannot. */
+  editable: boolean;
+  source: SkillSource;
+  promptTemplateVersion: string;
+  packetContractVersion: number;
+  /**
+   * What a download of this text does and does not contain, stated on the
+   * artefact itself so a downloaded file cannot be mistaken for a run record.
+   */
+  containsCustomerSource: false;
+}
+
+/**
+ * Read the text of one registered revision, re-hashed against the registry.
+ *
+ * WHAT THIS DELIBERATELY DOES AND DOES NOT SERVE
+ * ----------------------------------------------
+ * It serves the REUSABLE TEMPLATE — the instructions we send. That is the thing
+ * Settings exists to let an operator read, copy, improve and publish, and it is
+ * written by us, not derived from a customer document.
+ *
+ * It never serves an ASSEMBLED PROMPT. An assembled prompt contains the source
+ * windows, which are customer material; only its SHA-256 is recorded, and there
+ * is no route that returns one.
+ */
+export function readSkillRevisionBody(db: DatabaseSync, skillId: string, version: string, options: LoadSkillRegistryOptions = {}): SkillRevisionBody {
+  const record = requireRevision(db, skillId, version);
+  const asset = loadSkillRegistry(options).find((entry) => entry.skillId === skillId && entry.version === version);
+  if (!asset) throw new SkillRegistryError(`Revision ${skillId}@${version} is registered but its file is not present in any registry directory`);
+  if (asset.sha256 !== record.sha256) {
+    throw new SkillRegistryError(`Revision ${skillId}@${version} no longer hashes to its registered body; the file has been rewritten in place`, asset.file);
+  }
+  return {
+    skillId,
+    version,
+    status: record.status,
+    sha256: record.sha256,
+    text: asset.body,
+    characters: asset.characters,
+    editable: record.status === 'draft',
+    source: record.source,
+    promptTemplateVersion: record.promptTemplateVersion,
+    packetContractVersion: record.packetContractVersion,
+    containsCustomerSource: false,
+  };
+}
+
+/* ------------------------------------------------------------------------------------ *
+ * Version comparison
+ * ------------------------------------------------------------------------------------ */
+
+export interface SkillVersionDiffLine {
+  kind: 'context' | 'added' | 'removed';
+  text: string;
+}
+
+export interface SkillVersionComparison {
+  skillId: string;
+  from: { version: string; status: SkillStatus; sha256: string; promptTemplateVersion: string; characters: number };
+  to: { version: string; status: SkillStatus; sha256: string; promptTemplateVersion: string; characters: number };
+  identical: boolean;
+  addedLines: number;
+  removedLines: number;
+  promptTemplateChanged: boolean;
+  packetContractChanged: boolean;
+  diff: SkillVersionDiffLine[];
+}
+
+/**
+ * A longest-common-subsequence line diff between two revisions.
+ *
+ * Written out rather than pulled in as a dependency: the bodies are a few
+ * hundred lines, the algorithm is fifteen lines, and a publication confirmation
+ * screen must not depend on a package that could change what an operator sees
+ * before they approve a change to the model's instructions.
+ */
+export function compareSkillRevisions(db: DatabaseSync, skillId: string, fromVersion: string, toVersion: string, options: LoadSkillRegistryOptions = {}): SkillVersionComparison {
+  const from = readSkillRevisionBody(db, skillId, fromVersion, options);
+  const to = readSkillRevisionBody(db, skillId, toVersion, options);
+  const left = from.text.split('\n');
+  const right = to.text.split('\n');
+
+  const lengths: number[][] = Array.from({ length: left.length + 1 }, () => new Array<number>(right.length + 1).fill(0));
+  for (let i = left.length - 1; i >= 0; i -= 1) {
+    for (let j = right.length - 1; j >= 0; j -= 1) {
+      lengths[i][j] = left[i] === right[j] ? lengths[i + 1][j + 1] + 1 : Math.max(lengths[i + 1][j], lengths[i][j + 1]);
+    }
+  }
+  const diff: SkillVersionDiffLine[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < left.length && j < right.length) {
+    if (left[i] === right[j]) { diff.push({ kind: 'context', text: left[i] }); i += 1; j += 1; }
+    else if (lengths[i + 1][j] >= lengths[i][j + 1]) { diff.push({ kind: 'removed', text: left[i] }); i += 1; }
+    else { diff.push({ kind: 'added', text: right[j] }); j += 1; }
+  }
+  while (i < left.length) { diff.push({ kind: 'removed', text: left[i] }); i += 1; }
+  while (j < right.length) { diff.push({ kind: 'added', text: right[j] }); j += 1; }
+
+  return {
+    skillId,
+    from: { version: from.version, status: from.status, sha256: from.sha256, promptTemplateVersion: from.promptTemplateVersion, characters: from.characters },
+    to: { version: to.version, status: to.status, sha256: to.sha256, promptTemplateVersion: to.promptTemplateVersion, characters: to.characters },
+    identical: from.sha256 === to.sha256,
+    addedLines: diff.filter((line) => line.kind === 'added').length,
+    removedLines: diff.filter((line) => line.kind === 'removed').length,
+    promptTemplateChanged: from.promptTemplateVersion !== to.promptTemplateVersion,
+    packetContractChanged: from.packetContractVersion !== to.packetContractVersion,
+    diff,
+  };
+}
+
+/* ------------------------------------------------------------------------------------ *
+ * Benchmarks
+ * ------------------------------------------------------------------------------------ */
+
+export interface SkillBenchmarkRecord {
+  id: string;
+  skillId: string;
+  version: string;
+  projectId: string | null;
+  sourceId: string | null;
+  packetId: string | null;
+  benchmarkLabel: string;
+  verdict: string;
+  metrics: Record<string, unknown>;
+  recordedBy: string;
+  recordedAt: string;
+  note: string | null;
+}
+
+let benchmarkSequence = 0;
+
+/**
+ * Record a graded result against the exact revision that produced it.
+ *
+ * Append only, by database trigger. A benchmark is evidence about a version, and
+ * a version whose score can be revised after the fact is a version whose score
+ * means nothing.
+ */
+export function recordSkillBenchmark(db: DatabaseSync, input: {
+  skillId: string;
+  version: string;
+  projectId?: string | null;
+  sourceId?: string | null;
+  packetId?: string | null;
+  benchmarkLabel: string;
+  verdict: string;
+  metrics: Record<string, unknown>;
+  recordedBy: string;
+  note?: string | null;
+}): SkillBenchmarkRecord {
+  if (!input.recordedBy?.trim()) throw new SkillRegistryError('Recording a benchmark requires a named actor');
+  if (!input.benchmarkLabel?.trim()) throw new SkillRegistryError('A benchmark result must name the benchmark it was measured against');
+  requireRevision(db, input.skillId, input.version);
+  benchmarkSequence += 1;
+  const recordedAt = nowIso();
+  const id = `skill-benchmark:${recordedAt}:${String(benchmarkSequence).padStart(4, '0')}:${process.pid}:${input.skillId}:${input.version}`;
+  db.prepare(`INSERT INTO extraction_skill_benchmarks (id, skill_id, version, project_id, source_id, packet_id, benchmark_label, verdict, metrics_json, recorded_by, recorded_at, note)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, input.skillId, input.version, input.projectId ?? null, input.sourceId ?? null, input.packetId ?? null,
+      input.benchmarkLabel, input.verdict, JSON.stringify(input.metrics), input.recordedBy, recordedAt, input.note ?? null);
+  return { id, skillId: input.skillId, version: input.version, projectId: input.projectId ?? null, sourceId: input.sourceId ?? null, packetId: input.packetId ?? null, benchmarkLabel: input.benchmarkLabel, verdict: input.verdict, metrics: input.metrics, recordedBy: input.recordedBy, recordedAt, note: input.note ?? null };
+}
+
+export function readSkillBenchmarks(db: DatabaseSync, filter: { skillId?: string; version?: string; limit?: number } = {}): SkillBenchmarkRecord[] {
+  const clauses: string[] = [];
+  const values: string[] = [];
+  if (filter.skillId) { clauses.push('skill_id = ?'); values.push(filter.skillId); }
+  if (filter.version) { clauses.push('version = ?'); values.push(filter.version); }
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+  const rows = db.prepare(`SELECT * FROM extraction_skill_benchmarks ${where} ORDER BY recorded_at DESC, id DESC LIMIT ?`)
+    .all(...values, filter.limit ?? 100) as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    id: String(row.id),
+    skillId: String(row.skill_id),
+    version: String(row.version),
+    projectId: row.project_id ? String(row.project_id) : null,
+    sourceId: row.source_id ? String(row.source_id) : null,
+    packetId: row.packet_id ? String(row.packet_id) : null,
+    benchmarkLabel: String(row.benchmark_label),
+    verdict: String(row.verdict),
+    metrics: JSON.parse(String(row.metrics_json)) as Record<string, unknown>,
+    recordedBy: String(row.recorded_by),
+    recordedAt: String(row.recorded_at),
+    note: row.note === null || row.note === undefined ? null : String(row.note),
+  }));
+}
+
+/* ------------------------------------------------------------------------------------ *
+ * Usage: run → skill version, and skill version → runs
+ * ------------------------------------------------------------------------------------ */
+
+export interface SkillVersionRunSummary {
+  runId: string;
+  kind: 'extraction' | 'consultant-brief';
+  projectId: string | null;
+  sourceId: string | null;
+  providerId: string;
+  modelLabel: string;
+  status: string;
+  startedAt: string;
+  promptSha256: string;
+  skillSha256: string;
+}
+
+/**
+ * Every run that used one revision, across both model-calling subsystems.
+ *
+ * This is the other half of run provenance: `readExtractionRunProvenance` answers
+ * "which revision produced this run", and this answers "which runs did this
+ * revision produce". Both directions are needed before a published revision can
+ * be judged on evidence rather than on intent.
+ */
+export function readRunsForSkillVersion(db: DatabaseSync, skillId: string, version: string, limit = 100): SkillVersionRunSummary[] {
+  const extraction = db.prepare(`SELECT id, project_id, source_id, provider_id, model_label, status, started_at, prompt_sha256, skill_sha256
+    FROM extraction_runs WHERE skill_id = ? AND skill_version = ? ORDER BY started_at DESC LIMIT ?`)
+    .all(skillId, version, limit) as Array<Record<string, unknown>>;
+  const briefs = db.prepare(`SELECT id, project_id, provider_id, model_label, status, created_at, prompt_sha256, skill_sha256
+    FROM consultant_brief_runs WHERE skill_id = ? AND skill_version = ? ORDER BY created_at DESC LIMIT ?`)
+    .all(skillId, version, limit) as Array<Record<string, unknown>>;
+  const combined: SkillVersionRunSummary[] = [
+    ...extraction.map((row) => ({
+      runId: String(row.id), kind: 'extraction' as const, projectId: row.project_id ? String(row.project_id) : null, sourceId: row.source_id ? String(row.source_id) : null,
+      providerId: String(row.provider_id), modelLabel: String(row.model_label), status: String(row.status), startedAt: String(row.started_at),
+      promptSha256: String(row.prompt_sha256), skillSha256: String(row.skill_sha256),
+    })),
+    ...briefs.map((row) => ({
+      runId: String(row.id), kind: 'consultant-brief' as const, projectId: row.project_id ? String(row.project_id) : null, sourceId: null,
+      providerId: String(row.provider_id), modelLabel: String(row.model_label), status: String(row.status), startedAt: String(row.created_at),
+      promptSha256: String(row.prompt_sha256), skillSha256: row.skill_sha256 ? String(row.skill_sha256) : '',
+    })),
+  ];
+  return combined.sort((left, right) => (left.startedAt < right.startedAt ? 1 : left.startedAt > right.startedAt ? -1 : 0)).slice(0, limit);
+}
+
+function usageCount(db: DatabaseSync, skillId: string, version: string): number {
+  const extraction = db.prepare('SELECT count(*) count FROM extraction_runs WHERE skill_id = ? AND skill_version = ?').get(skillId, version) as { count: number };
+  const briefs = db.prepare('SELECT count(*) count FROM consultant_brief_runs WHERE skill_id = ? AND skill_version = ?').get(skillId, version) as { count: number };
+  return Number(extraction.count) + Number(briefs.count);
+}
+
+/* ------------------------------------------------------------------------------------ *
+ * The Settings catalogue
+ * ------------------------------------------------------------------------------------ */
+
+export interface SkillCatalogueVersion extends SkillRevisionRecord {
+  recordedUses: number;
+  lastUsedAt: string | null;
+  latestBenchmark: SkillBenchmarkRecord | null;
+  benchmarkCount: number;
+  pinnedProjects: Array<{ projectId: string; projectCode: string | null; projectName: string | null; pinnedBy: string; pinnedAt: string }>;
+  /** True when the file this revision was registered from is present and still hashes to its registered body. */
+  bodyAvailable: boolean;
+  bodyIssue: string | null;
+}
+
+export interface SkillCatalogueEntry {
+  skillId: string;
+  name: string;
+  purpose: string | null;
+  /** The code path that resolves this skill, or null when nothing reads it yet. */
+  consumedBy: string | null;
+  activeVersion: string | null;
+  versions: SkillCatalogueVersion[];
+}
+
+/**
+ * Everything Settings → AI Skills & Prompts needs, in one read.
+ *
+ * No revision body is included: the list is metadata, and a body is fetched
+ * explicitly per version so that reading one is a deliberate act with its own
+ * route rather than a side effect of opening a settings page.
+ */
+export function readSkillCatalogue(db: DatabaseSync, options: LoadSkillRegistryOptions = {}): SkillCatalogueEntry[] {
+  let assets: SkillRevisionAsset[] = [];
+  let loadError: string | null = null;
+  try {
+    assets = loadSkillRegistry(options);
+  } catch (error) {
+    loadError = error instanceof Error ? error.message : String(error);
+  }
+  const assetByKey = new Map(assets.map((asset) => [`${asset.skillId}@${asset.version}`, asset]));
+  const records = readSkillRevisions(db);
+  const bySkill = new Map<string, SkillRevisionRecord[]>();
+  for (const record of records) {
+    const list = bySkill.get(record.skillId) ?? [];
+    list.push(record);
+    bySkill.set(record.skillId, list);
+  }
+  const entries: SkillCatalogueEntry[] = [];
+  for (const [skillId, list] of [...bySkill.entries()].sort(([left], [right]) => (left < right ? -1 : 1))) {
+    const ordered = [...list].sort((left, right) => compareSkillVersions(left.version, right.version));
+    const active = ordered.find((record) => record.status === 'active') ?? null;
+    const latest = ordered.at(-1)!;
+    entries.push({
+      skillId,
+      name: (active ?? latest).name,
+      purpose: (active ?? latest).purpose,
+      consumedBy: SKILL_CONSUMERS[skillId] ?? null,
+      activeVersion: active?.version ?? null,
+      versions: ordered.map((record) => {
+        const asset = assetByKey.get(`${record.skillId}@${record.version}`);
+        const benchmarks = readSkillBenchmarks(db, { skillId: record.skillId, version: record.version, limit: 50 });
+        const pins = db.prepare(`SELECT p.project_id, p.pinned_by, p.pinned_at, pr.code, pr.name
+          FROM extraction_skill_pins p LEFT JOIN projects pr ON pr.id = p.project_id
+          WHERE p.skill_id = ? AND p.version = ? ORDER BY p.project_id`).all(record.skillId, record.version) as Array<Record<string, unknown>>;
+        const lastRun = readRunsForSkillVersion(db, record.skillId, record.version, 1)[0] ?? null;
+        return {
+          ...record,
+          recordedUses: usageCount(db, record.skillId, record.version),
+          lastUsedAt: lastRun?.startedAt ?? null,
+          latestBenchmark: benchmarks[0] ?? null,
+          benchmarkCount: benchmarks.length,
+          pinnedProjects: pins.map((pin) => ({
+            projectId: String(pin.project_id),
+            projectCode: pin.code ? String(pin.code) : null,
+            projectName: pin.name ? String(pin.name) : null,
+            pinnedBy: String(pin.pinned_by),
+            pinnedAt: String(pin.pinned_at),
+          })),
+          bodyAvailable: Boolean(asset) && asset!.sha256 === record.sha256,
+          bodyIssue: loadError
+            ?? (!asset
+              ? 'The revision file is not present in any registry directory on this machine.'
+              : asset.sha256 !== record.sha256
+                ? 'The revision file no longer hashes to its registered body; it has been rewritten in place.'
+                : null),
+        };
+      }),
+    });
+  }
+  return entries;
 }

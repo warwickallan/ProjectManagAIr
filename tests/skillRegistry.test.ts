@@ -295,7 +295,16 @@ describe('registration and lifecycle', () => {
     try {
       const result = syncSkillRegistry(fixture.db, { externalDir: null });
       expect(result.registered.some((entry) => entry.version === '2.0.0')).toBe(true);
-      expect(result.bootstrapped).toEqual([{ skillId: DEFAULT_EXTRACTION_SKILL_ID, version: '2.0.0' }]);
+      // Every shipped skill id that declares an active revision and has none
+      // registered bootstraps through the audited promotion path, so the set
+      // grows as seeds are added. What must stay true is that the extraction
+      // skill is among them and that each id ends with exactly one active
+      // revision — which the partial unique index enforces at the database.
+      expect(result.bootstrapped).toContainEqual({ skillId: DEFAULT_EXTRACTION_SKILL_ID, version: '2.0.0' });
+      for (const entry of result.bootstrapped) {
+        const activeCount = fixture.db.prepare("SELECT count(*) count FROM extraction_skills WHERE skill_id = ? AND status = 'active'").get(entry.skillId) as { count: number };
+        expect(Number(activeCount.count)).toBe(1);
+      }
 
       const active = readActiveSkillRevision(fixture.db)!;
       expect(active.version).toBe('2.0.0');

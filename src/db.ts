@@ -6,6 +6,7 @@ import { importPayloadSchema, portfolioDataSchema, type ImportPayload, type Port
 import { readBlindExtractionComparisonReports } from './blindExtractionComparison.js';
 import { readRegisterState } from './projectRegisters.js';
 import { buildDeterministicBrief, computeProjectOverview, readSourceIntelligence } from './sourceIntelligence.js';
+import { CONSULTANT_VIEW_MODES, buildDeterministicConsultantView } from './consultantViews.js';
 
 type SqlValue = string | number | bigint | null;
 
@@ -193,6 +194,10 @@ function readProjectFromRows(db: DatabaseSync, row: Record<string, unknown>): Pr
     sourceIntelligence: readSourceIntelligence(db, projectId),
     projectOverview: computeProjectOverview(db, projectId),
     consultantBrief: buildDeterministicBrief(db, projectId),
+    // Deterministic only. Nothing on this path can reach a provider, so opening
+    // a project costs zero model calls however many tabs, filters or refreshes
+    // follow.
+    consultantViews: CONSULTANT_VIEW_MODES.map((mode) => buildDeterministicConsultantView(db, projectId, mode)),
   };
   return project as Project;
 }

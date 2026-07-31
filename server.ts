@@ -14,7 +14,28 @@ import { recordRegisterEvent, validateOccurredAt } from './src/registerProjectio
 import { acknowledgeChangeset, applyReviewedChangeset, buildConsultantBrief, freezePacketAndCreateChangeset, pinOverviewMode, readSourceIntelligence, replayPacket, reviewChangeset } from './src/sourceIntelligence.js';
 import { createLifecycleSourceEnqueuer, retrySourceJob, runSourceExtractionJob, skipSourceAfterComprehension, startSourceJobSweeper, WatchedInboxScanner } from './src/sourcePipeline.js';
 import { createLocalOriginGuard } from './src/httpSecurity.js';
-import { ensureSkillRegistrySynced, pinProjectSkill, promoteSkillRevision, readSkillAuditTrail, readSkillPin, readSkillRevisions, rollbackSkillRevision, unpinProjectSkill } from './src/skillRegistry.js';
+import {
+  compareSkillRevisions,
+  ensureSkillRegistrySynced,
+  pinProjectSkill,
+  promoteSkillRevision,
+  readExtractionRunProvenance,
+  readRunsForSkillVersion,
+  readSkillAuditTrail,
+  readSkillBenchmarks,
+  readSkillCatalogue,
+  readSkillPin,
+  readSkillRevisionBody,
+  readSkillRevisions,
+  recordSkillBenchmark,
+  retireSkillRevision,
+  rollbackSkillRevision,
+  unpinProjectSkill,
+  uploadSkillDraft,
+  validateSkillDraft,
+} from './src/skillRegistry.js';
+import { CONSULTANT_VIEW_MODES, generateConsultantView, readConsultantView, renderSynthesisMarkdown, type ConsultantViewMode } from './src/consultantViews.js';
+import { readPreservedOutputs } from './src/providerOutputs.js';
 import { ClaudeCodeStructuredExtractionProvider } from './src/extractionProvider.js';
 import { ClaudeCodeGroundedBriefProvider } from './src/briefProvider.js';
 
@@ -259,6 +280,37 @@ app.post('/api/projects/:projectId/overview/pin', asyncRoute(async (request, res
   response.json(pinOverviewMode(db(), String(request.params.projectId), mode, 'current-user'));
 }));
 app.post('/api/projects/:projectId/consultant-brief', asyncRoute(async (request, response) => response.json(await buildConsultantBrief(db(), String(request.params.projectId), String((request.body as { mode?: string }).mode ?? 'needs-warwick'), groundedBriefProvider))));
+function consultantMode(value: unknown): ConsultantViewMode | null {
+  return (CONSULTANT_VIEW_MODES as readonly string[]).includes(String(value)) ? String(value) as ConsultantViewMode : null;
+}
+/**
+ * Read a consultant view. Deterministic content plus whatever synthesis is
+ * already cached. Zero provider calls, always — generation is POST only.
+ */
+app.get('/api/projects/:projectId/consultant-view', (request, response) => {
+  const mode = consultantMode(request.query.mode ?? 'needs-warwick');
+  if (!mode) { response.status(400).json({ error: `mode must be one of ${CONSULTANT_VIEW_MODES.join(', ')}.` }); return; }
+  response.json(readConsultantView(db(), String(request.params.projectId), mode, groundedBriefProvider));
+});
+/** One deliberate user action, at most one bounded provider call. */
+app.post('/api/projects/:projectId/consultant-view', asyncRoute(async (request, response) => {
+  const body = request.body as { mode?: string; force?: boolean };
+  const mode = consultantMode(body.mode ?? 'needs-warwick');
+  if (!mode) { response.status(400).json({ error: `mode must be one of ${CONSULTANT_VIEW_MODES.join(', ')}.` }); return; }
+  response.json(await generateConsultantView(db(), String(request.params.projectId), mode, groundedBriefProvider, { force: Boolean(body.force), actor: 'current-user' }));
+}));
+app.get('/api/projects/:projectId/consultant-view/download', (request, response) => {
+  const mode = consultantMode(request.query.mode ?? 'needs-warwick');
+  if (!mode) { response.status(400).json({ error: `mode must be one of ${CONSULTANT_VIEW_MODES.join(', ')}.` }); return; }
+  const view = readConsultantView(db(), String(request.params.projectId), mode, groundedBriefProvider);
+  response.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+  response.setHeader('Content-Disposition', `attachment; filename="consultant-view-${mode}.md"`);
+  response.send(renderSynthesisMarkdown(view));
+});
+/** Preserved raw provider responses for one source: the acceptance evidence trail. */
+app.get('/api/projects/:projectId/sources/:sourceId/provider-outputs', (request, response) => {
+  response.json({ outputs: readPreservedOutputs(db(), String(request.params.sourceId)) });
+});
 app.post('/api/proposed-changes/:proposedChangeId/approve', asyncRoute(async (request, response) => response.json(approveProposedChange(db(), String(request.params.proposedChangeId), String((request.body as { reviewer?: string }).reviewer ?? 'current-user')))));
 app.post('/api/proposed-changes/:proposedChangeId/reject', asyncRoute(async (request, response) => response.json(rejectProposedChange(db(), String(request.params.proposedChangeId), String((request.body as { reviewer?: string }).reviewer ?? 'current-user')))));
 app.post('/api/files/open', asyncRoute(async (request, response) => response.json(openOriginalPath(db(), String((request.body as { path?: string }).path ?? '')))));
@@ -287,7 +339,77 @@ app.post('/api/inbox/:graphId/read-state', asyncRoute(async (request, response) 
 }));
 app.post('/api/inbox/:graphId/delete', asyncRoute(async (request, response) => response.json(await moveMessageToDeletedItems(db(), String(request.params.graphId)))));
 
-app.get('/api/extraction-skills', (request, response) => response.json({ revisions: readSkillRevisions(db(), typeof request.query.skillId === 'string' ? request.query.skillId : undefined) }));
+/**
+ * Settings -> AI Skills & Prompts.
+ *
+ * `catalogue` is the managed view: every registered skill, its versions, their
+ * status, provenance, recorded uses, latest benchmark and project pins. No
+ * revision body is included — a body is fetched per version by its own route, so
+ * reading the instructions the model receives is always a deliberate act.
+ */
+app.get('/api/extraction-skills', (request, response) => response.json({
+  catalogue: readSkillCatalogue(db()),
+  revisions: readSkillRevisions(db(), typeof request.query.skillId === 'string' ? request.query.skillId : undefined),
+}));
+app.get('/api/extraction-skills/compare', (request, response) => {
+  const skillId = String(request.query.skillId ?? '');
+  const from = String(request.query.from ?? '');
+  const to = String(request.query.to ?? '');
+  if (!skillId || !from || !to) { response.status(400).json({ error: 'skillId, from and to are required.' }); return; }
+  response.json(compareSkillRevisions(db(), skillId, from, to));
+});
+app.get('/api/extraction-skills/benchmarks', (request, response) => response.json({
+  benchmarks: readSkillBenchmarks(db(), {
+    skillId: typeof request.query.skillId === 'string' ? request.query.skillId : undefined,
+    version: typeof request.query.version === 'string' ? request.query.version : undefined,
+  }),
+}));
+app.post('/api/extraction-skills/benchmarks', asyncRoute(async (request, response) => {
+  const body = request.body as { skillId?: string; version?: string; benchmarkLabel?: string; verdict?: string; metrics?: Record<string, unknown>; projectId?: string; sourceId?: string; packetId?: string; actor?: string; note?: string };
+  if (!body.skillId || !body.version || !body.benchmarkLabel || !body.verdict) { response.status(400).json({ error: 'skillId, version, benchmarkLabel and verdict are required.' }); return; }
+  response.status(201).json(recordSkillBenchmark(db(), {
+    skillId: body.skillId, version: body.version, benchmarkLabel: body.benchmarkLabel, verdict: body.verdict,
+    metrics: body.metrics ?? {}, projectId: body.projectId ?? null, sourceId: body.sourceId ?? null, packetId: body.packetId ?? null,
+    recordedBy: String(body.actor ?? 'current-user'), note: body.note ?? null,
+  }));
+}));
+app.post('/api/extraction-skills/validate', asyncRoute(async (request, response) => {
+  const body = request.body as { text?: string; fileName?: string; expectedSkillId?: string };
+  if (typeof body.text !== 'string') { response.status(400).json({ error: 'text is required.' }); return; }
+  response.json(validateSkillDraft(db(), { text: body.text, fileName: body.fileName ?? null, expectedSkillId: body.expectedSkillId ?? null }));
+}));
+app.post('/api/extraction-skills/drafts', asyncRoute(async (request, response) => {
+  const body = request.body as { text?: string; fileName?: string; expectedSkillId?: string; actor?: string };
+  if (typeof body.text !== 'string') { response.status(400).json({ error: 'text is required.' }); return; }
+  // An upload ALWAYS creates a draft. It can never overwrite a published version
+  // and never activates anything; publishing is a separate confirmed action.
+  response.status(201).json(uploadSkillDraft(db(), { text: body.text, fileName: body.fileName ?? null, expectedSkillId: body.expectedSkillId ?? null, actor: String(body.actor ?? 'current-user') }));
+}));
+app.post('/api/extraction-skills/retire', asyncRoute(async (request, response) => {
+  const body = request.body as { skillId?: string; version?: string; actor?: string; note?: string };
+  if (!body.version) { response.status(400).json({ error: 'version is required.' }); return; }
+  response.json(retireSkillRevision(db(), { skillId: body.skillId, version: body.version, actor: String(body.actor ?? 'current-user'), note: body.note }));
+}));
+app.get('/api/extraction-skills/:skillId/versions/:version', (request, response) => {
+  response.json(readSkillRevisionBody(db(), String(request.params.skillId), String(request.params.version)));
+});
+app.get('/api/extraction-skills/:skillId/versions/:version/download', (request, response) => {
+  // The reusable template only. There is deliberately no route anywhere that
+  // returns an assembled prompt: an assembled prompt contains source windows,
+  // which are customer material, and only its SHA-256 is ever recorded.
+  const body = readSkillRevisionBody(db(), String(request.params.skillId), String(request.params.version));
+  response.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+  response.setHeader('Content-Disposition', `attachment; filename="${body.skillId}-${body.version}.md"`);
+  response.send(body.text);
+});
+app.get('/api/extraction-skills/:skillId/versions/:version/runs', (request, response) => {
+  response.json({ runs: readRunsForSkillVersion(db(), String(request.params.skillId), String(request.params.version)) });
+});
+app.get('/api/extraction-runs/:runId/provenance', (request, response) => {
+  const provenance = readExtractionRunProvenance(db(), String(request.params.runId));
+  if (!provenance) { response.status(404).json({ error: 'Extraction run not found.' }); return; }
+  response.json(provenance);
+});
 app.get('/api/extraction-skills/audit', (request, response) => response.json({ events: readSkillAuditTrail(db(), { skillId: typeof request.query.skillId === 'string' ? request.query.skillId : undefined, projectId: typeof request.query.projectId === 'string' ? request.query.projectId : undefined }) }));
 app.post('/api/extraction-skills/promote', asyncRoute(async (request, response) => {
   const body = request.body as { skillId?: string; version?: string; actor?: string; note?: string };

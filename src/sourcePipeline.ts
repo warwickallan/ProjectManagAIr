@@ -20,8 +20,10 @@ import {
   type SourcePacketRow,
   type StructuredExtractionOutput,
   type StructuredExtractionProvider,
+  type RawProviderResponse,
   type StructuredExtractionRequest,
 } from './extractionProvider.js';
+import { preserveProviderOutput, recordProviderOutputOutcome } from './providerOutputs.js';
 import { intakeProjectSource, type IntakeFileInput } from './projectLifecycle.js';
 import { ensureSkillRegistrySynced, packetSkillProvenance, publicSkillProvenance, recordExtractionRunProvenance, resolveSkillForRun, runProvenanceOf } from './skillRegistry.js';
 import {
@@ -941,6 +943,10 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
   }));
   const runIds: string[] = [];
   const outputs: StructuredExtractionOutput[] = [];
+  // Which attempt on this source these responses belong to. Preserved outputs
+  // from an earlier, failed attempt must remain distinguishable from this one's:
+  // they are the evidence that the model already answered once.
+  const attemptLabel = `attempt-${String(Number((db.prepare('SELECT attempt_count FROM source_processing_jobs WHERE id = ?').get(jobId) as { attempt_count: number } | undefined)?.attempt_count ?? 0)).padStart(2, '0')}`;
   let totalInputTokens = 0;
   let totalSourceTokens = 0;
   const sourceTokens = Math.max(1, Math.ceil(Number(source.word_count) * 1.35));
@@ -963,7 +969,40 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
     const assembled = assembleExtractionPrompt(partialRequest, resolvedSkill);
     const prompt = assembled.prompt;
     const promptSha256 = assembled.promptSha256;
-    const request: StructuredExtractionRequest = { ...partialRequest, prompt, promptSha256, skillSha256 };
+    // Preservation is wired per call so the handle it returns is in scope for the
+    // outcome record below. The provider is contractually required to invoke it
+    // before it parses anything, which is what makes a completed response
+    // survive every downstream defect.
+    const preserved: { id: string | null } = { id: null };
+    const preserveRawOutput = (event: RawProviderResponse): string | null => {
+      const record = preserveProviderOutput(db, {
+        sourceId: source.id,
+        projectId: project.id,
+        stage: 'structured-extraction',
+        callIndex: slice.callIndex,
+        attemptLabel: String(attemptLabel),
+        providerId: provider!.identity.providerId,
+        modelLabel: provider!.identity.modelLabel,
+        skillId: resolvedSkill.skillId,
+        skillVersion: resolvedSkill.version,
+        skillSha256,
+        promptTemplateVersion: resolvedSkill.promptTemplateVersion,
+        promptSha256,
+        packetContractVersion: resolvedSkill.packetContractVersion,
+        windowKeys: slice.windows.map((window) => window.seq),
+        requestedAt: event.requestedAt,
+        receivedAt: event.receivedAt,
+        durationMs: event.durationMs,
+        raw: event.raw,
+        inputTokens: event.reportedInputTokens ?? estimateTokens(prompt),
+        outputTokens: event.reportedOutputTokens ?? estimateTokens(event.raw),
+        inputTokenSource: event.reportedInputTokens === undefined || event.reportedInputTokens === null ? 'estimated' : 'provider-reported',
+        outputTokenSource: event.reportedOutputTokens === undefined || event.reportedOutputTokens === null ? 'estimated' : 'provider-reported',
+      });
+      preserved.id = record.id;
+      return record.id;
+    };
+    const request: StructuredExtractionRequest = { ...partialRequest, prompt, promptSha256, skillSha256, preserveRawOutput };
     const projectedInput = totalInputTokens + estimateTokens(prompt);
     const projectedRepetition = (totalSourceTokens + slice.estimatedSourceTokens) / sourceTokens;
     if (projectedInput > budget.maxInputTokens || projectedRepetition > budget.maxSourceRepetition || Date.now() - started > budget.maxWallClockMs) {
@@ -994,6 +1033,14 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
       }));
       runIds.push(runId);
       completedRunRecorded = true;
+      if (preserved.id) {
+        const excluded = result.output.rejectedRows?.length ?? 0;
+        recordProviderOutputOutcome(db, preserved.id, {
+          parseStatus: excluded > 0 ? 'parsed-with-exclusions' : 'parsed',
+          parseDetail: excluded > 0 ? `${excluded} row(s) failed the row contract and were excluded: ${result.output.rejectedRows!.map((entry) => `#${entry.index} ${entry.reason}`).join(' | ').slice(0, 2000)}` : null,
+          runId,
+        });
+      }
       outputs.push(result.output);
       if (options.leaseOwner) renewSourceJobLease(db, jobId, options.leaseOwner, options.leaseMs);
       if (totalInputTokens > budget.maxInputTokens || totalSourceTokens / sourceTokens > budget.maxSourceRepetition || Date.now() - started > budget.maxWallClockMs) {
@@ -1001,6 +1048,9 @@ async function runSourceExtraction(db: DatabaseSync, options: SourceExtractionOp
       }
     } catch (error) {
       const failure = classifySourceFailure(error);
+      // A response that arrived and then failed to parse is still preserved; the
+      // record says so rather than being silently left as `received`.
+      if (preserved.id) recordProviderOutputOutcome(db, preserved.id, { parseStatus: 'rejected', parseDetail: failure.message.slice(0, 2000) });
       if (!completedRunRecorded) {
         recordRunProvenance(db, resolvedSkill, insertRun(db, {
           source,
