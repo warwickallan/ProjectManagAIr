@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { useApi } from './api';
 import { ErrorState, LoadingState, PageIntro, Section, StatusChip } from './components';
+import { AiSkillsPanel } from './AiSkillsPanel';
+import { BuildHandoffsPanel } from './BuildHandoffsPanel';
 
 type StorageSettings = { projectsRoot: string | null; projectFolderNamingFormat: string; exists: boolean; writable: boolean; configured: boolean; verifiedAt: string | null; lastWriteTestAt: string | null; message?: string; writeTest?: boolean };
 
@@ -9,6 +11,8 @@ export function SettingsPage() {
     <div className="page-stack">
       <PageIntro eyebrow="Cockpit settings" title="Settings" description="Manage local-only Project ManagAIr configuration outside Git." />
       <StorageSettingsPanel />
+      <BuildHandoffsPanel />
+      <AiSkillsPanel />
     </div>
   );
 }

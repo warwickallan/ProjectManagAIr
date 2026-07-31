@@ -2,6 +2,7 @@ import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, vi } from 'vitest';
 import fixtureJson from '../fixtures/portfolio.json';
 import { App } from '../src/App';
+import { formatDate } from '../src/components';
 import { buildPortfolioResponse, buildProjectResponse, portfolioFixtureSchema } from '../src/domain';
 
 const fixture = portfolioFixtureSchema.parse(fixtureJson);
@@ -63,5 +64,12 @@ describe('Cockpit states and routes', () => {
     vi.stubGlobal('fetch', vi.fn(() => jsonResponse(response)));
     render(<App />);
     expect(await screen.findByText('No open questions.')).toBeInTheDocument();
+  });
+});
+
+
+describe('date presentation', () => {
+  it('does not display the legacy unscheduled sentinel as a real date', () => {
+    expect(formatDate('9999-12-31')).toBe('Not set');
   });
 });

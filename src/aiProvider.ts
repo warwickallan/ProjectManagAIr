@@ -1,5 +1,6 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import type { DatabaseSync } from 'node:sqlite';
+import { parseCodexJsonl, runCliCommand } from './extractionProvider.js';
 
 export interface AIContextRef {
   contextType: 'current-day-calendar' | 'selected-event' | 'selected-email' | 'selected-project' | 'project-record';
@@ -37,20 +38,24 @@ export interface AIProvider {
   resumeSession(sessionId: string): string;
 }
 
+/** Wall-clock limit for one interactive chat call; a hung CLI must not hang the Express route. */
+export const DEFAULT_CHAT_TIMEOUT_MS = 3 * 60_000;
+
 function where(command: string): string | null {
-  const result = spawnSync('where.exe', [command], { encoding: 'utf8' });
-  if (result.status !== 0) return null;
-  return result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? null;
+  const lookup = process.platform === 'win32' ? 'where.exe' : 'which';
+  const result = spawnSync(lookup, [command], { encoding: 'utf8', timeout: 5000 });
+  if (result.error || result.status !== 0) return null;
+  return (result.stdout ?? '').split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? null;
 }
 
 function commandVersion(command: string): string | null {
   const result = spawnSync(command, ['--version'], { encoding: 'utf8', timeout: 5000 });
-  if (result.status !== 0) return null;
-  return (result.stdout || result.stderr).trim() || null;
+  if (result.error || result.status !== 0) return null;
+  return ((result.stdout ?? '') || (result.stderr ?? '')).trim() || null;
 }
 
 class ClaudeCodeProvider implements AIProvider {
-  private child: ReturnType<typeof spawn> | null = null;
+  private controller: AbortController | null = null;
 
   isAvailable(): AIProviderStatus {
     const executablePath = where('claude');
@@ -70,14 +75,26 @@ class ClaudeCodeProvider implements AIProvider {
     const prompt = buildGroundedPrompt(request.prompt, request.contextRefs);
     insertContextRefs(db, sessionId, request.contextRefs);
     insertMessage(db, sessionId, 'user', request.prompt);
-    const response = await runCommand('claude', ['-p', prompt]);
-    insertMessage(db, sessionId, 'assistant', response);
-    return { sessionId, provider, response, contextSent: request.contextRefs };
+    this.controller = new AbortController();
+    try {
+      const run = await runCliCommand({
+        providerId: 'claude-code',
+        command: 'claude',
+        args: ['-p', prompt],
+        signal: this.controller.signal,
+        timeoutMs: DEFAULT_CHAT_TIMEOUT_MS,
+      });
+      const response = run.stdout.trim();
+      insertMessage(db, sessionId, 'assistant', response);
+      return { sessionId, provider, response, contextSent: request.contextRefs };
+    } finally {
+      this.controller = null;
+    }
   }
 
   cancel(): void {
-    this.child?.kill();
-    this.child = null;
+    this.controller?.abort();
+    this.controller = null;
   }
 
   resumeSession(sessionId: string): string {
@@ -85,7 +102,14 @@ class ClaudeCodeProvider implements AIProvider {
   }
 }
 
+/**
+ * Codex is a first-class chat provider: it runs through the same `runCliCommand`
+ * machinery as the extraction provider, so a failure carries its taxonomy kind and both
+ * output channels instead of dead-ending the route with an unconditional throw.
+ */
 class CodexCliProvider implements AIProvider {
+  private controller: AbortController | null = null;
+
   isAvailable(): AIProviderStatus {
     const executablePath = where('codex');
     if (!executablePath) return { id: 'codex-cli', label: 'Codex CLI', available: false, detail: 'codex was not found on PATH.', executablePath: null };
@@ -97,12 +121,35 @@ class CodexCliProvider implements AIProvider {
     return createSession(db, 'codex-cli', title);
   }
 
-  async sendMessage(): Promise<ChatResult> {
+  async sendMessage(db: DatabaseSync, request: ChatRequest): Promise<ChatResult> {
     const provider = this.isAvailable();
-    throw new Error(provider.available ? 'Codex CLI non-interactive local provider is not enabled for this build.' : provider.detail);
+    if (!provider.available) throw new Error(provider.detail);
+    const sessionId = request.sessionId ?? this.startSession(db, 'Project ManagAIr chat');
+    const prompt = buildGroundedPrompt(request.prompt, request.contextRefs);
+    insertContextRefs(db, sessionId, request.contextRefs);
+    insertMessage(db, sessionId, 'user', request.prompt);
+    this.controller = new AbortController();
+    try {
+      const run = await runCliCommand({
+        providerId: 'codex-cli',
+        command: 'codex',
+        args: ['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', '-'],
+        input: prompt,
+        signal: this.controller.signal,
+        timeoutMs: DEFAULT_CHAT_TIMEOUT_MS,
+      });
+      const response = parseCodexJsonl(run.stdout, 'codex-cli').message;
+      insertMessage(db, sessionId, 'assistant', response);
+      return { sessionId, provider, response, contextSent: request.contextRefs };
+    } finally {
+      this.controller = null;
+    }
   }
 
-  cancel(): void {}
+  cancel(): void {
+    this.controller?.abort();
+    this.controller = null;
+  }
 
   resumeSession(sessionId: string): string {
     return sessionId;
@@ -115,16 +162,47 @@ export function probeAIProviders(): AIProviderStatus[] {
   return providers.map((provider) => provider.isAvailable());
 }
 
+export interface PreferredProviderResolution {
+  provider: AIProvider | null;
+  /** Why nothing was selected; null when a provider was selected. */
+  reason: string | null;
+}
+
+/**
+ * Select a provider. An explicitly requested provider must still be available — matching
+ * on id alone selected a provider that could not run and dead-ended every chat call.
+ */
+export function resolvePreferredProvider(): PreferredProviderResolution {
+  const requested = process.env.PROJECTMANAGAIR_AI_PROVIDER?.trim();
+  const statuses = providers.map((provider) => ({ provider, status: provider.isAvailable() }));
+  if (requested) {
+    const match = statuses.find((entry) => entry.status.id === requested);
+    if (!match) {
+      return { provider: null, reason: `Requested AI provider "${requested}" is not a known provider (known: ${statuses.map((entry) => entry.status.id).join(', ')}).` };
+    }
+    if (!match.status.available) {
+      return { provider: null, reason: `Requested AI provider "${requested}" is not available: ${match.status.detail}` };
+    }
+    return { provider: match.provider, reason: null };
+  }
+  const first = statuses.find((entry) => entry.status.available);
+  if (first) return { provider: first.provider, reason: null };
+  return {
+    provider: null,
+    reason: `No supported authenticated local AI provider was discovered. ${statuses.map((entry) => `${entry.status.id}: ${entry.status.detail}`).join(' ')}`,
+  };
+}
+
 export function preferredProvider(): AIProvider | null {
-  const requested = process.env.PROJECTMANAGAIR_AI_PROVIDER;
-  if (requested) return providers.find((provider) => provider.isAvailable().id === requested) ?? null;
-  return providers.find((provider) => provider.isAvailable().available) ?? null;
+  return resolvePreferredProvider().provider;
 }
 
 export async function sendChatMessage(db: DatabaseSync, request: ChatRequest): Promise<ChatResult> {
   if (request.contextRefs.length === 0) throw new Error('Select at least one context record before sending chat.');
-  const provider = preferredProvider();
-  if (!provider) throw new Error('No supported authenticated local AI provider was discovered. Install nothing; authenticate an existing Claude Code CLI or configure a provider later.');
+  const { provider, reason } = resolvePreferredProvider();
+  if (!provider) throw new Error(reason ?? 'No supported authenticated local AI provider was discovered.');
+  // A typed provider failure propagates untouched: it already carries its taxonomy kind
+  // and both output channels, which is what the operator needs to see.
   return provider.sendMessage(db, request);
 }
 
@@ -156,17 +234,3 @@ function buildGroundedPrompt(prompt: string, refs: AIContextRef[]): string {
   return `You are Project ManagAIr's embedded assistant. Use only the selected context records below. Do not infer from mailbox, calendar, attachments, or project folders that are not listed.\n\nSelected context:\n${context}\n\nUser request:\n${prompt}`;
 }
 
-function runCommand(command: string, args: string[]): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += String(chunk); });
-    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
-    child.on('error', reject);
-    child.on('close', (code) => {
-      if (code === 0) resolve(stdout.trim());
-      else reject(new Error(stderr.trim() || `${command} exited with code ${code}`));
-    });
-  });
-}

@@ -43,7 +43,7 @@ export const actionSchema = commonRecord.extend({
 
 export const riskIssueSchema = commonRecord.extend({
   kind: z.enum(['risk', 'issue']),
-  severity: z.enum(['low', 'medium', 'high', 'critical']),
+  severity: z.enum(['unknown', 'low', 'medium', 'high', 'critical']),
   likelihood: z.enum(['unlikely', 'possible', 'likely', 'almost-certain']).nullable(),
   impact: z.string().min(1),
   response: z.string().min(1),
@@ -60,7 +60,7 @@ export const changeSchema = commonRecord.extend({
 });
 
 export const decisionSchema = commonRecord.extend({
-  decisionStatus: z.enum(['proposed', 'awaiting-user', 'decided', 'superseded']),
+  decisionStatus: z.enum(['proposed', 'awaiting-user', 'decided', 'agreed', 'agreed-in-principle', 'ratified', 'rejected', 'parked', 'pending-ratification', 'superseded']),
   decisionNeededBy: dateOnly.nullable(),
   optionsSummary: z.string(),
   outcome: z.string().nullable(),
@@ -164,11 +164,21 @@ export const inboxSourceSchema = z.object({
   sourceType: z.string().min(1),
   currentExternalPath: z.string().min(1),
   previousExternalPath: z.string().nullable(),
-  processingStatus: z.enum(['awaiting_processing', 'processing', 'awaiting_review', 'verified', 'failed', 'rejected', 'archived']),
+  processingStatus: z.enum(['awaiting_processing', 'processing', 'awaiting_review', 'verified', 'failed', 'quarantined', 'rejected', 'archived']),
   processorProvider: z.string().min(1),
   extractedItemIds: z.array(z.string()),
   reviewState: z.string().min(1),
   verificationState: z.string().min(1),
+  /**
+   * D1 — recovery information the pipeline writes (migration 011) and which,
+   * until now, was readable only by opening the database. `processingStage` is
+   * the finer state behind the coarse `processingStatus` chip, `processingError`
+   * is what went wrong, and `processingRecoveryAction` is what a consultant
+   * should do about it. All three are null for a source that has never failed.
+   */
+  processingStage: z.string().nullable().default(null),
+  processingError: z.string().nullable().default(null),
+  processingRecoveryAction: z.string().nullable().default(null),
   createdAt: isoDateTime,
   updatedAt: isoDateTime,
 });
@@ -213,6 +223,126 @@ export const sourceFileHistorySchema = z.object({
   contentHash: z.string().min(1),
 });
 
+export const registerAnchorSchema = z.object({
+  id: z.string().min(1),
+  sourceId: z.string().min(1),
+  segmentId: z.string().min(1),
+  speaker: z.string().nullable(),
+  tMs: z.number().nullable(),
+  quote: z.string().nullable(),
+  verified: z.boolean(),
+});
+
+export const registerEventSchema = z.object({
+  id: z.string().min(1),
+  occurredAt: isoDateTime,
+  actor: z.string().min(1),
+  eventType: z.string().min(1),
+  field: z.string().nullable(),
+  previousValue: z.string().nullable(),
+  newValue: z.string().nullable(),
+  reason: z.string().min(1),
+  evidenceRef: z.string().nullable(),
+});
+
+export const registerCurrentStateSchema = z.object({
+  status: z.string().min(1),
+  owner: z.string().nullable(),
+  dueDate: z.string().nullable(),
+  resolution: z.string().nullable(),
+  lastHumanEventAt: z.string().nullable(),
+});
+
+export const registerScoreSchema = z.object({
+  value: z.number(),
+  band: z.enum(['Now', 'Soon', 'Watch', 'Reference']),
+  inputs: z.record(z.string(), z.unknown()),
+  scoringVersion: z.string().min(1),
+});
+
+export const overviewRecordSchema = z.object({
+  id: z.string().min(1),
+  registerName: z.string().min(1),
+  title: z.string().min(1),
+  summary: z.string(),
+  status: z.string().min(1),
+  owner: z.string().nullable(),
+  dueDate: z.string().nullable(),
+  score: z.number(),
+  band: z.enum(['Now', 'Soon', 'Watch', 'Reference']),
+  scoreInputs: z.record(z.string(), z.unknown()),
+});
+
+export const projectOverviewSchema = z.object({
+  leadMode: z.enum(['changes', 'meeting', 'needs-warwick']),
+  computedMode: z.enum(['changes', 'meeting', 'needs-warwick']),
+  pinnedMode: z.enum(['changes', 'meeting', 'needs-warwick']).nullable(),
+  modes: z.object({
+    changes: z.object({ available: z.boolean(), changesetId: z.string().nullable() }),
+    meeting: z.object({ available: z.boolean() }),
+    needsWarwick: z.object({ available: z.boolean() }),
+  }),
+  lenses: z.record(z.string(), z.array(overviewRecordSchema)),
+});
+
+export const sourceIntelligenceSchema = z.object({
+  changesets: z.array(z.object({
+    id: z.string().min(1),
+    packetId: z.string().min(1),
+    sourceId: z.string().min(1),
+    createdAt: isoDateTime,
+    gateVerdict: z.string().min(1),
+    gateReport: z.unknown(),
+    reviewStatus: z.string().min(1),
+    appliedAt: z.string().nullable(),
+    deterministicHash: z.string().min(1),
+    operations: z.array(z.object({
+      id: z.string().min(1), seq: z.number().int(), op: z.string().min(1), registerName: z.string().min(1), clientRef: z.string().min(1),
+      targetExternalId: z.string().nullable(), allocatedExternalId: z.string().nullable(), proposedRow: z.record(z.string(), z.unknown()), fieldDiff: z.record(z.string(), z.unknown()), anchors: z.array(z.unknown()),
+      confidence: z.string().min(1), derivation: z.string().min(1), status: z.string().min(1), reviewer: z.string().nullable(), reviewedAt: z.string().nullable(), reviewNote: z.string().nullable(),
+    })),
+  })),
+  sources: z.array(z.object({
+    id: z.string().min(1), sourceType: z.string().min(1), originalFileName: z.string().min(1), eventDate: z.string().nullable(), durationMs: z.number().nullable(),
+    wordCount: z.number().int().nonnegative(), segmentCount: z.number().int().nonnegative(), participants: z.array(z.string()), normaliserVersion: z.string().min(1), createdAt: isoDateTime,
+    windows: z.array(z.record(z.string(), z.unknown())), markerCounts: z.array(z.record(z.string(), z.unknown())),
+    metrics: z.object({ calls: z.number().int().nonnegative(), inputTokens: z.number().int().nonnegative(), outputTokens: z.number().int().nonnegative(), durationMs: z.number().nonnegative() }),
+  })),
+});
+
+export const consultantBriefSchema = z.object({
+  id: z.string().min(1),
+  selectionHash: z.string().min(1),
+  briefMarkdown: z.string(),
+  citations: z.array(z.string()),
+  generationMode: z.string().min(1),
+  stale: z.boolean(),
+  selectedRecords: z.array(overviewRecordSchema).default([]),
+});
+/**
+ * The deterministic Meeting Brief and Needs Warwick views.
+ *
+ * Carried on the project payload because they cost nothing to compute and must
+ * be on screen the moment the project opens. A generated synthesis is NOT here:
+ * it is fetched from its own route, so nothing about opening a project can be
+ * mistaken for a request to spend a provider call.
+ */
+export const consultantViewSchema = z.object({
+  mode: z.string().min(1),
+  themeEngineVersion: z.string().min(1),
+  themes: z.array(z.looseObject({ id: z.string(), label: z.string(), memberIds: z.array(z.string()) })).default([]),
+  sections: z.array(z.object({
+    key: z.string().min(1),
+    title: z.string().min(1),
+    description: z.string(),
+    rowIds: z.array(z.string()),
+  })).default([]),
+  records: z.array(z.looseObject({ id: z.string(), registerName: z.string(), title: z.string() })).default([]),
+  selectedIds: z.array(z.string()).default([]),
+  selectionHash: z.string().min(1),
+  providerCalls: z.literal(0),
+});
+
 export const registerRowSchema = z.object({
   id: z.string().min(1),
   projectId: z.string().min(1),
@@ -236,6 +366,15 @@ export const registerRowSchema = z.object({
   rawRow: z.record(z.string(), z.unknown()),
   normalizedRow: z.record(z.string(), z.string()),
   updatedAt: isoDateTime,
+  derivation: z.enum(['fact', 'inference']).default('fact'),
+  confidence: z.string().default('unknown'),
+  dueDateRaw: z.string().nullable().default(null),
+  dueDateConfidence: z.string().default('none'),
+  typedDetails: z.record(z.string(), z.unknown()).default({}),
+  anchors: z.array(registerAnchorSchema).default([]),
+  events: z.array(registerEventSchema).default([]),
+  currentState: registerCurrentStateSchema.nullable().default(null),
+  score: registerScoreSchema.nullable().default(null),
 });
 
 export const registerComparisonRowSchema = z.object({
@@ -310,6 +449,10 @@ export const projectSchema = z.object({
   registerComparisonRows: z.array(registerComparisonRowSchema).default([]),
   registerComparisonSummary: z.array(registerComparisonSummarySchema).default([]),
   blindExtractionComparisonReports: z.array(blindExtractionComparisonReportSchema).default([]),
+  sourceIntelligence: sourceIntelligenceSchema.default({ changesets: [], sources: [] }),
+  projectOverview: projectOverviewSchema.optional(),
+  consultantBrief: consultantBriefSchema.optional(),
+  consultantViews: z.array(consultantViewSchema).default([]),
 });
 
 export const portfolioDataSchema = z.object({

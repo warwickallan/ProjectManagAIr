@@ -1,5 +1,5 @@
 import fixtureJson from '../fixtures/portfolio.json';
-import { buildPortfolioResponse, buildProjectResponse, deriveAttentionItems, formatAttentionLabel, getFreshness, portfolioFixtureSchema, type Project } from '../src/domain';
+import { buildPortfolioResponse, buildProjectResponse, decisionSchema, deriveAttentionItems, formatAttentionLabel, getFreshness, portfolioFixtureSchema, riskIssueSchema, type Project } from '../src/domain';
 
 const fixture = portfolioFixtureSchema.parse(fixtureJson);
 const atlas = fixture.projects[0];
@@ -98,6 +98,11 @@ describe('validated fixture responses', () => {
     expect(buildProjectResponse(fixture, 'missing')).toBeNull();
   });
 
+  it('accepts explicit unknown risk severity and governed decision outcomes', () => {
+    expect(riskIssueSchema.parse({ ...atlas.risksIssues[0], severity: 'unknown' }).severity).toBe('unknown');
+    expect(decisionSchema.parse({ ...atlas.decisions[0], decisionStatus: 'agreed' }).decisionStatus).toBe('agreed');
+    expect(decisionSchema.parse({ ...atlas.decisions[0], decisionStatus: 'pending-ratification' }).decisionStatus).toBe('pending-ratification');
+  });
   it('reports current and stale snapshots truthfully', () => {
     expect(getFreshness(fixture.asOf, new Date('2026-07-29T10:00:00Z')).status).toBe('current');
     expect(getFreshness(fixture.asOf, new Date('2026-08-02T10:00:00Z')).status).toBe('stale');

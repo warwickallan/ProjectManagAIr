@@ -1,14 +1,46 @@
 import express from 'express';
+
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { buildPortfolioResponse, buildProjectResponse, portfolioFixtureSchema } from './src/domain.js';
 import { openProjectManagairDatabase, readPortfolioData, readProjectData } from './src/db.js';
-import { approveProposedChange, createProject, intakeProjectSource, openOriginalPath, readStorageSettings, recordBlindExtractionPacket, rejectProposedChange, updateStorageSettings, verifyStorageRoot } from './src/projectLifecycle.js';
+import { approveProposedChange, createProject, openOriginalPath, readStorageSettings, recordBlindExtractionPacket, rejectProposedChange, updateStorageSettings, verifyStorageRoot, type IntakeFileInput } from './src/projectLifecycle.js';
 import { authStatus, markMessageRead, moveMessageToDeletedItems, pollDeviceCode, readCalendarProjection, readInboxProjection, requiredScopes, startDeviceCode, syncCalendarView, syncInbox } from './src/m365.js';
 import { probeAIProviders, sendChatMessage } from './src/aiProvider.js';
 import { compareBlindExtractionToBenchmark } from './src/blindExtractionComparison.js';
 import { importProjectRegisterBenchmark } from './src/projectRegisters.js';
+import { recordRegisterEvent, validateOccurredAt } from './src/registerProjection.js';
+import { acknowledgeChangeset, applyReviewedChangeset, buildConsultantBrief, freezePacketAndCreateChangeset, pinOverviewMode, readSourceIntelligence, replayPacket, reviewChangeset } from './src/sourceIntelligence.js';
+import { createLifecycleSourceEnqueuer, retrySourceJob, runSourceExtractionJob, skipSourceAfterComprehension, startSourceJobSweeper, WatchedInboxScanner } from './src/sourcePipeline.js';
+import { createLocalOriginGuard } from './src/httpSecurity.js';
+import {
+  compareSkillRevisions,
+  ensureSkillRegistrySynced,
+  pinProjectSkill,
+  promoteSkillRevision,
+  readExtractionRunProvenance,
+  readRunsForSkillVersion,
+  readSkillAuditTrail,
+  readSkillBenchmarks,
+  readSkillCatalogue,
+  readSkillPin,
+  readSkillRevisionBody,
+  readSkillRevisions,
+  recordSkillBenchmark,
+  retireSkillRevision,
+  rollbackSkillRevision,
+  unpinProjectSkill,
+  uploadSkillDraft,
+  validateSkillDraft,
+} from './src/skillRegistry.js';
+import { CONSULTANT_VIEW_MODES, generateConsultantView, readConsultantView, renderSynthesisMarkdown, type ConsultantViewMode } from './src/consultantViews.js';
+import { readPreservedOutputs } from './src/providerOutputs.js';
+import { finalizeBuild } from './src/buildFinalizer.js';
+import { GitHubRestPort, GoogleDriveRestPort, beginDriveAuthorization, driveCredentialPaths } from './src/buildFinalizerPorts.js';
+import { isKnownManifestPath, readBuildHandoffs, resolveHandoffRoot } from './src/buildHandoffs.js';
+import { ClaudeCodeStructuredExtractionProvider } from './src/extractionProvider.js';
+import { ClaudeCodeGroundedBriefProvider } from './src/briefProvider.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -34,11 +66,82 @@ function db() {
   return dbContext.db;
 }
 
+const structuredExtractionProvider = new ClaudeCodeStructuredExtractionProvider();
+const groundedBriefProvider = new ClaudeCodeGroundedBriefProvider();
+let extractionWorker = Promise.resolve();
+
+function scheduleSourceExtraction(sourceId: string) {
+  const source = db().prepare('SELECT id, project_id, intake_source_id, content_hash FROM source_documents WHERE id = ?').get(sourceId) as { id: string; project_id: string; intake_source_id: string | null; content_hash: string } | undefined;
+  if (!source) return;
+  // Re-probe before declaring the provider unavailable: installing the CLI
+  // must not require a server restart.
+  structuredExtractionProvider.refresh?.();
+  if (!structuredExtractionProvider.isAvailable()) {
+    const timestamp = new Date().toISOString();
+    const jobId = `source-job:${source.project_id}:${source.content_hash.slice(0, 16)}`;
+    db().prepare("UPDATE source_processing_jobs SET status = 'queued', current_stage = 'awaiting-provider', updated_at = ?, error_message = ? WHERE id = ?")
+      .run(timestamp, 'Local structured extraction provider is unavailable; deterministic source evidence remains available.', jobId);
+    db().prepare("UPDATE project_source_intake SET processing_status = 'awaiting_processing', processing_stage = 'awaiting-provider', processing_error = ?, processing_recovery_action = ?, processing_updated_at = ?, updated_at = ? WHERE id = ?")
+      .run('Local structured extraction provider is unavailable.', 'Install or sign in to the local Claude CLI, then retry this source from the Cockpit.', timestamp, timestamp, source.intake_source_id);
+    return;
+  }
+  // `runSourceExtractionJob` resolves rather than rejecting: every failure path
+  // records a readable reason and a recovery action on the job and intake rows
+  // before returning. Nothing is swallowed.
+  extractionWorker = extractionWorker.then(async () => {
+    const result = await runSourceExtractionJob(db(), {
+      sourceId,
+      provider: structuredExtractionProvider,
+      onEvent: (event) => console.log('[source-pipeline]', JSON.stringify(event)),
+    });
+    if (!result.ok) console.error(`[source-pipeline] ${result.status}: ${result.message ?? 'no message'} -> ${result.recoveryAction ?? 'no recovery action recorded'}`);
+  });
+  void extractionWorker;
+}
+
+async function enqueueSourceFile(projectId: string, file: IntakeFileInput) {
+  const result = await createLifecycleSourceEnqueuer(db())(projectId, file);
+  if (!result.duplicate && typeof result.sourceId === 'string') scheduleSourceExtraction(result.sourceId);
+  return result;
+}
+
 function asyncRoute(handler: express.RequestHandler): express.RequestHandler {
   return (request, response, next) => Promise.resolve(handler(request, response, next)).catch(next);
 }
 
+const inboxWatchers = new Map<string, WatchedInboxScanner>();
+
+function ensureInboxWatcher(projectId: string, externalPath: string | null) {
+  if (demoMode || !externalPath || inboxWatchers.has(projectId)) return;
+  const inboxPath = path.join(externalPath, '00_Inbox', 'Unsorted');
+  // A missing inbox folder is no longer a silent drop: OneDrive is frequently
+  // still mounting at startup, and the previous guard meant that project was
+  // never watched again until someone restarted the server.
+  const scanner = new WatchedInboxScanner({
+    projectId,
+    inboxPath,
+    enqueue: enqueueSourceFile,
+    isKnownHash: (contentHash) => Boolean(db().prepare('SELECT 1 FROM project_source_intake WHERE project_id = ? AND content_hash = ? LIMIT 1').get(projectId, contentHash)),
+    onEvents: (events) => {
+      for (const event of events) {
+        if (['failed', 'abandoned', 'inbox-missing', 'inbox-ready', 'refused'].includes(String(event.status))) console.warn('[inbox-watcher]', JSON.stringify(event));
+      }
+    },
+  });
+  scanner.start();
+  inboxWatchers.set(projectId, scanner);
+}
+
+function startInboxWatchers() {
+  if (demoMode) return;
+  const projects = db().prepare('SELECT id, external_path FROM projects WHERE external_path IS NOT NULL').all() as Array<{ id: string; external_path: string | null }>;
+  for (const project of projects) ensureInboxWatcher(project.id, project.external_path);
+}
 app.disable('x-powered-by');
+// Loopback is not a security boundary against a page the user visits: a
+// DNS-rebinding site is same-origin to the browser. Host and Origin are checked
+// before any body is parsed.
+app.use(createLocalOriginGuard({ ports: [port] }));
 app.use(express.json({ limit: '32mb' }));
 app.use((_, response, next) => {
   response.setHeader('Cache-Control', 'no-store');
@@ -78,6 +181,7 @@ app.post('/api/project-storage/verify', asyncRoute(async (request, response) => 
 
 app.post('/api/projects', asyncRoute(async (request, response) => {
   const result = createProject(db(), request.body as Parameters<typeof createProject>[1]);
+  ensureInboxWatcher(result.projectId, result.externalPath);
   response.status(201).json(result);
 }));
 app.get('/api/projects/:projectId', (request, response) => {
@@ -125,10 +229,93 @@ app.post('/api/projects/:projectId/blind-extraction-comparisons', asyncRoute(asy
 app.post('/api/projects/:projectId/sources', asyncRoute(async (request, response) => {
   const body = request.body as { files?: Array<{ name: string; type?: string; dataBase64: string }> };
   const files = Array.isArray(body.files) ? body.files : [];
-  response.status(201).json({ results: await Promise.all(files.map((file) => intakeProjectSource(db(), String(request.params.projectId), file))) });
+  response.status(201).json({ results: await Promise.all(files.map((file) => enqueueSourceFile(String(request.params.projectId), file))) });
 }));
-app.post('/api/proposed-changes/:proposedChangeId/approve', asyncRoute(async (request, response) => response.json(approveProposedChange(db(), String(request.params.proposedChangeId), String((request.body as { reviewer?: string }).reviewer ?? 'Warwick')))));
-app.post('/api/proposed-changes/:proposedChangeId/reject', asyncRoute(async (request, response) => response.json(rejectProposedChange(db(), String(request.params.proposedChangeId), String((request.body as { reviewer?: string }).reviewer ?? 'Warwick')))));
+app.get('/api/projects/:projectId/source-intelligence', (request, response) => response.json(readSourceIntelligence(db(), String(request.params.projectId))));
+app.post('/api/projects/:projectId/extraction-packets', asyncRoute(async (request, response) => response.status(201).json(freezePacketAndCreateChangeset(db(), request.body))));
+app.post('/api/projects/:projectId/changesets/:changesetId/review', asyncRoute(async (request, response) => {
+  const body = request.body as { reviewer?: string; decision?: 'accept' | 'reject'; opIds?: string[]; batch?: boolean; note?: string; decisions?: Array<{ operationId: string; status: 'accepted' | 'rejected'; note?: string }> };
+  const reviewer = String(body.reviewer ?? 'current-user');
+  if (Array.isArray(body.decisions)) {
+    const accepted = body.decisions.filter((item) => item.status === 'accepted');
+    const rejected = body.decisions.filter((item) => item.status === 'rejected');
+    const results = [];
+    if (accepted.length) results.push(reviewChangeset(db(), String(request.params.changesetId), { decision: 'accept', reviewer, opIds: accepted.map((item) => item.operationId), batch: Boolean(body.batch), note: accepted.map((item) => item.note).filter(Boolean).join('; ') || null }));
+    if (rejected.length) results.push(reviewChangeset(db(), String(request.params.changesetId), { decision: 'reject', reviewer, opIds: rejected.map((item) => item.operationId), batch: Boolean(body.batch), note: rejected.map((item) => item.note).filter(Boolean).join('; ') || null }));
+    response.json({ changesetId: String(request.params.changesetId), results });
+    return;
+  }
+  if (!body.decision) { response.status(400).json({ error: 'decision or decisions is required.' }); return; }
+  response.json(reviewChangeset(db(), String(request.params.changesetId), { decision: body.decision, reviewer, opIds: body.opIds, batch: body.batch, note: body.note ?? null }));
+}));
+app.post('/api/projects/:projectId/changesets/:changesetId/apply', asyncRoute(async (request, response) => response.json(applyReviewedChangeset(db(), String(request.params.changesetId)))));
+app.post('/api/projects/:projectId/packets/:packetId/replay', asyncRoute(async (request, response) => response.json(replayPacket(db(), String(request.params.packetId)))));
+app.post('/api/projects/:projectId/register-rows/:externalRegisterId/events', asyncRoute(async (request, response) => {
+  const body = request.body as { actor?: string; eventType?: string; field?: string | null; newValue?: string | null; reason?: string; evidenceRef?: string | null; occurredAt?: string };
+  if (!body.eventType || !body.reason) { response.status(400).json({ error: 'eventType and reason are required.' }); return; }
+  // N8 — `occurred_at` decides event replay order and human precedence, and
+  // `register_row_events` is append-only: a future or implausibly old timestamp
+  // accepted here can never be corrected afterwards, only added to. Refuse it
+  // with a reason rather than clamping it silently. Omitting it keeps the
+  // existing behaviour of stamping the server's own clock.
+  let occurredAt: string | undefined;
+  if (body.occurredAt !== undefined && body.occurredAt !== null) {
+    const checked = validateOccurredAt(body.occurredAt, new Date().toISOString());
+    if (!checked.ok) { response.status(400).json({ error: checked.error }); return; }
+    occurredAt = checked.occurredAt;
+  }
+  response.status(201).json(recordRegisterEvent(db(), String(request.params.projectId), String(request.params.externalRegisterId), { actor: String(body.actor ?? 'current-user'), eventType: body.eventType, field: body.field, newValue: body.newValue, reason: body.reason, evidenceRef: body.evidenceRef, occurredAt }));
+}));
+app.post('/api/projects/:projectId/sources/:sourceId/retry', asyncRoute(async (request, response) => {
+  const result = await retrySourceJob(db(), { sourceId: String(request.params.sourceId), provider: structuredExtractionProvider });
+  response.status(result.status === 'lease-held' ? 409 : 200).json(result);
+}));
+app.post('/api/projects/:projectId/sources/:sourceId/skip', asyncRoute(async (request, response) => {
+  const body = request.body as { reason?: string; markerDismissals?: Array<{ markerId: string; reason: string }> };
+  if (!body.reason || !String(body.reason).trim()) { response.status(400).json({ error: 'reason is required to skip a source after comprehension.' }); return; }
+  response.json(skipSourceAfterComprehension(db(), { sourceId: String(request.params.sourceId), reason: String(body.reason), markerDismissals: body.markerDismissals }));
+}));
+app.post('/api/projects/:projectId/changesets/:changesetId/acknowledge', asyncRoute(async (request, response) => {
+  response.json(acknowledgeChangeset(db(), String(request.params.changesetId), String((request.body as { actor?: string }).actor ?? 'current-user')));
+}));
+app.post('/api/projects/:projectId/overview/pin', asyncRoute(async (request, response) => {
+  const mode = (request.body as { mode?: 'changes' | 'meeting' | 'needs-warwick' | null }).mode ?? null;
+  response.json(pinOverviewMode(db(), String(request.params.projectId), mode, 'current-user'));
+}));
+app.post('/api/projects/:projectId/consultant-brief', asyncRoute(async (request, response) => response.json(await buildConsultantBrief(db(), String(request.params.projectId), String((request.body as { mode?: string }).mode ?? 'needs-warwick'), groundedBriefProvider))));
+function consultantMode(value: unknown): ConsultantViewMode | null {
+  return (CONSULTANT_VIEW_MODES as readonly string[]).includes(String(value)) ? String(value) as ConsultantViewMode : null;
+}
+/**
+ * Read a consultant view. Deterministic content plus whatever synthesis is
+ * already cached. Zero provider calls, always — generation is POST only.
+ */
+app.get('/api/projects/:projectId/consultant-view', (request, response) => {
+  const mode = consultantMode(request.query.mode ?? 'needs-warwick');
+  if (!mode) { response.status(400).json({ error: `mode must be one of ${CONSULTANT_VIEW_MODES.join(', ')}.` }); return; }
+  response.json(readConsultantView(db(), String(request.params.projectId), mode, groundedBriefProvider));
+});
+/** One deliberate user action, at most one bounded provider call. */
+app.post('/api/projects/:projectId/consultant-view', asyncRoute(async (request, response) => {
+  const body = request.body as { mode?: string; force?: boolean };
+  const mode = consultantMode(body.mode ?? 'needs-warwick');
+  if (!mode) { response.status(400).json({ error: `mode must be one of ${CONSULTANT_VIEW_MODES.join(', ')}.` }); return; }
+  response.json(await generateConsultantView(db(), String(request.params.projectId), mode, groundedBriefProvider, { force: Boolean(body.force), actor: 'current-user' }));
+}));
+app.get('/api/projects/:projectId/consultant-view/download', (request, response) => {
+  const mode = consultantMode(request.query.mode ?? 'needs-warwick');
+  if (!mode) { response.status(400).json({ error: `mode must be one of ${CONSULTANT_VIEW_MODES.join(', ')}.` }); return; }
+  const view = readConsultantView(db(), String(request.params.projectId), mode, groundedBriefProvider);
+  response.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+  response.setHeader('Content-Disposition', `attachment; filename="consultant-view-${mode}.md"`);
+  response.send(renderSynthesisMarkdown(view));
+});
+/** Preserved raw provider responses for one source: the acceptance evidence trail. */
+app.get('/api/projects/:projectId/sources/:sourceId/provider-outputs', (request, response) => {
+  response.json({ outputs: readPreservedOutputs(db(), String(request.params.sourceId)) });
+});
+app.post('/api/proposed-changes/:proposedChangeId/approve', asyncRoute(async (request, response) => response.json(approveProposedChange(db(), String(request.params.proposedChangeId), String((request.body as { reviewer?: string }).reviewer ?? 'current-user')))));
+app.post('/api/proposed-changes/:proposedChangeId/reject', asyncRoute(async (request, response) => response.json(rejectProposedChange(db(), String(request.params.proposedChangeId), String((request.body as { reviewer?: string }).reviewer ?? 'current-user')))));
 app.post('/api/files/open', asyncRoute(async (request, response) => response.json(openOriginalPath(db(), String((request.body as { path?: string }).path ?? '')))));
 app.get('/api/m365/status', (_, response) => response.json({ ...authStatus(), scopes: requiredScopes(), aiProviders: probeAIProviders() }));
 app.post('/api/m365/auth/start', asyncRoute(async (_, response) => response.json(await startDeviceCode())));
@@ -155,6 +342,143 @@ app.post('/api/inbox/:graphId/read-state', asyncRoute(async (request, response) 
 }));
 app.post('/api/inbox/:graphId/delete', asyncRoute(async (request, response) => response.json(await moveMessageToDeletedItems(db(), String(request.params.graphId)))));
 
+/**
+ * Settings -> AI Skills & Prompts.
+ *
+ * `catalogue` is the managed view: every registered skill, its versions, their
+ * status, provenance, recorded uses, latest benchmark and project pins. No
+ * revision body is included — a body is fetched per version by its own route, so
+ * reading the instructions the model receives is always a deliberate act.
+ */
+app.get('/api/extraction-skills', (request, response) => response.json({
+  catalogue: readSkillCatalogue(db()),
+  revisions: readSkillRevisions(db(), typeof request.query.skillId === 'string' ? request.query.skillId : undefined),
+}));
+app.get('/api/extraction-skills/compare', (request, response) => {
+  const skillId = String(request.query.skillId ?? '');
+  const from = String(request.query.from ?? '');
+  const to = String(request.query.to ?? '');
+  if (!skillId || !from || !to) { response.status(400).json({ error: 'skillId, from and to are required.' }); return; }
+  response.json(compareSkillRevisions(db(), skillId, from, to));
+});
+app.get('/api/extraction-skills/benchmarks', (request, response) => response.json({
+  benchmarks: readSkillBenchmarks(db(), {
+    skillId: typeof request.query.skillId === 'string' ? request.query.skillId : undefined,
+    version: typeof request.query.version === 'string' ? request.query.version : undefined,
+  }),
+}));
+app.post('/api/extraction-skills/benchmarks', asyncRoute(async (request, response) => {
+  const body = request.body as { skillId?: string; version?: string; benchmarkLabel?: string; verdict?: string; metrics?: Record<string, unknown>; projectId?: string; sourceId?: string; packetId?: string; actor?: string; note?: string };
+  if (!body.skillId || !body.version || !body.benchmarkLabel || !body.verdict) { response.status(400).json({ error: 'skillId, version, benchmarkLabel and verdict are required.' }); return; }
+  response.status(201).json(recordSkillBenchmark(db(), {
+    skillId: body.skillId, version: body.version, benchmarkLabel: body.benchmarkLabel, verdict: body.verdict,
+    metrics: body.metrics ?? {}, projectId: body.projectId ?? null, sourceId: body.sourceId ?? null, packetId: body.packetId ?? null,
+    recordedBy: String(body.actor ?? 'current-user'), note: body.note ?? null,
+  }));
+}));
+app.post('/api/extraction-skills/validate', asyncRoute(async (request, response) => {
+  const body = request.body as { text?: string; fileName?: string; expectedSkillId?: string };
+  if (typeof body.text !== 'string') { response.status(400).json({ error: 'text is required.' }); return; }
+  response.json(validateSkillDraft(db(), { text: body.text, fileName: body.fileName ?? null, expectedSkillId: body.expectedSkillId ?? null }));
+}));
+app.post('/api/extraction-skills/drafts', asyncRoute(async (request, response) => {
+  const body = request.body as { text?: string; fileName?: string; expectedSkillId?: string; actor?: string };
+  if (typeof body.text !== 'string') { response.status(400).json({ error: 'text is required.' }); return; }
+  // An upload ALWAYS creates a draft. It can never overwrite a published version
+  // and never activates anything; publishing is a separate confirmed action.
+  response.status(201).json(uploadSkillDraft(db(), { text: body.text, fileName: body.fileName ?? null, expectedSkillId: body.expectedSkillId ?? null, actor: String(body.actor ?? 'current-user') }));
+}));
+app.post('/api/extraction-skills/retire', asyncRoute(async (request, response) => {
+  const body = request.body as { skillId?: string; version?: string; actor?: string; note?: string };
+  if (!body.version) { response.status(400).json({ error: 'version is required.' }); return; }
+  response.json(retireSkillRevision(db(), { skillId: body.skillId, version: body.version, actor: String(body.actor ?? 'current-user'), note: body.note }));
+}));
+app.get('/api/extraction-skills/:skillId/versions/:version', (request, response) => {
+  response.json(readSkillRevisionBody(db(), String(request.params.skillId), String(request.params.version)));
+});
+app.get('/api/extraction-skills/:skillId/versions/:version/download', (request, response) => {
+  // The reusable template only. There is deliberately no route anywhere that
+  // returns an assembled prompt: an assembled prompt contains source windows,
+  // which are customer material, and only its SHA-256 is ever recorded.
+  const body = readSkillRevisionBody(db(), String(request.params.skillId), String(request.params.version));
+  response.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+  response.setHeader('Content-Disposition', `attachment; filename="${body.skillId}-${body.version}.md"`);
+  response.send(body.text);
+});
+app.get('/api/extraction-skills/:skillId/versions/:version/runs', (request, response) => {
+  response.json({ runs: readRunsForSkillVersion(db(), String(request.params.skillId), String(request.params.version)) });
+});
+app.get('/api/extraction-runs/:runId/provenance', (request, response) => {
+  const provenance = readExtractionRunProvenance(db(), String(request.params.runId));
+  if (!provenance) { response.status(404).json({ error: 'Extraction run not found.' }); return; }
+  response.json(provenance);
+});
+app.get('/api/extraction-skills/audit', (request, response) => response.json({ events: readSkillAuditTrail(db(), { skillId: typeof request.query.skillId === 'string' ? request.query.skillId : undefined, projectId: typeof request.query.projectId === 'string' ? request.query.projectId : undefined }) }));
+app.post('/api/extraction-skills/promote', asyncRoute(async (request, response) => {
+  const body = request.body as { skillId?: string; version?: string; actor?: string; note?: string };
+  if (!body.version) { response.status(400).json({ error: 'version is required.' }); return; }
+  response.json(promoteSkillRevision(db(), { skillId: body.skillId, version: body.version, actor: String(body.actor ?? 'current-user'), note: body.note }));
+}));
+app.post('/api/extraction-skills/rollback', asyncRoute(async (request, response) => {
+  const body = request.body as { skillId?: string; toVersion?: string; actor?: string; note?: string };
+  if (!body.toVersion) { response.status(400).json({ error: 'toVersion is required.' }); return; }
+  response.json(rollbackSkillRevision(db(), { skillId: body.skillId, toVersion: body.toVersion, actor: String(body.actor ?? 'current-user'), note: body.note }));
+}));
+app.get('/api/projects/:projectId/extraction-skill', (request, response) => response.json({ pin: readSkillPin(db(), String(request.params.projectId)) }));
+app.post('/api/projects/:projectId/extraction-skill/pin', asyncRoute(async (request, response) => {
+  const body = request.body as { skillId?: string; version?: string; actor?: string; note?: string };
+  if (!body.version) { response.status(400).json({ error: 'version is required.' }); return; }
+  response.json(pinProjectSkill(db(), { projectId: String(request.params.projectId), skillId: body.skillId, version: body.version, actor: String(body.actor ?? 'current-user'), note: body.note }));
+}));
+app.post('/api/projects/:projectId/extraction-skill/unpin', asyncRoute(async (request, response) => response.json(unpinProjectSkill(db(), { projectId: String(request.params.projectId), skillId: (request.body as { skillId?: string }).skillId, actor: String((request.body as { actor?: string }).actor ?? 'current-user') }))));
+/* ---------------------------------------------------------------------------- *
+ * Build handoffs
+ *
+ * The GET is a filesystem read: opening Settings must never push anything or
+ * spend a network call. The POST calls the same `finalizeBuild` engine the
+ * command line calls — there is no Git logic in this file or in the UI.
+ * ---------------------------------------------------------------------------- */
+
+const buildHandoffRoot = resolveHandoffRoot(root);
+
+app.get('/api/build-handoffs', (_, response) => response.json(readBuildHandoffs(buildHandoffRoot)));
+
+app.post('/api/build-handoffs/finalize', asyncRoute(async (request, response) => {
+  const body = request.body as { manifestPath?: string; dryRun?: boolean };
+  if (!body.manifestPath) { response.status(400).json({ error: 'manifestPath is required.' }); return; }
+  // The Cockpit is loopback-only, but a route that takes a path from a request
+  // body and hands it to something that runs `git push` accepts only a path this
+  // machine already offers.
+  if (!isKnownManifestPath(buildHandoffRoot, body.manifestPath)) {
+    response.status(400).json({ error: 'That manifest is not one of this machine\'s build handoffs.' });
+    return;
+  }
+  const result = await finalizeBuild({
+    manifestPath: body.manifestPath,
+    repoRoot: root,
+    handoffRoot: buildHandoffRoot,
+    github: new GitHubRestPort(),
+    drive: new GoogleDriveRestPort({ paths: driveCredentialPaths(root) }),
+    dryRun: Boolean(body.dryRun),
+  });
+  response.json(result);
+}));
+
+app.post('/api/build-handoffs/connect-drive', asyncRoute(async (_, response) => {
+  // Returns the consent URL and does not block on it: the operator opens it,
+  // Google redirects to the loopback listener this starts, and the refresh token
+  // is written there. Retry then completes the pending handoff.
+  const authorization = await beginDriveAuthorization({ paths: driveCredentialPaths(root) });
+  // The consent completes out of band, after this response has been sent. Its
+  // outcome is logged rather than discarded: a refused or abandoned
+  // authorisation is the thing an operator will be asking about a minute later.
+  authorization.completed.then(
+    () => console.log('[build-handoffs] Google Drive authorisation completed.'),
+    (error: unknown) => console.warn('[build-handoffs] Google Drive authorisation did not complete:', error instanceof Error ? error.message : error),
+  );
+  response.json({ authorizationUrl: authorization.authorizationUrl, port: authorization.port });
+}));
+
 app.get('/api/ai/providers', (_, response) => response.json({ providers: probeAIProviders() }));
 app.post('/api/ai/chat', asyncRoute(async (request, response) => response.json(await sendChatMessage(db(), request.body))));
 
@@ -178,6 +502,18 @@ if (production) {
   const { createServer } = await import('vite');
   const vite = await createServer({ root, server: { middlewareMode: true }, appType: 'spa' });
   app.use(vite.middlewares);
+}
+
+if (!demoMode) ensureSkillRegistrySynced(db());
+startInboxWatchers();
+
+// Crash recovery: reclaim any job whose lease expired while the process was
+// down, then keep sweeping. Without this a job interrupted mid-extraction stayed
+// `processing` forever and re-uploading the file hit the content-hash dedup.
+if (!demoMode) {
+  startSourceJobSweeper(db(), {
+    onReclaim: (jobs) => { if (jobs.length) console.warn('[source-pipeline] reclaimed stalled jobs', JSON.stringify(jobs)); },
+  });
 }
 
 app.listen(port, '127.0.0.1', () => {

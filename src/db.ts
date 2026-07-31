@@ -5,6 +5,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { importPayloadSchema, portfolioDataSchema, type ImportPayload, type PortfolioData, type Project, type UserConfig } from './domain.js';
 import { readBlindExtractionComparisonReports } from './blindExtractionComparison.js';
 import { readRegisterState } from './projectRegisters.js';
+import { buildDeterministicBrief, computeProjectOverview, readSourceIntelligence } from './sourceIntelligence.js';
+import { CONSULTANT_VIEW_MODES, buildDeterministicConsultantView } from './consultantViews.js';
+import { buildProjectThemes } from './projectThemes.js';
 
 type SqlValue = string | number | bigint | null;
 
@@ -112,6 +115,7 @@ export function readProjectData(db: DatabaseSync, projectId: string): PortfolioD
 
 function readProjectFromRows(db: DatabaseSync, row: Record<string, unknown>): Project {
   const projectId = String(row.id);
+  const registerState = readRegisterState(db, projectId);
   const project = {
     id: projectId,
     name: String(row.name),
@@ -169,7 +173,11 @@ function readProjectFromRows(db: DatabaseSync, row: Record<string, unknown>): Pr
       id: String(item.id), projectId, entityType: String(item.entity_type), entityId: String(item.entity_id), label: String(item.label), externalPath: String(item.external_path), evidenceKind: String(item.evidence_kind), capturedAt: item.captured_at ? String(item.captured_at) : null, dataClassification: String(item.data_classification),
     })),
     inboxSources: (db.prepare('SELECT * FROM project_source_intake WHERE project_id = ? ORDER BY updated_at DESC').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
-      id: String(item.id), projectId, originalFileName: String(item.original_file_name), originalReceivedAt: String(item.original_received_at), contentHash: String(item.content_hash), sourceType: String(item.source_type), currentExternalPath: String(item.current_external_path), previousExternalPath: item.previous_external_path ? String(item.previous_external_path) : null, processingStatus: String(item.processing_status), processorProvider: String(item.processor_provider), extractedItemIds: jsonArray(item.extracted_item_ids_json as string), reviewState: String(item.review_state), verificationState: String(item.verification_state), createdAt: String(item.created_at), updatedAt: String(item.updated_at),
+      id: String(item.id), projectId, originalFileName: String(item.original_file_name), originalReceivedAt: String(item.original_received_at), contentHash: String(item.content_hash), sourceType: String(item.source_type), currentExternalPath: String(item.current_external_path), previousExternalPath: item.previous_external_path ? String(item.previous_external_path) : null, processingStatus: String(item.processing_status), processorProvider: String(item.processor_provider), extractedItemIds: jsonArray(item.extracted_item_ids_json as string), reviewState: String(item.review_state), verificationState: String(item.verification_state),
+      // D1 — the pipeline records why a source failed and what to do about it. Surfacing
+      // these is what turns a permanent "processing" chip back into a diagnosable failure.
+      processingStage: item.processing_stage ? String(item.processing_stage) : null, processingError: item.processing_error ? String(item.processing_error) : null, processingRecoveryAction: item.processing_recovery_action ? String(item.processing_recovery_action) : null,
+      createdAt: String(item.created_at), updatedAt: String(item.updated_at),
     })),
     proposedChanges: (db.prepare('SELECT * FROM proposed_changes WHERE project_id = ? ORDER BY created_at DESC').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
       id: String(item.id), projectId, sourceId: String(item.source_id), status: String(item.status), payload: JSON.parse(String(item.payload_json)) as unknown, createdAt: String(item.created_at), reviewedAt: item.reviewed_at ? String(item.reviewed_at) : null, reviewedBy: item.reviewed_by ? String(item.reviewed_by) : null, appliedAt: item.applied_at ? String(item.applied_at) : null,
@@ -180,10 +188,23 @@ function readProjectFromRows(db: DatabaseSync, row: Record<string, unknown>): Pr
     sourceFileHistory: (db.prepare('SELECT * FROM source_file_history WHERE project_id = ? ORDER BY occurred_at DESC').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
       id: String(item.id), sourceId: String(item.source_id), projectId, fromExternalPath: item.from_external_path ? String(item.from_external_path) : null, toExternalPath: String(item.to_external_path), action: String(item.action), occurredAt: String(item.occurred_at), actor: String(item.actor), contentHash: String(item.content_hash),
     })),
-    registerRows: readRegisterState(db, projectId).registerRows,
-    registerComparisonRows: readRegisterState(db, projectId).comparisonRows,
-    registerComparisonSummary: readRegisterState(db, projectId).comparisonSummary,
+    registerRows: registerState.registerRows,
+    registerComparisonRows: registerState.comparisonRows,
+    registerComparisonSummary: registerState.comparisonSummary,
     blindExtractionComparisonReports: readBlindExtractionComparisonReports(db, projectId),
+    sourceIntelligence: readSourceIntelligence(db, projectId),
+    projectOverview: computeProjectOverview(db, projectId),
+    consultantBrief: buildDeterministicBrief(db, projectId),
+    // Deterministic only. Nothing on this path can reach a provider, so opening
+    // a project costs zero model calls however many tabs, filters or refreshes
+    // follow.
+    // Themes are computed once and shared by both modes: the grouping is a
+    // property of the project, not of the view, and building it twice doubled
+    // the cost of every project open.
+    consultantViews: (() => {
+      const themes = buildProjectThemes(db, projectId);
+      return CONSULTANT_VIEW_MODES.map((mode) => buildDeterministicConsultantView(db, projectId, mode, themes));
+    })(),
   };
   return project as Project;
 }

@@ -29,6 +29,21 @@ The sibling `Vendor/mypka-reference` folder is read-only architectural reference
 - [docs/data-boundary.md](docs/data-boundary.md) defines what may cross into Git and what must remain external or local-only.
 - [docs/sqlite-runtime.md](docs/sqlite-runtime.md) documents the local SQLite runtime and import path.
 - [docs/m365-workday-cockpit.md](docs/m365-workday-cockpit.md) documents the Microsoft 365 workday Cockpit configuration and boundaries.
+- [docs/extraction-skill-registry.md](docs/extraction-skill-registry.md) documents the versioned extraction skill registry and its promote/pin/rollback workflow.
+
+## Extraction Skill Registry
+
+The instructional text sent to the extraction model is versioned data, not code. Shipped seed
+revisions live in `skills/<skillId>/<version>.md`; an organisation's private revisions live in the
+directory named by `PROJECTMANAGAIR_SKILL_REGISTRY_DIR`, outside Git, and overlay or extend the
+shipped set. Revisions are registered, promoted, pinned per project and rolled back through
+`src/skillRegistry.ts`; every transition is explicit, attributed and audited, and the database
+allows at most one active revision per skill id.
+
+A skill revision can change what we ask the model for. It can never change what we accept back: the
+packet schema, coverage, anchor and evidence rules, validation, reconciliation, human review and
+deterministic replay stay in code and are unreachable from the registry. See
+[docs/extraction-skill-registry.md](docs/extraction-skill-registry.md) for the workflow.
 
 ## Local Start
 
