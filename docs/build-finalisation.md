@@ -52,6 +52,11 @@ the suite.
 12. Open a draft pull request, or find and update the existing one.
 13. Mirror the safe deliverables to Google Drive.
 14. Write the completion manifest.
+15. Upload the completion manifest into the build folder, so the record of the
+    finalisation lives beside the deliverables and not only on one machine. It
+    is written before it is uploaded, so the Drive copy is the one version that
+    cannot name its own Drive id; the local copy is rewritten afterwards so that
+    it does.
 
 ## What "the working tree is safe" means, and why it is narrow
 

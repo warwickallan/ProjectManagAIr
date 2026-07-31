@@ -165,6 +165,9 @@ export interface FinalizeResult {
     uploadedCount: number;
     connectionRequired: boolean;
     error: string | null;
+    /** The completion record's own copy in the build folder, uploaded after it is written. */
+    completionRecordId: string | null;
+    completionRecordUrl: string | null;
   };
   deliverables: DeliverableResult[];
   steps: FinalizeStep[];
@@ -601,7 +604,7 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     localHeadSha: null,
     remoteHeadSha: null,
     pullRequest: null,
-    drive: { attempted: false, folderId: null, folderName: null, folderUrl: null, requiredCount: 0, uploadedCount: 0, connectionRequired: false, error: null },
+    drive: { attempted: false, folderId: null, folderName: null, folderUrl: null, requiredCount: 0, uploadedCount: 0, connectionRequired: false, error: null, completionRecordId: null, completionRecordUrl: null },
     deliverables: [],
     steps,
     errors,
@@ -971,7 +974,45 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
   result.state = gitFailed ? 'FAILED' : softFailed ? 'PARTIAL' : options.dryRun ? 'PARTIAL' : 'COMPLETED';
   if (options.dryRun) errors.push('Dry run: no mutation was performed, so the result is reported as PARTIAL by definition.');
   result.finishedAt = now().toISOString();
-  return finish(result, options, now, manifest);
+  finish(result, options, now, manifest);
+  await mirrorCompletionRecord(options, result, now);
+  return result;
+}
+
+/**
+ * Upload the completion record itself, once it exists.
+ *
+ * The build folder must contain the evidence of its own finalisation, not just
+ * the deliverables — otherwise the only durable record of the pushed SHA, the
+ * pull request and the Drive ids lives on one Windows machine.
+ *
+ * It necessarily happens after `finish()` has written the file, so the copy that
+ * lands in Drive is the one that does not yet name its own Drive id. The local
+ * file is rewritten afterwards so that it does. Neither copy is ever missing
+ * anything else.
+ */
+async function mirrorCompletionRecord(options: FinalizeOptions, result: FinalizeResult, now: () => Date): Promise<void> {
+  if (options.dryRun || !options.drive || !result.drive.folderId || !result.completionManifestPath) return;
+  if (!existsSync(result.completionManifestPath)) return;
+  try {
+    const name = path.basename(result.completionManifestPath);
+    const existing = await options.drive.findChildFile(result.drive.folderId, name);
+    const uploaded = await options.drive.uploadFile({
+      parentId: result.drive.folderId,
+      name,
+      localPath: result.completionManifestPath,
+      mimeType: 'application/json',
+      existingId: existing?.id ?? null,
+    });
+    result.drive.completionRecordId = uploaded.id;
+    result.drive.completionRecordUrl = uploaded.webViewLink ?? `https://drive.google.com/file/d/${uploaded.id}/view`;
+    writeFileSync(result.completionManifestPath, `${JSON.stringify(redactCompletion(result), null, 2)}\n`, 'utf8');
+  } catch (error) {
+    // Never downgrade a finished run because its receipt did not upload. The
+    // verdict is already decided and the local record already exists.
+    result.errors.push(`The completion record was written locally but not mirrored: ${redactSecrets(error instanceof Error ? error.message : String(error))}`);
+    void now;
+  }
 }
 
 /* ------------------------------------------------------------------------------------ *
@@ -1241,6 +1282,10 @@ export function renderFinalizeReport(result: FinalizeResult): string {
   if (result.drive.attempted) {
     lines.push(`  Drive folder ${result.drive.folderUrl ?? 'not created'}`);
     lines.push(`  Deliverables ${result.drive.uploadedCount} of ${result.drive.requiredCount} required uploaded`);
+    for (const entry of result.deliverables) {
+      lines.push(`    ${entry.uploadStatus.padEnd(22)} ${entry.title}${entry.driveFileId ? ` — ${entry.driveFileId}` : ''}`);
+    }
+    if (result.drive.completionRecordUrl) lines.push(`  This report   ${result.drive.completionRecordUrl}`);
   }
   lines.push('');
   for (const step of result.steps) {

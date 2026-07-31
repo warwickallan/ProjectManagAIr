@@ -678,7 +678,8 @@ describe('the Google Drive mirror', () => {
     const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), drive);
 
     expect(result.state).toBe('COMPLETED');
-    expect(drive.uploads).toEqual(['Handoff.md', 'Handoff (Doc)']);
+    // The declared deliverables, plus the run's own completion record.
+    expect(drive.uploads).toEqual(['Handoff.md', 'Handoff (Doc)', 'handoff.completion.json']);
     // The customer transcript sitting beside the handoff is never uploaded.
     expect(drive.uploads.some((name) => name.includes('transcript'))).toBe(false);
     const withheld = result.deliverables.find((entry) => entry.classification === 'contains_customer_data')!;
@@ -780,6 +781,33 @@ describe('the Google Drive mirror', () => {
     expect(result.state).toBe('PARTIAL');
     expect(result.errors.join(' ')).toMatch(/Handoff\.md \(Drive refused Handoff\.md\.\)/);
     expect(remoteSha(fx)).toBe(fx.headSha);
+  });
+
+  it('mirrors the completion record itself into the build folder', async () => {
+    const fx = fixture();
+    const deliverable = path.join(fx.root, 'Handoff.md');
+    writeFileSync(deliverable, '# handoff\n', 'utf8');
+    const manifestPath = writeManifest(fx, {
+      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables' },
+      deliverables: [{ path: deliverable, classification: 'safe_for_drive', required: true, googleDoc: false }],
+    });
+    const drive = new FakeDrive();
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), drive);
+
+    expect(result.state).toBe('COMPLETED');
+    // The build folder holds the evidence of its own finalisation, so the only
+    // durable record of the pushed SHA and the pull request is not one machine.
+    expect(result.drive.completionRecordId).toBeTruthy();
+    const uploaded = drive.files.get(result.drive.completionRecordId!)!;
+    expect(uploaded.parentId).toBe(result.drive.folderId);
+    expect(uploaded.name.endsWith('.completion.json')).toBe(true);
+    const record = JSON.parse(uploaded.content) as FinalizeResult;
+    expect(record.remoteHeadSha).toBe(fx.headSha);
+    expect(record.pullRequest?.number).toBe(result.pullRequest!.number);
+    // ...and the local copy names where its own copy went.
+    const local = JSON.parse(readFileSync(result.completionManifestPath!, 'utf8')) as FinalizeResult;
+    expect(local.drive.completionRecordId).toBe(result.drive.completionRecordId);
   });
 
   it('survives a deliverable that cannot be read, and still writes the completion record', async () => {
