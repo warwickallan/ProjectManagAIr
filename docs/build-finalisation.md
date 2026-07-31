@@ -46,16 +46,22 @@ the suite.
 6. Verify the expected commit is present.
 7. Verify it descends from the declared baseline.
 7a. Verify the **canonical build record** — the sanitised handoff named by
-    `gitHandoffPath` — is present in that exact commit, read out of the commit's
-    own tree. GitHub is the canonical record, so a build without one does not
-    finalise, and the check happens before the push.
+    `gitHandoffPath` — is a committed file of at least 200 bytes in that exact
+    commit, read out of the commit's own tree. Type and size are both checked:
+    `git cat-file -e` succeeds for any object at a path, including a directory,
+    so a manifest naming a folder would otherwise pass.
+7b. Verify **nothing unsafe is in the commit**: any declared deliverable that is
+    not `safe_for_public_git` and lives inside the repository must not be in the
+    commit's tree. This repository is public and the commit is about to be
+    pushed to it. Both checks happen before the push.
 8. Create the local branch, or confirm it already points at the expected SHA.
 9. Read the remote branch. A remote branch at a different SHA is refused.
 10. Push with upstream tracking.
 11. Verify with `ls-remote` what origin actually points at.
 12. Open a draft pull request, or find and update the existing one.
 13. Mirror deliverables to Google Drive, **if** the manifest declares a
-    destination. This is optional and cannot change the verdict.
+    destination. This is optional and cannot change the verdict unless that
+    manifest also sets `drive.required`.
 14. Write the completion manifest.
 15. Upload the completion manifest into the build folder, so the record of the
     finalisation lives beside the deliverables and not only on one machine. It
@@ -76,6 +82,7 @@ commit. Drive is reported separately:
 | `drive.status` | Meaning |
 |---|---|
 | `disabled` | the manifest declares no Drive destination |
+| — | (a run that stops before the mirror keeps `skipped` when Drive was declared) |
 | `not_configured` | declared, but Drive is not connected on this machine |
 | `skipped` | deliberately not run (a dry run, or the remote was unconfirmed) |
 | `mirrored` | the deliverables are in the build folder |
@@ -183,10 +190,11 @@ Override with `PROJECTMANAGAIR_BUILD_HANDOFF_DIR`.
   "pullRequest": { "title": "…", "bodyPath": "./handoff.md", "draft": true },
   "createdAt": "2026-07-31T12:00:00.000Z",
   "origin": { "model": "claude-opus-5", "session": "…" },
+  // JSONC for readability; a real manifest is plain JSON with no comments.
   "handoffDocumentPath": "…/F247_…_Handoff.md",       // the full local handoff, outside Git
   "gitHandoffPath": "docs/build-handoffs/build-example-v1.md",  // the canonical record, in Git
   "deliverables": [
-    { "path": "…/handoff.md", "classification": "safe_for_drive", "required": true, "googleDoc": true },
+    { "path": "…/handoff.md", "classification": "safe_for_drive", "required": false, "googleDoc": true },
     { "path": "…/transcript.vtt", "classification": "contains_customer_data", "required": false }
   ],
   "drive": null                                      // optional; omit it and Drive reports `disabled`

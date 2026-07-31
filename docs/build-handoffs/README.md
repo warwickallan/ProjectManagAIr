@@ -13,7 +13,7 @@ committed here: what was built, SHAs, branch and pull request, test and build
 results, migrations, user-visible behaviour, residual risks, the verdict, and
 anything still outstanding. Never customer documents, transcripts, emails,
 databases, provider responses containing customer data, credentials, private
-Bellrock information, unredacted logs, git bundles or local machine
+client information, unredacted logs, git bundles or local machine
 configuration. Those stay on the machine, classified in the handoff manifest so a
 reader can see what was withheld and why.
 

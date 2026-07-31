@@ -97,7 +97,10 @@ function readLastRun(manifestPath: string): BuildHandoffView['lastRun'] {
         localHeadSha: parsed.localHeadSha ?? null,
         remoteHeadSha: parsed.remoteHeadSha ?? null,
         pullRequest: parsed.pullRequest ?? null,
-        gitHandoff: parsed.gitHandoff ?? { path: null, status: 'not-declared' },
+        // A completion record written before this field existed says nothing
+        // about the canonical record — which is different from saying none was
+        // declared, so it reads as unverified rather than as a refusal.
+        gitHandoff: parsed.gitHandoff ?? { path: null, status: 'unverified' },
         drive: parsed.drive,
         deliverables: parsed.deliverables ?? [],
         lastError: (parsed.errors ?? [])[0] ?? null,

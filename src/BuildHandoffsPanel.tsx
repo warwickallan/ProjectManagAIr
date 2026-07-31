@@ -34,7 +34,7 @@ type DeliverableResult = {
 
 type DriveStatus = 'disabled' | 'not_configured' | 'skipped' | 'mirrored' | 'failed';
 
-type GitHandoffSummary = { path: string | null; status: 'present' | 'missing' | 'not-declared' };
+type GitHandoffSummary = { path: string | null; status: 'present' | 'missing' | 'unverified' | 'not-declared' };
 
 type DriveSummary = {
   status: DriveStatus;
@@ -209,6 +209,7 @@ export function BuildHandoffsPanel() {
 function gitHandoffLabel(handoff: Handoff, gitHandoff: GitHandoffSummary | null) {
   if (gitHandoff?.status === 'present') return <>Committed — <code>{gitHandoff.path}</code></>;
   if (gitHandoff?.status === 'missing') return <>MISSING from the commit — <code>{gitHandoff.path}</code></>;
+  if (gitHandoff?.status === 'unverified') return <>Declared, not yet verified — <code>{gitHandoff.path}</code></>;
   if (handoff.gitHandoffPath) return <>Declared, not yet verified — <code>{handoff.gitHandoffPath}</code></>;
   return 'Not declared — this build cannot finalise until it commits one';
 }
@@ -222,7 +223,14 @@ function driveLabel(handoff: Handoff, drive: DriveSummary | null) {
     case 'failed': return `not mirrored — ${drive.error ?? 'unknown reason'}`;
     case 'skipped': return 'not run this time';
     case 'disabled': return 'not enabled for this build';
-    default: return 'enabled, not attempted yet';
+    default:
+      // A completion record written by an engine that predates `drive.status`.
+      // Read what it does carry rather than asserting something false about it.
+      if (!drive) return 'enabled, not attempted yet';
+      if (drive.uploadedCount > 0) return `${drive.uploadedCount} deliverable(s) mirrored`;
+      if (drive.connectionRequired) return 'Drive is not connected on this machine';
+      if (drive.error) return `not mirrored — ${drive.error}`;
+      return drive.attempted ? 'attempted, nothing mirrored' : 'enabled, not attempted yet';
   }
 }
 

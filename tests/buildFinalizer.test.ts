@@ -100,7 +100,12 @@ function fixture(repository = 'warwickallan/ProjectManagAIr'): Fixture {
   const baselineSha = git(cloud, 'rev-parse', 'HEAD');
 
   git(cloud, 'switch', '-c', 'build/example-v1');
-  writeFileSync(path.join(cloud, 'feature.md'), '# the build\n', 'utf8');
+  // A believable build record, plus a directory and a stub file so the
+  // "is the record actually a file, and is it actually a record" checks have
+  // something real to refuse.
+  writeFileSync(path.join(cloud, 'feature.md'), `# the build\n\n${'Committed build record. '.repeat(20)}\n`, 'utf8');
+  mkdirSync(path.join(cloud, 'nested'), { recursive: true });
+  writeFileSync(path.join(cloud, 'nested', 'stub.md'), 'x\n', 'utf8');
   git(cloud, 'add', '-A');
   git(cloud, 'commit', '-m', 'the build');
   const headSha = git(cloud, 'rev-parse', 'HEAD');
@@ -293,7 +298,7 @@ describe('a valid handoff finalises in one action', () => {
 
     // The steps read as an account of what happened.
     const keys = result.steps.map((step) => step.key);
-    expect(keys).toEqual(['manifest', 'repository', 'worktree', 'bundle', 'fetch', 'commit', 'ancestry', 'git-handoff', 'branch', 'remote-read', 'push', 'remote-verify', 'pull-request', 'drive']);
+    expect(keys).toEqual(['manifest', 'repository', 'worktree', 'bundle', 'fetch', 'commit', 'ancestry', 'git-handoff', 'public-git-boundary', 'branch', 'remote-read', 'push', 'remote-verify', 'pull-request', 'drive']);
     // GitHub is the canonical record: the sanitised handoff is proved present in
     // the exact commit being pushed, not merely named by the manifest.
     expect(result.gitHandoff).toEqual({ path: 'feature.md', status: 'present' });
@@ -528,6 +533,84 @@ describe('GitHub is the canonical build record', () => {
     expect(result.gitHandoff.status).toBe('not-declared');
     expect(result.errors.join(' ')).toMatch(/canonical build record/i);
     expect(remoteSha(fx)).toBeNull();
+  });
+
+  it('COMPLETES even when Drive is configured and the upload genuinely fails', async () => {
+    const fx = fixture();
+    const deliverable = path.join(fx.root, 'handoff.md');
+    writeFileSync(deliverable, '# handoff\n', 'utf8');
+    const manifestPath = writeManifest(fx, {
+      // Drive declared, Drive NOT marked required: the normal case.
+      drive: { folderId: 'root-folder', folderName: 'ProjectManagAIr', buildDeliverablesFolder: 'Build Deliverables' },
+      deliverables: [{ path: deliverable, classification: 'safe_for_drive', required: true, googleDoc: false, title: 'Handoff.md' }],
+    });
+    const drive = new FakeDrive();
+    drive.failUploadsFor.add('Handoff.md');
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), drive);
+
+    // This is the rule the whole correction turns on: the drive step really is
+    // `failed`, and the build is still COMPLETED because Git is the record.
+    expect(result.steps.find((step) => step.key === 'drive')!.status).toBe('failed');
+    expect(result.drive.status).toBe('failed');
+    expect(result.drive.required).toBe(false);
+    expect(result.state).toBe('COMPLETED');
+    expect(remoteSha(fx)).toBe(fx.headSha);
+    expect(result.pullRequest?.number).toBe(42);
+    // ...and it is complete, so the manifest moved out of pending.
+    expect(existsSync(manifestPath)).toBe(false);
+    // The failure is still on the record, not swallowed.
+    expect(result.errors.join(' ')).toMatch(/Handoff\.md/);
+  });
+
+  it('refuses a build record that is a directory or an empty file, not just a missing one', async () => {
+    const fx = fixture();
+    // `git cat-file -e` succeeds for any object at a path, including a tree, so
+    // a manifest naming a directory that exists in every commit would otherwise
+    // pass and the build would complete with no record of itself.
+    const directory = await run(fx, writeManifest(fx, { gitHandoffPath: 'nested' }, 'dir.json'), new FakeGitHub(() => fx.headSha));
+    expect(directory.state).toBe('FAILED');
+    expect(directory.errors.join(' ')).toMatch(/is a tree in commit/i);
+    expect(remoteSha(fx)).toBeNull();
+
+    const tiny = await run(fx, writeManifest(fx, { gitHandoffPath: 'nested/stub.md' }, 'tiny.json'), new FakeGitHub(() => fx.headSha));
+    expect(tiny.state).toBe('FAILED');
+    expect(tiny.errors.join(' ')).toMatch(/bytes in commit .* which cannot be a build record/i);
+    expect(remoteSha(fx)).toBeNull();
+  });
+
+  it('refuses to push a commit that contains a deliverable classified unfit for public Git', async () => {
+    const fx = fixture();
+    // The build committed a customer transcript onto the branch and then
+    // honestly declared it. Withholding it from Drive is not enough: this
+    // repository is public and the commit is about to be pushed to it.
+    const committed = path.join(fx.local, 'nested', 'stub.md');
+    const manifestPath = writeManifest(fx, {
+      deliverables: [{ path: committed, classification: 'contains_customer_data', required: false, googleDoc: false, title: 'stub.md' }],
+    });
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), new FakeDrive());
+
+    expect(result.state).toBe('FAILED');
+    expect(result.errors.join(' ')).toMatch(/repository is public/i);
+    expect(result.errors.join(' ')).toMatch(/nested\/stub\.md \(contains_customer_data\)/);
+    expect(remoteSha(fx)).toBeNull();
+  });
+
+  it('does not confuse a deliverable outside the repository with one inside it', async () => {
+    const fx = fixture();
+    // The normal case: handoffs, bundles and databases sit beside the repository,
+    // not in it, and must not be mistaken for committed content.
+    const outside = path.join(fx.root, 'transcript.vtt');
+    writeFileSync(outside, 'WEBVTT\n', 'utf8');
+    const manifestPath = writeManifest(fx, {
+      deliverables: [{ path: outside, classification: 'contains_customer_data', required: false, googleDoc: false }],
+    });
+
+    const result = await run(fx, manifestPath, new FakeGitHub(() => fx.headSha), new FakeDrive());
+
+    expect(result.state).toBe('COMPLETED');
+    expect(result.steps.find((step) => step.key === 'public-git-boundary')!.status).toBe('ok');
   });
 
   it('completes with no Drive destination at all', async () => {

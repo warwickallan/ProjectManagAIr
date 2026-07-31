@@ -36,8 +36,11 @@ same engine; there is no second implementation of any rule.
 
 A build is COMPLETED when the branch is pushed, `ls-remote` confirms origin
 points at the exact expected SHA, the draft pull request exists, and the
-sanitised handoff named by the manifest is proved present **in that exact
-commit** — read out of the commit's own tree, not trusted from the manifest.
+sanitised handoff named by the manifest is proved to be a committed file **in
+that exact commit** — read out of the commit's own tree, checked for type and
+size, not trusted from the manifest. `git cat-file -e` alone would accept a
+directory, so a manifest naming a folder that exists in every commit would
+otherwise pass with no record of the build at all.
 
 Google Drive mirroring is optional. It reports `disabled`, `not_configured`,
 `skipped`, `mirrored` or `failed`, and cannot change the verdict unless a
@@ -47,8 +50,14 @@ Google OAuth client to finish a build.
 ### What it never does
 
 Merge. Force-push. Delete a branch. Reset or clean a working tree. Move a branch
-that is not where the manifest says it should be. Commit or upload anything not
-classified for that destination. Print, log or persist an access token.
+that is not where the manifest says it should be. Upload anything not cleared for
+Drive. Push a commit containing a declared deliverable the manifest itself says
+is unfit for public Git. Print, log or persist an access token.
+
+The finaliser commits nothing of its own. What it enforces is that the commit it
+is about to push does not contain a deliverable classified below
+`safe_for_public_git` — it cannot vouch for files a build never declared, so the
+classification list is the boundary and the builder is responsible for it.
 
 A dirty or ambiguous repository fails with a readable explanation rather than a
 guess. The working-tree check is deliberately narrow: an interrupted merge,
@@ -116,8 +125,8 @@ None. This build adds no schema, no table and no migration file.
 
 | Check | Result |
 |---|---|
-| Unit and integration tests | 457 passed, 1 skipped, 28 files |
-| Finaliser tests | 45, against a real bare remote, a real bundle and a real local clone |
+| Unit and integration tests | 461 passed, 1 skipped, 28 files |
+| Finaliser tests | 49, against a real bare remote, a real bundle and a real local clone |
 | TypeScript | clean (`tsc --noEmit`) |
 | Production build | clean |
 | Playwright end-to-end | 8 passed |
@@ -129,13 +138,15 @@ than mocked. No network, no credentials, no model calls.
 
 Proved by test, among others: a wrong SHA, a wrong ancestry, a wrong repository
 and a look-alike host carrying the same `owner/repo` are all rejected; a build
-whose sanitised handoff is missing from the commit is refused before the push; a
+whose sanitised handoff is missing from the commit — or is a directory, or is
+too small to be a record — is refused before the push, as is a commit containing
+a deliverable the manifest classifies as unfit for public Git; a
 mid-merge repository changes nothing; a local or remote branch at a different SHA
 is refused rather than force-pushed; reruns create no second pull request and no
 second Drive folder; a pull request whose head has drifted is not rewritten; an
-unconfigured Drive still COMPLETES; a `local_only`, `contains_customer_data` or
-`contains_secrets` deliverable is never uploaded; a secret in a remote URL never
-reaches the completion record.
+unconfigured Drive still COMPLETES, and so does a Drive upload that genuinely
+fails; a `local_only`, `contains_customer_data` or `contains_secrets` deliverable
+is never uploaded; a secret in a remote URL never reaches the completion record.
 
 ## Adversarial review
 

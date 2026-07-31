@@ -210,8 +210,8 @@ export interface FinalizeResult {
   /** Whether the canonical record — the sanitised handoff — is in the pushed commit. */
   gitHandoff: {
     path: string | null;
-    /** `present` in the exact commit, `missing` from it, or `not-declared`. */
-    status: 'present' | 'missing' | 'not-declared';
+    /** `present` in the exact commit, `missing` from it, `unverified` (dry run), or `not-declared`. */
+    status: 'present' | 'missing' | 'unverified' | 'not-declared';
   };
   drive: {
     /**
@@ -699,6 +699,12 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
   }
   record({ key: 'manifest', title: 'Read the handoff manifest', status: 'ok', detail: `${manifest.branch} at ${manifest.expectedHeadSha} from ${manifest.origin.model}.`, mutated: false });
 
+  // Set the moment the manifest is known, not when the mirror runs: a run that
+  // stops at the push must not leave a completion record claiming Drive was
+  // never asked for when the manifest plainly asks for it.
+  result.drive.required = Boolean(manifest.drive?.required);
+  result.drive.status = manifest.drive ? 'skipped' : 'disabled';
+
   /* ---------------------------------------------------------------- identity */
 
   // `git config --get`, not `git remote get-url`: the latter applies `insteadOf`
@@ -804,6 +810,7 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     // strongest statement that can honestly be made without mutating anything.
     record({ key: 'commit', title: 'Verify the expected commit exists', status: 'skipped', detail: 'Dry run: the verified bundle carries this commit and would supply it.', mutated: false });
     record({ key: 'ancestry', title: 'Verify the declared baseline', status: 'skipped', detail: 'Dry run: the commit was not fetched, so its ancestry cannot be checked without mutating the repository.', mutated: false });
+    result.gitHandoff = { path: manifest.gitHandoffPath, status: manifest.gitHandoffPath ? 'unverified' : 'not-declared' };
     record({
       key: 'git-handoff',
       title: 'Verify the committed build record',
@@ -887,20 +894,62 @@ export async function finalizeBuild(options: FinalizeOptions): Promise<FinalizeR
     });
     return finish(result, options, now);
   }
-  const committedHandoff = await git(['cat-file', '-e', `${manifest.expectedHeadSha}:${manifest.gitHandoffPath}`]);
-  if (committedHandoff.code !== 0) {
+  // `cat-file -e` is not enough: it succeeds for ANY object at that path,
+  // including a tree. A manifest naming `docs/build-handoffs` — a directory that
+  // exists in every commit on this branch — would otherwise pass, and the build
+  // would be COMPLETED with no record of itself at all. The type and the size
+  // are what actually answer "is the record there".
+  const handoffType = await git(['cat-file', '-t', `${manifest.expectedHeadSha}:${manifest.gitHandoffPath}`]);
+  const handoffSize = handoffType.code === 0 && handoffType.stdout.trim() === 'blob'
+    ? await git(['cat-file', '-s', `${manifest.expectedHeadSha}:${manifest.gitHandoffPath}`])
+    : null;
+  const handoffBytes = handoffSize?.code === 0 ? Number.parseInt(handoffSize.stdout.trim(), 10) : Number.NaN;
+  const MINIMUM_RECORD_BYTES = 200;
+  if (handoffType.code !== 0 || handoffType.stdout.trim() !== 'blob' || !Number.isFinite(handoffBytes) || handoffBytes < MINIMUM_RECORD_BYTES) {
     result.gitHandoff = { path: manifest.gitHandoffPath, status: 'missing' };
+    const why = handoffType.code !== 0
+      ? `is not in commit ${manifest.expectedHeadSha}`
+      : handoffType.stdout.trim() !== 'blob'
+        ? `is a ${handoffType.stdout.trim()} in commit ${manifest.expectedHeadSha}, not a file`
+        : `is only ${Number.isFinite(handoffBytes) ? handoffBytes : 0} bytes in commit ${manifest.expectedHeadSha}, which cannot be a build record`;
     record({
       key: 'git-handoff',
       title: 'Verify the committed build record',
       status: 'failed',
-      detail: `${manifest.gitHandoffPath} is not in commit ${manifest.expectedHeadSha}. The canonical build record must be committed on the branch being pushed; commit it and produce a new bundle.`,
+      detail: `${manifest.gitHandoffPath} ${why}. The canonical build record must be a committed file on the branch being pushed; commit it and produce a new bundle.`,
       mutated: false,
     });
     return finish(result, options, now);
   }
   result.gitHandoff = { path: manifest.gitHandoffPath, status: 'present' };
-  record({ key: 'git-handoff', title: 'Verify the committed build record', status: 'ok', detail: `${manifest.gitHandoffPath} is present in ${manifest.expectedHeadSha.slice(0, 12)}.`, mutated: false });
+  record({ key: 'git-handoff', title: 'Verify the committed build record', status: 'ok', detail: `${manifest.gitHandoffPath} is a ${handoffBytes}-byte file in ${manifest.expectedHeadSha.slice(0, 12)}.`, mutated: false });
+
+  /* -------------------------------------------- nothing unsafe in the commit */
+
+  // The mirror of the same rule. This repository is PUBLIC, so a deliverable the
+  // manifest itself says is not fit for public Git must not be in the commit
+  // about to be pushed to it. Checked against the commit's tree, for every
+  // declared deliverable that lives inside the repository.
+  const unsafeInCommit: string[] = [];
+  for (const entry of manifest.deliverables) {
+    if (mayEnterPublicGit(entry.classification)) continue;
+    const absolute = resolveRelative(options.manifestPath, entry.path);
+    const relative = path.relative(options.repoRoot, absolute);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) continue;
+    const inTree = await git(['cat-file', '-e', `${manifest.expectedHeadSha}:${relative.split(path.sep).join('/')}`]);
+    if (inTree.code === 0) unsafeInCommit.push(`${relative.split(path.sep).join('/')} (${entry.classification})`);
+  }
+  if (unsafeInCommit.length > 0) {
+    record({
+      key: 'public-git-boundary',
+      title: 'Check nothing unsafe is in the commit',
+      status: 'failed',
+      detail: `This repository is public, and commit ${manifest.expectedHeadSha} contains ${unsafeInCommit.length} deliverable(s) the manifest classifies as unfit for it: ${unsafeInCommit.join(', ')}. Refusing to push.`,
+      mutated: false,
+    });
+    return finish(result, options, now);
+  }
+  record({ key: 'public-git-boundary', title: 'Check nothing unsafe is in the commit', status: 'ok', detail: `No deliverable classified below safe_for_public_git is in ${manifest.expectedHeadSha.slice(0, 12)}.`, mutated: false });
 
   /* ------------------------------------------------------------ local branch */
 
