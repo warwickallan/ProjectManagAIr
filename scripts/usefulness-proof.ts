@@ -4,7 +4,7 @@
  * Takes the already-produced candidate 2.9.0 packet/changeset (frozen and
  * benchmarked earlier, sitting unapplied), applies it through the normal
  * review/apply path onto an ISOLATED COPY of the candidate database — never
- * the live NPL database — and renders the existing deterministic Meeting
+ * the live customer database — and renders the existing deterministic Meeting
  * Brief and Needs Warwick views on top. No provider is constructed, no
  * extraction job runs, no packet is reassembled. The question this run
  * answers is not "did the comparator score go up" but "is the applied
