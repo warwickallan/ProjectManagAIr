@@ -1,7 +1,7 @@
 # build/source-intelligence-usefulness-v1 — two-intelligence architecture, Consultant Reasoning, usefulness proof
 
 **Baseline** `6de535f17ada80f8b30c92626ca10cdd1e9e2228` (build/source-intelligence-acceptance-prompts-v1)
-**Head** `53d34b16ec5677edd02e354dd86030b09f0745e7`
+**Head** `a9697c643878954c348ae218c2f5f0b6c1b6c7c9`, extended by this commit (human project events, migration 015) — see `git log` for the exact tip.
 **Built by** claude-opus-5, 31 July – 1 August 2026
 **Verdict** PENDING WARWICK'S VISUAL ASSESSMENT — everything below is built and
 verified; **no skill has been promoted and this branch has not been merged.**
@@ -69,7 +69,7 @@ The registry's own `sha256()` (`src/skillRegistry.ts`) hashes the revision
 **body** only — everything after the closing `---` — never the front matter.
 `notes` is metadata: `syncSkillRegistry` treats a changed `notes` value as a
 `refreshed` audit event, not a hash mismatch. So the notes line was rewritten
-in place ("the NPL PPM Playback meeting" → "a live customer project meeting"),
+in place (the named customer meeting became "a live customer project meeting"),
 verified by recomputing `sha256(body)` before and after the edit (identical:
 `c663c19042241fc26672e0d5b3112d02c32e50eec91544fbb01e519af2dcede8`) — **no
 revision was silently edited and no recorded hash was invalidated**, because
@@ -82,6 +82,78 @@ is not lost to the sanitisation.
 `tests/boundary.test.ts` and `tests/skillRegistry.test.ts` pass clean after the
 change (49 tests). No skill was promoted; 2.9.0 stays `status: candidate`.
 
+## Human project events (this commit)
+
+Inspection established the human-update architecture already existed almost
+whole: `POST /api/projects/:projectId/register-rows/:externalRegisterId/events`
+→ `recordRegisterEvent()` → append-only `register_row_events` → deterministic
+`rebuildProjection` replay, with before/after values, actor, rationale and
+timestamp already preserved. The gap was the human-facing UI and a safe
+standalone note. This commit completes that path; it does not redesign it.
+
+- **Migration 015** adds one column, `register_row_events.origin` (`source` /
+  `human` / `system`, default `human`), backfilled `source` wherever
+  `source_id` was already set. This makes explicit what was previously only
+  inferable (two writers have ever existed: the source-extraction apply path
+  and the human-facing route); `src/sourceIntelligence.ts`'s direct insert now
+  tags itself `'source'` explicitly.
+- **`recordRegisterEvent`** gained an `origin` parameter (default `human`) and
+  a guard: an `eventType: 'note'` event that also names a `field`/`newValue`
+  is refused outright, so a standalone note can never silently mutate a
+  register field. `event_type` was already unconstrained free text, so `note`
+  itself needed no schema change.
+- **`EVENT_TYPE_STATUS`** (`src/registerProjection.ts`) replaces the old
+  seven-entry ternary with an eighteen-entry map covering the register-
+  appropriate actions this ticket asked for: `start`/`block`/`cancel`
+  (Actions), `mitigate`/`accept` (Risks_Issues), `supersede` (Decisions),
+  `achieve`/`miss` (Milestones), `apply`/`verify`/`revert` (Config_Changes).
+  `note` and `reaffirm` stay deliberately absent from the map — that absence
+  is what keeps them status-neutral. `scoreRow`'s closed-status list gained
+  the new terminal statuses so a cancelled action or an applied config change
+  scores `Reference`, not left in the queue.
+- **UI**: `src/RegisterViews.tsx` adds `RegisterUpdateForm` to the row drawer
+  — register-appropriate status buttons, "Change owner", "Change due date"
+  (labelled "Reschedule" for Milestones), and "Add note", each requiring a
+  mandatory rationale. Entities and Sources get only "Add note" per the
+  ticket's explicit carve-out. The drawer's history section (renamed from
+  "Human operational history" to "History") now shows every event with an
+  origin badge (Source/Human/System), so source-derived, human-authored and
+  system-generated entries are visually distinct. A confirmation — "Project
+  state changed. Refresh Consultant Intelligence when you want an updated
+  brief." — is shown after a successful submit; it is stashed as a one-shot
+  URL flag because `onChanged()`'s refetch flashes the page's loading state
+  and would otherwise wipe local component state before anyone read it.
+- **Reasoning integration required no code change.** `buildReasoningRequest`
+  (`src/consultantReasoningState.ts`) already read every `register_row_events`
+  row into `latest_events`/`recent_changes` regardless of event type, and the
+  `project_state_hash` already covered that data — so a standalone note
+  changes the hash and appears in the next request exactly as a field
+  correction does. Proved directly in `tests/humanProjectEvents.test.ts`
+  rather than assumed.
+- **One regression found and fixed**: an existing test
+  (`tests/sourceIntelligenceGates.test.ts`) coincidentally used the literal
+  string `'note'` as an arbitrary `eventType` label for a field correction,
+  before `note` had reserved meaning. Relabelled to `'correct'`; the test's
+  actual subject (event-time precedence) is unaffected.
+- **New tests**: `tests/humanProjectEvents.test.ts`, 18 tests — completing an
+  action, answering a question (resolution + close in one event), resolving/
+  mitigating/accepting/reopening a risk, owner and due-date changes, a
+  milestone reschedule, a standalone note (and its field-guard refusal),
+  origin tagging (human default, explicit system, and a hand-inserted
+  source-shaped event for contrast), deterministic replay of the new event
+  types under equal timestamps and out-of-order `occurredAt`, and reasoning
+  integration (`project_state_hash` change, `readConsultantReasoning` reading
+  `state: 'stale'` against a hand-seeded prior accepted result, zero provider
+  calls throughout via a `FakeConsultantReasoningProvider` that throws if
+  reached).
+- **Verified in the browser** against a disposable copy of the sealed
+  acceptance database (never the original — the original was never pointed at
+  during this work and its accepted result still reads `current`, unchanged,
+  by hash, after migration 015 applied to it): adding a note, ratifying a
+  decision, changing an owner — one event each, immediate history update, the
+  confirmation banner, zero POST requests beyond the one `events` call per
+  action.
+
 ## Migrations
 
 - `013_provider_outputs_prompt_registry_and_consultant_views.sql` — carried
@@ -92,6 +164,11 @@ change (49 tests). No skill was promoted; 2.9.0 stays `status: candidate`.
   (a reasoning run has no source document); results cache against the state
   hash they reasoned over and are marked stale, never deleted, when that state
   moves.
+- `015_human_register_events.sql` — adds `register_row_events.origin`
+  (`source` / `human` / `system`), backfilled from the existing `source_id`
+  signal. Purely additive metadata: it is not part of `project_state_hash`,
+  so applying it to the sealed acceptance database did not disturb the
+  accepted Consultant Reasoning result (verified by hash, unchanged).
 
 ## Verification
 
@@ -130,8 +207,17 @@ change (49 tests). No skill was promoted; 2.9.0 stays `status: candidate`.
 
 ## Still required
 
-Warwick's visual assessment of the Cockpit (Overview led by Consultant
-Reasoning, Mined Data tab, evidence drill-down, both skill families in
-Settings → AI Skills & Prompts) and a merge decision. No further AI extraction
-or reasoning call, no skill promotion and no redesign should happen before
-that review.
+1. Warwick's visual assessment of the Cockpit and a merge decision — unchanged.
+2. Whether to rewrite the two commits still carrying the un-sanitised customer
+   name/meeting on the pushed branch (`3f96963` onward), or accept it as a
+   low-severity residual — reported, not acted on, pending Warwick's call.
+3. Whether the 9 standalone per-register tabs should be demoted/removed now
+   that Mined Data exists, and whether the three overlapping "meeting/needs-
+   warwick" mechanisms (Consultant Reasoning's own modes, `AdaptiveOverview`,
+   `consultantViews.ts`) should be reconciled — both explicitly out of scope
+   for this ticket.
+4. No skill was promoted and nothing was merged on this ticket either. No AI
+   extraction or reasoning call occurred: `recordRegisterEvent` and everything
+   it calls touch only SQLite.
+
+No further redesign should happen before Warwick's review.

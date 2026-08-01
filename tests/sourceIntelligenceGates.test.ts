@@ -538,7 +538,7 @@ describe('B5 — source event dates', () => {
       const ingestedAt = String((db.prepare('SELECT created_at FROM source_documents WHERE id = ?').get(sourceId) as { created_at: string }).created_at);
 
       // An event that predates the ingest does not outrank the source.
-      recordRegisterEvent(db, project.projectId, actionId, { actor: 'Casey', eventType: 'note', field: 'status', newValue: 'open', reason: 'Historic note recorded long before this source arrived.', occurredAt: '2020-01-01T00:00:00.000Z' });
+      recordRegisterEvent(db, project.projectId, actionId, { actor: 'Casey', eventType: 'correct', field: 'status', newValue: 'open', reason: 'Historic correction recorded long before this source arrived.', occurredAt: '2020-01-01T00:00:00.000Z' });
       const run2 = trustedRun(db, project.projectId, sourceId);
       const older = packetFor(db, project.projectId, 'UNDATED', sourceId, run2);
       older.sheets.Actions.rows[0].op = 'update';

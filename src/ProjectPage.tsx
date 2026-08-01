@@ -4,7 +4,7 @@ import { AIChatPanel } from './AIChatPanel';
 import { ConsultantViewPanel } from './ConsultantViewPanel';
 import { ConsultantReasoningPanel } from './ConsultantReasoningPanel';
 import { DetailFieldList, RegisterTable, Stacked, registerForTab, registerRowRoute, type RegisterRow } from './RegisterViews';
-import { ActivityList, AttentionList, EmptyState, ErrorState, FreshnessNotice, LoadingState, PageIntro, ProgressBar, Section, SourceProcessingAlerts, SourceProcessingNotice, StatusChip, formatDate, formatDateTime, humanize, sourceProcessingView } from './components';
+import { ActivityList, AttentionList, EmptyState, ErrorState, FreshnessNotice, LoadingState, PageIntro, ProgressBar, Section, SourceProcessingAlerts, SourceProcessingNotice, StatusChip, formatDate, formatDateTime, humanize, postJson, sourceProcessingView } from './components';
 
 type Project = ProjectResponse['project'];
 type JsonRecord = Record<string, unknown>;
@@ -150,9 +150,9 @@ function ProjectTabContent({ project, activeTab, attention, attentionLabel, user
   if (activeTab === 'work-packages') return <WorkPackagesTab project={project} />;
   if (activeTab === 'deliverables') return <DeliverablesTab project={project} attentionLabel={attentionLabel} userId={userId} />;
   if (['data-config', 'meetings-comms', 'uat-training', 'handover'].includes(activeTab)) return <PlaceholderSection id={activeTab} title={labelFor(activeTab)} />;
-  if (activeTab === 'mined-data') return <MinedDataTab project={project} focusedRecordId={focusedRecordId} />;
+  if (activeTab === 'mined-data') return <MinedDataTab project={project} focusedRecordId={focusedRecordId} userId={userId} onChanged={onChanged} />;
   const registerName = registerForTab[activeTab];
-  if (registerName) return <RegisterBackedTab project={project} tab={activeTab} registerName={registerName} attentionLabel={attentionLabel} userId={userId} focusedRecordId={focusedRecordId} />;
+  if (registerName) return <RegisterBackedTab project={project} tab={activeTab} registerName={registerName} attentionLabel={attentionLabel} userId={userId} focusedRecordId={focusedRecordId} onChanged={onChanged} />;
   return <OverviewTab project={project} attention={attention} attentionLabel={attentionLabel} overview={projectOverview} brief={consultantBrief} onChanged={onChanged} />;
 }
 
@@ -194,7 +194,7 @@ function OverviewTab({ project, attention, attentionLabel, overview, brief, onCh
  * per-register tabs still exist and still deep-link, so `registerRowRoute`
  * targets are unaffected by anything here.
  */
-function MinedDataTab({ project, focusedRecordId }: { project: Project; focusedRecordId: string | null }) {
+function MinedDataTab({ project, focusedRecordId, userId, onChanged }: { project: Project; focusedRecordId: string | null; userId: string; onChanged: () => void }) {
   const [selectedRegister, setSelectedRegister] = useState<string>(minedRegisters[0][0]);
   const label = minedRegisters.find(([name]) => name === selectedRegister)?.[1] ?? humanize(selectedRegister);
   const rows = project.registerRows.filter((row) => row.registerName === selectedRegister) as RegisterRow[];
@@ -214,7 +214,7 @@ function MinedDataTab({ project, focusedRecordId }: { project: Project; focusedR
           return <button key={name} type="button" className={selectedRegister === name ? 'active' : ''} aria-pressed={selectedRegister === name} onClick={() => setSelectedRegister(name)}>{text}<span>{count}</span></button>;
         })}
       </nav>
-      <RegisterTable title={label} registerName={selectedRegister} rows={rows} comparisonRows={project.registerComparisonRows.filter((row) => row.registerName === selectedRegister)} focusedRecordId={focusedRecordId} />
+      <RegisterTable title={label} registerName={selectedRegister} rows={rows} comparisonRows={project.registerComparisonRows.filter((row) => row.registerName === selectedRegister)} focusedRecordId={focusedRecordId} userId={userId} onChanged={onChanged} />
     </div>
   );
 }
@@ -296,16 +296,16 @@ function overviewModeAvailable(overview: ProjectOverview, mode: OverviewMode) {
 
 function modeLabel(mode: OverviewMode) { return overviewModes.find((item) => item.id === mode)?.label ?? humanize(mode); }
 
-function RegisterBackedTab({ project, tab, registerName, attentionLabel, userId, focusedRecordId }: { project: Project; tab: TabId; registerName: string; attentionLabel: string; userId: string; focusedRecordId: string | null }) {
+function RegisterBackedTab({ project, tab, registerName, attentionLabel, userId, focusedRecordId, onChanged }: { project: Project; tab: TabId; registerName: string; attentionLabel: string; userId: string; focusedRecordId: string | null; onChanged: () => void }) {
   const rows = project.registerRows.filter((row) => row.registerName === registerName) as RegisterRow[];
-  if (rows.length > 0) return <RegisterTable title={labelFor(tab)} registerName={registerName} rows={rows} comparisonRows={project.registerComparisonRows.filter((row) => row.registerName === registerName)} focusedRecordId={focusedRecordId} />;
+  if (rows.length > 0) return <RegisterTable title={labelFor(tab)} registerName={registerName} rows={rows} comparisonRows={project.registerComparisonRows.filter((row) => row.registerName === registerName)} focusedRecordId={focusedRecordId} userId={userId} onChanged={onChanged} />;
   if (tab === 'actions') return <Section id="actions" title="Actions" kicker="Concrete next steps" count={project.actions.length}><RecordTable label="Project actions" columns={['ID', 'Action', 'Owner', 'Priority', 'Due', 'Status']} rows={project.actions.map((action) => [action.id, <RecordTitle key="title" title={action.title} summary={action.summary} attention={action.needsUserAttention && action.attentionOwner === userId ? attentionLabel : null} />, action.owner, <StatusChip key="priority" value={action.priority} />, formatDate(action.dueDate), <StatusChip key="status" value={action.status} />])} /></Section>;
   if (tab === 'risks') return <Section id="risks" title="Risks and issues" kicker="Threats to delivery" count={project.risksIssues.length}><RecordTable label="Project risks and issues" columns={['ID', 'Risk / issue', 'Kind', 'Severity', 'Impact', 'Status']} rows={project.risksIssues.map((item) => [item.id, <RecordTitle key="title" title={item.title} summary={item.summary} attention={null} />, item.kind, <StatusChip key="severity" value={item.severity} />, item.impact, <StatusChip key="status" value={item.status} />])} /></Section>;
   if (tab === 'decisions') return <Section id="decisions" title="Decisions" kicker="Choices and outcomes" count={project.decisions.length}><Stacked records={project.decisions.map((decision) => ({ id: decision.id, title: decision.title, text: decision.summary, chip: decision.decisionStatus, details: [['Needed by', formatDate(decision.decisionNeededBy)], ['Options', decision.optionsSummary], ['Outcome', decision.outcome ?? 'Pending']] }))} empty="No decisions recorded." /></Section>;
   if (tab === 'config-changes') return <Section id="config-changes" title="Config Changes" kicker="Configuration movement" count={project.changes.length}><Stacked records={project.changes.map((change) => ({ id: change.id, title: change.title, text: change.summary, chip: change.status, details: [['Type', change.changeType], ['Impact', change.impact], ['Owner', change.owner]] }))} empty="No config changes recorded." /></Section>;
   if (tab === 'open-questions') return <Section id="open-questions" title="Open Questions" kicker="Unknowns to resolve" count={project.openQuestions.length}><Stacked records={project.openQuestions.map((question) => ({ id: question.id, title: question.title, text: question.question, chip: question.blocking ? 'blocked' : question.status, details: [['Owner', question.owner], ['Answer needed', formatDate(question.answerNeededBy)]] }))} empty="No open questions." /></Section>;
   if (tab === 'milestones') return <MilestonesTab project={project} />;
-  return <RegisterTable title={labelFor(tab)} registerName={registerName} rows={rows} comparisonRows={[]} focusedRecordId={focusedRecordId} />;
+  return <RegisterTable title={labelFor(tab)} registerName={registerName} rows={rows} comparisonRows={[]} focusedRecordId={focusedRecordId} userId={userId} onChanged={onChanged} />;
 }
 
 function RegisterComparison({ project, compact = false }: { project: Project; compact?: boolean }) {
@@ -465,4 +465,3 @@ function RecordTable({ label, columns, rows }: { label: string; columns: string[
 function labelFor(tab: TabId) { return [...primaryTabs, ...moreTabs].find(([id]) => id === tab)?.[1] ?? humanize(tab); }
 function safePathLabel(value: string) { const normal = value.replace(/\\/g, '/'); const marker = '/Projects/'; const index = normal.lastIndexOf(marker); return index >= 0 ? normal.slice(index + marker.length) : normal.split('/').slice(-3).join('/'); }
 function fileToBase64(file: File): Promise<string> { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1] ?? ''); reader.onerror = () => reject(reader.error); reader.readAsDataURL(file); }); }
-async function postJson<T = unknown>(url: string, method: 'POST', body: unknown): Promise<T> { const response = await fetch(url, { method, headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) }); const data = (await response.json().catch(() => null)) as T | { error?: string } | null; if (!response.ok) throw new Error((data as { error?: string } | null)?.error ?? `Request failed with ${response.status}`); return data as T; }

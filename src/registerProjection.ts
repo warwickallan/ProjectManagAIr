@@ -464,6 +464,39 @@ function correctedRowField(corrections: Map<string, string | null>, field: strin
   return value === undefined || value === null ? null : text(value) || null;
 }
 
+/**
+ * Register-appropriate status transitions a human or a source-apply event may
+ * request, keyed by `event_type`. Deliberately a flat map rather than a
+ * per-register switch: the projector does not police which register an event
+ * type "belongs to" (a Risks_Issues-only status recorded against an Action
+ * would just be an unrecognised wording for that register's classifier, same
+ * as any other unexpected status text, not a crash).
+ *
+ * `note` and `reaffirm` are intentionally absent: both are events a human (or
+ * a source reaffirm) may record without changing status, and their absence
+ * from this map is what keeps them status-neutral.
+ */
+const EVENT_TYPE_STATUS: Record<string, string> = {
+  complete: 'completed',
+  close: 'resolved',
+  resolve: 'resolved',
+  ratify: 'ratified',
+  reject: 'rejected',
+  park: 'parked',
+  reopen: 'open',
+  start: 'in-progress',
+  block: 'blocked',
+  cancel: 'cancelled',
+  mitigate: 'mitigated',
+  accept: 'accepted',
+  supersede: 'superseded',
+  achieve: 'achieved',
+  miss: 'missed',
+  apply: 'applied',
+  verify: 'verified',
+  revert: 'reverted',
+};
+
 function stateFor(db: DatabaseSync, projectId: string, row: Record<string, unknown>) {
   const state: Record<string, string | null> = {
     status: String(row.record_status),
@@ -483,13 +516,7 @@ function stateFor(db: DatabaseSync, projectId: string, row: Record<string, unkno
       else corrections.set(field, next);
     }
     const eventType = String(event.event_type);
-    if (['complete', 'close', 'resolve', 'ratify', 'reject', 'park', 'reopen'].includes(eventType)) {
-      state.status = eventType === 'reopen' ? 'open'
-        : eventType === 'ratify' ? 'ratified'
-          : eventType === 'reject' ? 'rejected'
-            : eventType === 'park' ? 'parked'
-              : eventType === 'complete' ? 'completed' : 'resolved';
-    }
+    if (Object.hasOwn(EVENT_TYPE_STATUS, eventType)) state.status = EVENT_TYPE_STATUS[eventType];
   }
   return { state, corrections, events };
 }
@@ -500,7 +527,7 @@ function scoreRow(db: DatabaseSync, projectId: string, row: Record<string, unkno
   const severityLabel = normalized(detail.severity);
   const likelihoodLabel = normalized(detail.likelihood).replace(/ /g, '-');
   const blockingFlag = truthy(detail.blocking);
-  const closed = ['resolved', 'closed', 'complete', 'completed', 'superseded', 'rejected', 'ratified', 'agreed', 'agreed in principle', 'accepted'].includes(normalized(state.status));
+  const closed = ['resolved', 'closed', 'complete', 'completed', 'superseded', 'rejected', 'ratified', 'agreed', 'agreed in principle', 'accepted', 'cancelled', 'mitigated', 'achieved', 'missed', 'applied', 'verified', 'reverted'].includes(normalized(state.status));
   const due = state.due_date && /^\d{4}-\d{2}-\d{2}$/.test(state.due_date) ? state.due_date : null;
   // Every time input below derives from the explicit as-of `timestamp` (C5).
   const asOfMs = new Date(timestamp).valueOf();
@@ -900,10 +927,17 @@ export function validateOccurredAt(value: unknown, now: string): OccurredAtCheck
   return { ok: true, occurredAt: instant.toISOString() };
 }
 
-export function recordRegisterEvent(db: DatabaseSync, projectId: string, externalRegisterId: string, input: { actor: string; eventType: string; field?: string | null; newValue?: string | null; reason: string; evidenceRef?: string | null; occurredAt?: string }) {
+export function recordRegisterEvent(db: DatabaseSync, projectId: string, externalRegisterId: string, input: { actor: string; eventType: string; field?: string | null; newValue?: string | null; reason: string; evidenceRef?: string | null; occurredAt?: string; origin?: 'human' | 'system' }) {
   const row = db.prepare('SELECT id, register_name, title, summary FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(projectId, externalRegisterId) as Record<string, unknown> | undefined;
   if (!row) throw new Error('Register row not found.');
   const register = String(row.register_name);
+  // A standalone note is a record that carries no field mutation by
+  // definition. Refusing one that also names a field, rather than silently
+  // ignoring the field, keeps "note" a safe, reviewable guarantee rather than
+  // a convention someone could accidentally violate.
+  if (input.eventType === 'note' && (input.field || input.newValue)) {
+    throw new Error('A note event cannot also carry a field or newValue; record the field correction as a separate event.');
+  }
   // N2 — a field the projector cannot reach must not be recorded at all. The
   // event log is append-only, so an unprojectable event is permanent, inert,
   // and still able to block future extracted updates to that field.
@@ -926,8 +960,8 @@ export function recordRegisterEvent(db: DatabaseSync, projectId: string, externa
           : readTypedDetails(db, register, String(row.id))[input.field] ?? null;
   db.exec('BEGIN IMMEDIATE;');
   try {
-    db.prepare('INSERT INTO register_row_events (id, project_id, external_register_id, occurred_at, actor, event_type, field, previous_value, new_value, reason, evidence_ref, source_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)')
-      .run(randomUUID(), projectId, externalRegisterId, occurredAt, input.actor, input.eventType, input.field ?? null, previous === null || previous === undefined ? null : String(previous), input.newValue ?? null, input.reason, input.evidenceRef ?? null);
+    db.prepare('INSERT INTO register_row_events (id, project_id, external_register_id, occurred_at, actor, event_type, field, previous_value, new_value, reason, evidence_ref, source_id, origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)')
+      .run(randomUUID(), projectId, externalRegisterId, occurredAt, input.actor, input.eventType, input.field ?? null, previous === null || previous === undefined ? null : String(previous), input.newValue ?? null, input.reason, input.evidenceRef ?? null, input.origin ?? 'human');
     db.prepare('INSERT INTO project_register_revisions (project_id, revision, updated_at) VALUES (?, 1, ?) ON CONFLICT(project_id) DO UPDATE SET revision = revision + 1, updated_at = excluded.updated_at').run(projectId, occurredAt);
     rebuildProjection(db, projectId, occurredAt);
     db.prepare('UPDATE consultant_briefs SET stale = 1 WHERE project_id = ?').run(projectId);
@@ -946,6 +980,6 @@ export function readRowEvidence(db: DatabaseSync, projectId: string, externalReg
   const events = db.prepare('SELECT * FROM register_row_events WHERE project_id = ? AND external_register_id = ? ORDER BY occurred_at DESC, rowid DESC').all(projectId, externalRegisterId) as Array<Record<string, unknown>>;
   return {
     anchors: anchors.map((row) => ({ id: String(row.id), sourceId: String(row.source_id), segmentId: String(row.segment_id), speaker: row.speaker ? String(row.speaker) : null, tMs: row.t_ms === null ? null : Number(row.t_ms), quote: row.quote ? String(row.quote) : null, verified: row.verified === 1 })),
-    events: events.map((row) => ({ id: String(row.id), occurredAt: String(row.occurred_at), actor: String(row.actor), eventType: String(row.event_type), field: row.field ? String(row.field) : null, previousValue: row.previous_value ? String(row.previous_value) : null, newValue: row.new_value ? String(row.new_value) : null, reason: String(row.reason), evidenceRef: row.evidence_ref ? String(row.evidence_ref) : null })),
+    events: events.map((row) => ({ id: String(row.id), occurredAt: String(row.occurred_at), actor: String(row.actor), eventType: String(row.event_type), field: row.field ? String(row.field) : null, previousValue: row.previous_value ? String(row.previous_value) : null, newValue: row.new_value ? String(row.new_value) : null, reason: String(row.reason), evidenceRef: row.evidence_ref ? String(row.evidence_ref) : null, origin: (row.origin ? String(row.origin) : 'human') as 'source' | 'human' | 'system' })),
   };
 }

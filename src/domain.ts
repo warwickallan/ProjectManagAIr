@@ -243,6 +243,8 @@ export const registerEventSchema = z.object({
   newValue: z.string().nullable(),
   reason: z.string().min(1),
   evidenceRef: z.string().nullable(),
+  /** Who produced this event: the product UI, a source-extraction apply, or a future automated writer. */
+  origin: z.enum(['source', 'human', 'system']).default('human'),
 });
 
 export const registerCurrentStateSchema = z.object({

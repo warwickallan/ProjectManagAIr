@@ -109,6 +109,8 @@ const statusTone: Record<string, string> = {
   // Source-intake processing states (migration 011). `quarantined` used to have no
   // tone at all because the schema did not admit it.
   quarantined: 'bad', rejected: 'bad', awaiting_processing: 'watch', processing: 'info', awaiting_review: 'watch', archived: 'neutral',
+  // Human register-event statuses (015).
+  applied: 'good', mitigated: 'watch', cancelled: 'neutral', reverted: 'neutral', resolved: 'good', ratified: 'good', parked: 'watch', superseded: 'neutral',
 };
 
 export function StatusChip({ value, label }: { value: string; label?: string }) {
@@ -285,4 +287,12 @@ export function humanize(value: string): string {
 
 function activityGlyph(type: ActivityEvent['eventType']): string {
   return ({ progress: 'UP', decision: 'OK', risk: '!', milestone: 'MS', ai: 'AI' } as const)[type];
+}
+
+/** The one `fetch` wrapper every command action in the Cockpit posts through. */
+export async function postJson<T = unknown>(url: string, method: 'POST', body: unknown): Promise<T> {
+  const response = await fetch(url, { method, headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body) });
+  const data = (await response.json().catch(() => null)) as T | { error?: string } | null;
+  if (!response.ok) throw new Error((data as { error?: string } | null)?.error ?? `Request failed with ${response.status}`);
+  return data as T;
 }

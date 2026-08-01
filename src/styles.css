@@ -383,6 +383,12 @@ select.input { appearance: auto; }
 .drawer-details { margin-top: 14px; padding: 11px; border: 1px solid #e7eaf0; border-radius: 8px; }
 .drawer-details[open] summary { margin-bottom: 10px; }
 
+.register-update { padding: 12px 14px; margin: 4px 0 14px; border: 1px solid #e5e9f0; border-radius: 8px; background: #fbfcfe; }
+.update-form { margin-top: 10px; display: grid; gap: 8px; }
+.update-form label { font-size: 8px; text-transform: uppercase; letter-spacing: .04em; color: var(--subtle); }
+.update-form-value input { max-width: 260px; }
+.event-timeline .status-chip { margin: 0 8px; }
+
 @media (max-width: 900px) {
   .mode-selector { grid-template-columns: 1fr; }
   .mode-card { min-height: 0; }

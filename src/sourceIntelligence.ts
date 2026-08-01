@@ -1039,7 +1039,7 @@ function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode:
   const targetId = op.target_external_id ? String(op.target_external_id) : null;
   if (['conflict', 'unverified_link', 'possible_duplicate'].includes(String(op.op))) throw new Error(`${op.op} requires adjudication and cannot be applied directly.`);
   if (op.op === 'reaffirm' && targetId) {
-    db.prepare('INSERT INTO register_row_events (id, project_id, external_register_id, occurred_at, actor, event_type, field, previous_value, new_value, reason, evidence_ref, source_id) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)')
+    db.prepare("INSERT INTO register_row_events (id, project_id, external_register_id, occurred_at, actor, event_type, field, previous_value, new_value, reason, evidence_ref, source_id, origin) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, 'source')")
       .run(randomUUID(), context.projectId, targetId, context.timestamp, String(op.reviewer ?? 'reviewer'), 'reaffirm', 'Source reaffirmed the existing record.', context.packetId, context.sourceId);
     return targetId;
   }
