@@ -349,6 +349,12 @@ select.input { appearance: auto; }
 .review-lane { padding: 14px; border: 1px solid #e4e8ef; border-radius: 9px; background: #fbfcfd; }
 .review-lane h5 { margin: 0; color: #2b3850; font-size: 12px; }
 .review-lane header p { margin: 4px 0 0; color: var(--muted); font-size: 9px; }
+.source-reconciliation { display: grid; gap: 14px; margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line); }
+.reconciliation-source { display: grid; gap: 12px; padding: 16px; border: 1px solid #dfe5ee; border-radius: 11px; background: #fff; }
+.reconciliation-group { padding: 12px; border: 1px solid #e4e8ef; border-radius: 9px; background: #fbfcfd; }
+.reconciliation-group h5 { margin: 0 0 8px; color: #2b3850; font-size: 11px; }
+.reconciliation-group h5 span { color: var(--subtle); font-weight: 400; }
+.reconciliation-row .inline-details { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .review-lane header > span { padding: 3px 7px; border-radius: 99px; background: #edf1f7; color: #59677e; font-size: 8px; font-weight: 750; text-transform: uppercase; }
 .addition-list, .operation-list { display: grid; gap: 7px; margin: 12px 0; }
 .operation-summary { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 9px 10px; border-radius: 7px; background: #fff; }

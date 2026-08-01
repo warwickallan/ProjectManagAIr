@@ -419,6 +419,7 @@ function ProjectInbox({ projectId, userId, sources, proposals, sourceIntelligenc
     {message ? <p className="inline-note">{message}</p> : null}{error ? <p className="form-error" role="alert">{error}</p> : null}
     <SourceProcessingAlerts sources={sources} />
     {sourceIntelligence ? <ReviewLanes projectId={projectId} userId={userId} intelligence={sourceIntelligence} onChanged={onChanged} /> : null}
+    {sourceIntelligence && sourceIntelligence.changesets.length ? <SourceReconciliation intelligence={sourceIntelligence} /> : null}
     {proposals.length ? <details className="legacy-proposals"><summary>Legacy source proposals ({proposals.length})</summary><div className="stacked-records">{proposals.map((proposal) => <article className="stacked-record" key={proposal.id}><div className="record-line"><div><h3>{proposal.payload.sourceMetadata.originalFileName}</h3><p>{proposal.payload.items.length} legacy proposed item(s)</p></div><StatusChip value={proposal.status} /></div><ul className="proposal-list">{proposal.payload.items.map((item) => <li key={item.id}><strong>{humanize(item.type)}</strong><span>{item.title}</span></li>)}</ul>{proposal.status === 'proposed' ? <p className="inline-note">Read-only historical proposal. Use governed changesets for review and apply.</p> : null}</article>)}</div></details> : null}
     <h3 className="subhead">Sources</h3><SourceList projectId={projectId} userId={userId} sources={sources} onChanged={onChanged} />
   </Section>;
@@ -426,6 +427,89 @@ function ProjectInbox({ projectId, userId, sources, proposals, sourceIntelligenc
 
 function ReviewLanes({ projectId, userId, intelligence, onChanged }: { projectId: string; userId: string; intelligence: SourceIntelligence; onChanged: () => void }) {
   return <div className="source-intelligence-review"><div className="review-heading"><div><p className="section-kicker">Source Intelligence</p><h3>Governed review lanes</h3></div><span>{intelligence.changesets.length} changesets / {intelligence.sources.length} normalised sources</span></div><SourceMetrics sources={intelligence.sources} />{intelligence.changesets.length === 0 ? <EmptyState>No Source Intelligence changesets are waiting.</EmptyState> : intelligence.changesets.map((changeset) => <ChangesetReview key={changeset.id} projectId={projectId} userId={userId} changeset={changeset} onChanged={onChanged} />)}</div>;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Goal 4 — Source Reconciliation. A read-only, per-source review surface
+ * grouping every operation a processed source proposed into the outcomes a
+ * human actually needs to check: new records, updates, questions it answers,
+ * decisions it reaffirms, records it supersedes, contradictions and
+ * uncertainties it introduces, and rejected proposals. Built entirely from
+ * data the changeset/operation model already carries — no parallel store —
+ * so an operation can legitimately appear under more than one heading (an
+ * Action update that also answers an open question shows in both).
+ * ------------------------------------------------------------------------- */
+
+type ReconciliationGroupKey = 'new' | 'update' | 'answered' | 'actionsChanged' | 'reaffirmedDecision' | 'superseded' | 'contradiction' | 'uncertainty' | 'unchanged' | 'rejected';
+
+const RECONCILIATION_GROUPS: Array<[ReconciliationGroupKey, string]> = [
+  ['new', 'New records'],
+  ['update', 'Updates'],
+  ['answered', 'Questions answered / closed'],
+  ['actionsChanged', 'Actions completed or changed'],
+  ['reaffirmedDecision', 'Decisions reaffirmed'],
+  ['superseded', 'Records superseded'],
+  ['contradiction', 'Contradictions introduced'],
+  ['uncertainty', 'Uncertainties introduced'],
+  ['unchanged', 'Unchanged / reaffirmed matters'],
+  ['rejected', 'Rejected proposed changes'],
+];
+
+function operationGroups(operation: ChangeOperation): ReconciliationGroupKey[] {
+  const groups: ReconciliationGroupKey[] = [];
+  const answers = Array.isArray(operation.proposedRow.answers) ? (operation.proposedRow.answers as unknown[]) : [];
+  if (operation.status === 'rejected') groups.push('rejected');
+  if (operation.op === 'add') groups.push('new');
+  if (operation.op === 'update') groups.push('update');
+  if (operation.op === 'resolve' || answers.length > 0) groups.push('answered');
+  if (operation.registerName === 'Actions' && (operation.op === 'update' || operation.op === 'resolve')) groups.push('actionsChanged');
+  if (operation.registerName === 'Decisions' && operation.op === 'reaffirm') groups.push('reaffirmedDecision');
+  if (operation.op === 'supersede') groups.push('superseded');
+  if (operation.op === 'conflict') groups.push('contradiction');
+  if (operation.op === 'unverified_link' || operation.op === 'possible_duplicate' || operation.registerName === 'Uncertainty') groups.push('uncertainty');
+  if (operation.op === 'reaffirm') groups.push('unchanged');
+  return groups;
+}
+
+function SourceReconciliation({ intelligence }: { intelligence: SourceIntelligence }) {
+  return <section className="source-reconciliation"><header><div><p className="section-kicker">Source Reconciliation</p><h3>What each processed source changed</h3></div></header>
+    {intelligence.changesets.map((changeset) => {
+      const source = intelligence.sources.find((candidate) => candidate.id === changeset.sourceId);
+      const byGroup = new Map<ReconciliationGroupKey, ChangeOperation[]>();
+      for (const operation of changeset.operations) for (const group of operationGroups(operation)) byGroup.set(group, [...(byGroup.get(group) ?? []), operation]);
+      if (byGroup.size === 0) return null;
+      return <article className="reconciliation-source" key={changeset.id}>
+        <div className="record-line"><div><h4>{source?.originalFileName ?? changeset.sourceId}</h4><p>{source?.eventDate ? `Meeting date ${formatDate(source.eventDate)}` : 'No meeting date recorded'} / processed {formatDateTime(changeset.createdAt)}</p></div><StatusChip value={changeset.reviewStatus} /></div>
+        {RECONCILIATION_GROUPS.filter(([key]) => byGroup.has(key)).map(([key, label]) => <div className="reconciliation-group" key={key}>
+          <h5>{label} <span>({byGroup.get(key)!.length})</span></h5>
+          <div className="stacked-records">{byGroup.get(key)!.map((operation) => <ReconciliationRow key={`${key}:${operation.id}`} operation={operation} source={source} />)}</div>
+        </div>)}
+      </article>;
+    })}
+  </section>;
+}
+
+function ReconciliationRow({ operation, source }: { operation: ChangeOperation; source?: SourceDocumentSummary }) {
+  const before = (operation.fieldDiff.before ?? null) as JsonRecord | null;
+  const after = (operation.fieldDiff.after ?? null) as JsonRecord | null;
+  const stateOf = (value: JsonRecord | null) => value ? String(value.title ?? value.summary ?? value.status ?? '—') : '—';
+  const relatedIds = [
+    ...(Array.isArray(operation.proposedRow.answers) ? (operation.proposedRow.answers as unknown[]).map((id) => `answers ${String(id)}`) : []),
+    ...(Array.isArray(operation.proposedRow.supersedes) ? (operation.proposedRow.supersedes as unknown[]).map((id) => `supersedes ${String(id)}`) : []),
+    ...(typeof operation.fieldDiff.duplicateOf === 'string' ? [`possible duplicate of ${operation.fieldDiff.duplicateOf}`] : []),
+  ];
+  return <article className="stacked-record reconciliation-row">
+    <div className="record-line"><div><strong>{operation.targetExternalId ?? operation.allocatedExternalId ?? 'New record'}</strong><span>{humanize(operation.registerName)} / {humanize(operation.op)}</span></div><StatusChip value={operation.status === 'pending' ? 'pending' : operation.status} /></div>
+    <dl className="inline-details">
+      <div><dt>Previous state</dt><dd>{stateOf(before)}</dd></div>
+      <div><dt>New state</dt><dd>{stateOf(after)}</dd></div>
+      <div><dt>Source</dt><dd>{source?.originalFileName ?? operation.clientRef}{source?.eventDate ? ` / ${formatDate(source.eventDate)}` : ''}</dd></div>
+      <div><dt>Evidence anchors</dt><dd>{operation.anchors.length}</dd></div>
+      <div><dt>Confidence</dt><dd>{operation.confidence}</dd></div>
+      <div><dt>Review status</dt><dd>{operation.status}{operation.reviewer ? ` by ${operation.reviewer}` : ''}</dd></div>
+    </dl>
+    {relatedIds.length ? <p className="inline-note">{relatedIds.join(' / ')}</p> : null}
+  </article>;
 }
 
 function SourceMetrics({ sources }: { sources: SourceDocumentSummary[] }) {
