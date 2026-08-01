@@ -1430,7 +1430,19 @@ export function readRunsForSkillVersion(db: DatabaseSync, skillId: string, versi
   const briefs = db.prepare(`SELECT id, project_id, provider_id, model_label, status, created_at, prompt_sha256, skill_sha256
     FROM consultant_brief_runs WHERE skill_id = ? AND skill_version = ? ORDER BY created_at DESC LIMIT ?`)
     .all(skillId, version, limit) as Array<Record<string, unknown>>;
+  // The third model-calling subsystem. Omitting it made the Settings panel
+  // report zero recorded uses for a revision that had genuinely produced a run,
+  // which is precisely the "published on intent rather than evidence" problem
+  // run provenance exists to prevent.
+  const reasoning = db.prepare(`SELECT id, project_id, provider_id, model_label, status, created_at, prompt_sha256, skill_sha256
+    FROM consultant_reasoning_runs WHERE skill_id = ? AND skill_version = ? ORDER BY created_at DESC LIMIT ?`)
+    .all(skillId, version, limit) as Array<Record<string, unknown>>;
   const combined: SkillVersionRunSummary[] = [
+    ...reasoning.map((row) => ({
+      runId: String(row.id), kind: 'consultant-reasoning' as const, projectId: row.project_id ? String(row.project_id) : null, sourceId: null,
+      providerId: String(row.provider_id), modelLabel: String(row.model_label), status: String(row.status), startedAt: String(row.created_at),
+      promptSha256: String(row.prompt_sha256), skillSha256: row.skill_sha256 ? String(row.skill_sha256) : '',
+    })),
     ...extraction.map((row) => ({
       runId: String(row.id), kind: 'extraction' as const, projectId: row.project_id ? String(row.project_id) : null, sourceId: row.source_id ? String(row.source_id) : null,
       providerId: String(row.provider_id), modelLabel: String(row.model_label), status: String(row.status), startedAt: String(row.started_at),
@@ -1448,7 +1460,8 @@ export function readRunsForSkillVersion(db: DatabaseSync, skillId: string, versi
 function usageCount(db: DatabaseSync, skillId: string, version: string): number {
   const extraction = db.prepare('SELECT count(*) count FROM extraction_runs WHERE skill_id = ? AND skill_version = ?').get(skillId, version) as { count: number };
   const briefs = db.prepare('SELECT count(*) count FROM consultant_brief_runs WHERE skill_id = ? AND skill_version = ?').get(skillId, version) as { count: number };
-  return Number(extraction.count) + Number(briefs.count);
+  const reasoning = db.prepare('SELECT count(*) count FROM consultant_reasoning_runs WHERE skill_id = ? AND skill_version = ?').get(skillId, version) as { count: number };
+  return Number(extraction.count) + Number(briefs.count) + Number(reasoning.count);
 }
 
 /* ------------------------------------------------------------------------------------ *

@@ -92,7 +92,7 @@ describe('the managed catalogue', () => {
     const { db } = fixture();
     const catalogue = readSkillCatalogue(db);
     const ids = catalogue.map((entry) => entry.skillId).sort();
-    expect(ids).toEqual(['completeness-challenge', 'consultant-brief', 'global-reconciliation', 'source-comprehension', 'source-extraction']);
+    expect(ids).toEqual(['completeness-challenge', 'consultant-brief', 'consultant-reasoning', 'global-reconciliation', 'source-comprehension', 'source-extraction']);
 
     for (const entry of catalogue) {
       expect(entry.name.length).toBeGreaterThan(0);
@@ -123,23 +123,23 @@ describe('uploading a revision', () => {
     const { db } = fixture();
     const before = readSkillRevisions(db, DEFAULT_EXTRACTION_SKILL_ID).find((entry) => entry.status === 'active')!;
 
-    const result = uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0', status: 'active' }), actor: 'Warwick' });
+    const result = uploadSkillDraft(db, { text: draftDocument({ version: '3.0.0', status: 'active' }), actor: 'Warwick' });
     expect(result.status).toBe('draft');
 
     const after = readSkillRevisions(db, DEFAULT_EXTRACTION_SKILL_ID);
     // The document declared `active`. It is still a draft, and the published
     // pointer has not moved.
-    expect(after.find((entry) => entry.version === '2.1.0')!.status).toBe('draft');
+    expect(after.find((entry) => entry.version === '3.0.0')!.status).toBe('draft');
     expect(after.find((entry) => entry.status === 'active')!.version).toBe(before.version);
   });
 
   it('refuses to overwrite a version that already exists, and never touches its file', () => {
     const { db, registryDir } = fixture();
-    uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0', extra: 'ORIGINAL BODY MARKER' }), actor: 'Warwick' });
-    const file = path.join(registryDir, DEFAULT_EXTRACTION_SKILL_ID, '2.1.0.md');
+    uploadSkillDraft(db, { text: draftDocument({ version: '3.0.0', extra: 'ORIGINAL BODY MARKER' }), actor: 'Warwick' });
+    const file = path.join(registryDir, DEFAULT_EXTRACTION_SKILL_ID, '3.0.0.md');
     const original = readFileSync(file, 'utf8');
 
-    expect(() => uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0', extra: 'REPLACEMENT BODY MARKER' }), actor: 'Warwick' }))
+    expect(() => uploadSkillDraft(db, { text: draftDocument({ version: '3.0.0', extra: 'REPLACEMENT BODY MARKER' }), actor: 'Warwick' }))
       .toThrow(/already registered|already exists/i);
     expect(readFileSync(file, 'utf8')).toBe(original);
   });
@@ -151,8 +151,8 @@ describe('uploading a revision', () => {
       ['no front matter at all', /front matter fence/i],
       [draftDocument({ version: '2.1' }), /major\.minor\.patch/i],
       [draftDocument({ version: '1.0.0' }), /must increase/i],
-      [draftDocument({ version: '2.1.0', promptTemplateVersion: 'source-extraction-prompt-v2' }).replace('Return one JSON object with rows, windowCoverage and categoryCoverage.\nEvery element of rows carries client_ref and anchors.', 'Just do your best.'), /required contract elements/i],
-      [draftDocument({ version: '2.1.0' }).replace('notes: Synthetic revision for tests.', 'unknownKey: nope'), /Unknown front matter key|missing "notes"/i],
+      [draftDocument({ version: '3.0.0', promptTemplateVersion: 'source-extraction-prompt-v2' }).replace('Return one JSON object with rows, windowCoverage and categoryCoverage.\nEvery element of rows carries client_ref and anchors.', 'Just do your best.'), /required contract elements/i],
+      [draftDocument({ version: '3.0.0' }).replace('notes: Synthetic revision for tests.', 'unknownKey: nope'), /Unknown front matter key|missing "notes"/i],
     ];
     for (const [text, expected] of cases) {
       const validation = validateSkillDraft(db, { text });
@@ -161,7 +161,7 @@ describe('uploading a revision', () => {
       expect(() => uploadSkillDraft(db, { text, actor: 'Warwick' })).toThrow();
     }
     // Nothing was registered by any of the rejected attempts.
-    expect(readSkillRevisions(db, DEFAULT_EXTRACTION_SKILL_ID).map((entry) => entry.version)).toEqual(['2.0.0']);
+    expect(readSkillRevisions(db, DEFAULT_EXTRACTION_SKILL_ID).map((entry) => entry.version)).toEqual(['2.0.0', '2.9.0']);
   });
 
   it('validates identically whether the operator presses Validate or Upload', () => {
@@ -178,14 +178,14 @@ describe('uploading a revision', () => {
 describe('publishing, rollback, retirement and pinning', () => {
   it('publishes by moving a pointer, leaving both revisions and all history intact', () => {
     const { db } = fixture();
-    uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0' }), actor: 'Warwick' });
+    uploadSkillDraft(db, { text: draftDocument({ version: '3.0.0' }), actor: 'Warwick' });
     const beforeBody = readSkillRevisionBody(db, DEFAULT_EXTRACTION_SKILL_ID, '2.0.0');
 
-    const promotion = promoteSkillRevision(db, { version: '2.1.0', actor: 'Warwick', note: 'Test publication.' });
+    const promotion = promoteSkillRevision(db, { version: '3.0.0', actor: 'Warwick', note: 'Test publication.' });
     expect(promotion.previousActiveVersion).toBe('2.0.0');
 
     const revisions = readSkillRevisions(db, DEFAULT_EXTRACTION_SKILL_ID);
-    expect(revisions.find((entry) => entry.version === '2.1.0')!.status).toBe('active');
+    expect(revisions.find((entry) => entry.version === '3.0.0')!.status).toBe('active');
     expect(revisions.find((entry) => entry.version === '2.0.0')!.status).toBe('retired');
     // The superseded revision is still readable, byte for byte. Publication is
     // not deletion.
@@ -194,12 +194,12 @@ describe('publishing, rollback, retirement and pinning', () => {
 
   it('rolls back to the previously published version and refuses to smuggle an untested one in', () => {
     const { db } = fixture();
-    uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0' }), actor: 'Warwick' });
-    uploadSkillDraft(db, { text: draftDocument({ version: '2.2.0' }), actor: 'Warwick' });
-    promoteSkillRevision(db, { version: '2.1.0', actor: 'Warwick' });
+    uploadSkillDraft(db, { text: draftDocument({ version: '3.0.0' }), actor: 'Warwick' });
+    uploadSkillDraft(db, { text: draftDocument({ version: '3.1.0' }), actor: 'Warwick' });
+    promoteSkillRevision(db, { version: '3.0.0', actor: 'Warwick' });
 
-    // 2.2.0 has never been active, so rollback is not a route into production.
-    expect(() => rollbackSkillRevision(db, { toVersion: '2.2.0', actor: 'Warwick' })).toThrow(/never been active/i);
+    // 3.1.0 has never been active, so rollback is not a route into production.
+    expect(() => rollbackSkillRevision(db, { toVersion: '3.1.0', actor: 'Warwick' })).toThrow(/never been active/i);
 
     rollbackSkillRevision(db, { toVersion: '2.0.0', actor: 'Warwick' });
     expect(readSkillRevisions(db, DEFAULT_EXTRACTION_SKILL_ID).find((entry) => entry.status === 'active')!.version).toBe('2.0.0');
@@ -208,22 +208,22 @@ describe('publishing, rollback, retirement and pinning', () => {
   it('refuses to retire the published revision, and refuses to retire one a project is pinned to', () => {
     const { db } = fixture();
     const projectId = seedProject(db);
-    uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0' }), actor: 'Warwick' });
+    uploadSkillDraft(db, { text: draftDocument({ version: '3.0.0' }), actor: 'Warwick' });
 
     expect(() => retireSkillRevision(db, { version: '2.0.0', actor: 'Warwick' })).toThrow(/active revision/i);
 
-    pinProjectSkill(db, { projectId, version: '2.1.0', actor: 'Warwick' });
-    expect(() => retireSkillRevision(db, { version: '2.1.0', actor: 'Warwick' })).toThrow(/pinned/i);
+    pinProjectSkill(db, { projectId, version: '3.0.0', actor: 'Warwick' });
+    expect(() => retireSkillRevision(db, { version: '3.0.0', actor: 'Warwick' })).toThrow(/pinned/i);
   });
 
   it('honours a project pin over the published version', () => {
     const { db } = fixture();
     const projectId = seedProject(db);
-    uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0', extra: 'PINNED REVISION MARKER' }), actor: 'Warwick' });
-    pinProjectSkill(db, { projectId, version: '2.1.0', actor: 'Warwick' });
+    uploadSkillDraft(db, { text: draftDocument({ version: '3.0.0', extra: 'PINNED REVISION MARKER' }), actor: 'Warwick' });
+    pinProjectSkill(db, { projectId, version: '3.0.0', actor: 'Warwick' });
 
     const resolved = resolveSkillForRun(db, projectId);
-    expect(resolved.version).toBe('2.1.0');
+    expect(resolved.version).toBe('3.0.0');
     expect(resolved.pinned).toBe(true);
     expect(resolved.text).toContain('PINNED REVISION MARKER');
 
@@ -238,14 +238,14 @@ describe('publishing, rollback, retirement and pinning', () => {
 describe('version comparison', () => {
   it('reports the material text change between two revisions in both directions', () => {
     const { db } = fixture();
-    uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0', extra: 'A BRAND NEW INSTRUCTION LINE' }), actor: 'Warwick' });
+    uploadSkillDraft(db, { text: draftDocument({ version: '3.0.0', extra: 'A BRAND NEW INSTRUCTION LINE' }), actor: 'Warwick' });
 
-    const forward = compareSkillRevisions(db, DEFAULT_EXTRACTION_SKILL_ID, '2.0.0', '2.1.0');
+    const forward = compareSkillRevisions(db, DEFAULT_EXTRACTION_SKILL_ID, '2.0.0', '3.0.0');
     expect(forward.identical).toBe(false);
     expect(forward.addedLines).toBeGreaterThan(0);
     expect(forward.diff.some((line) => line.kind === 'added' && line.text.includes('A BRAND NEW INSTRUCTION LINE'))).toBe(true);
 
-    const reverse = compareSkillRevisions(db, DEFAULT_EXTRACTION_SKILL_ID, '2.1.0', '2.0.0');
+    const reverse = compareSkillRevisions(db, DEFAULT_EXTRACTION_SKILL_ID, '3.0.0', '2.0.0');
     expect(reverse.removedLines).toBe(forward.addedLines);
     expect(reverse.addedLines).toBe(forward.removedLines);
 
@@ -413,12 +413,12 @@ describe('a prompt revision cannot reach the safety contract', () => {
 describe('registry integrity', () => {
   it('refuses to serve a revision whose file has been rewritten in place', () => {
     const { db, registryDir } = fixture();
-    uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0' }), actor: 'Warwick' });
-    const file = path.join(registryDir, DEFAULT_EXTRACTION_SKILL_ID, '2.1.0.md');
+    uploadSkillDraft(db, { text: draftDocument({ version: '3.0.0' }), actor: 'Warwick' });
+    const file = path.join(registryDir, DEFAULT_EXTRACTION_SKILL_ID, '3.0.0.md');
     writeFileSync(file, `${readFileSync(file, 'utf8')}\nTAMPERED LINE`, 'utf8');
 
-    expect(() => readSkillRevisionBody(db, DEFAULT_EXTRACTION_SKILL_ID, '2.1.0')).toThrow(/rewritten in place/i);
-    const catalogueVersion = readSkillCatalogue(db).find((entry) => entry.skillId === DEFAULT_EXTRACTION_SKILL_ID)!.versions.find((version) => version.version === '2.1.0')!;
+    expect(() => readSkillRevisionBody(db, DEFAULT_EXTRACTION_SKILL_ID, '3.0.0')).toThrow(/rewritten in place/i);
+    const catalogueVersion = readSkillCatalogue(db).find((entry) => entry.skillId === DEFAULT_EXTRACTION_SKILL_ID)!.versions.find((version) => version.version === '3.0.0')!;
     expect(catalogueVersion.bodyAvailable).toBe(false);
     expect(catalogueVersion.bodyIssue).toMatch(/rewritten in place/i);
   });
@@ -454,24 +454,24 @@ describe('regressions found by adversarial review', () => {
     // `buildStructuredExtractionPrompt` throws on an unknown template version, so
     // publishing one breaks every extraction with an error that names the
     // template rather than the publication that caused it.
-    const validation = validateSkillDraft(db, { text: draftDocument({ version: '2.1.0', promptTemplateVersion: 'source-extraction-prompt-v99' }) });
+    const validation = validateSkillDraft(db, { text: draftDocument({ version: '3.0.0', promptTemplateVersion: 'source-extraction-prompt-v99' }) });
     expect(validation.ok).toBe(false);
     expect(validation.errors.join(' ')).toMatch(/not implemented by this build/i);
-    expect(() => uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0', promptTemplateVersion: 'source-extraction-prompt-v99' }), actor: 'Warwick' })).toThrow();
+    expect(() => uploadSkillDraft(db, { text: draftDocument({ version: '3.0.0', promptTemplateVersion: 'source-extraction-prompt-v99' }), actor: 'Warwick' })).toThrow();
   });
 
   it('does not let one machine-wide upload directory leak into a caller that named its own', () => {
     const shared = temporaryDirectory();
     const { db } = fixture();
-    uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0' }), actor: 'Warwick', options: { externalDir: null, uploadDir: shared } });
+    uploadSkillDraft(db, { text: draftDocument({ version: '3.0.0' }), actor: 'Warwick', options: { externalDir: null, uploadDir: shared } });
 
     // A caller that names its directories is asserting exactly which are in
     // play. Adding a machine-global one behind its back made one database's
     // upload visible to every other database on the host.
     const isolated = loadSkillRegistry({ externalDir: null });
-    expect(isolated.some((asset) => asset.version === '2.1.0')).toBe(false);
+    expect(isolated.some((asset) => asset.version === '3.0.0')).toBe(false);
     const including = loadSkillRegistry({ externalDir: null, uploadDir: shared });
-    expect(including.some((asset) => asset.version === '2.1.0')).toBe(true);
+    expect(including.some((asset) => asset.version === '3.0.0')).toBe(true);
   });
 
   it('refuses to follow a symlink planted at the upload destination', () => {
@@ -480,9 +480,9 @@ describe('regressions found by adversarial review', () => {
     const uploadDir = path.join(temporaryDirectory(), 'uploads');
     mkdirSync(path.join(uploadDir, DEFAULT_EXTRACTION_SKILL_ID), { recursive: true });
     const target = path.join(decoy, 'redirected.md');
-    symlinkSync(target, path.join(uploadDir, DEFAULT_EXTRACTION_SKILL_ID, '2.1.0.md'));
+    symlinkSync(target, path.join(uploadDir, DEFAULT_EXTRACTION_SKILL_ID, '3.0.0.md'));
 
-    expect(() => uploadSkillDraft(db, { text: draftDocument({ version: '2.1.0' }), actor: 'Warwick', options: { externalDir: null, uploadDir } })).toThrow();
+    expect(() => uploadSkillDraft(db, { text: draftDocument({ version: '3.0.0' }), actor: 'Warwick', options: { externalDir: null, uploadDir } })).toThrow();
     expect(existsSync(target)).toBe(false);
   });
 });
