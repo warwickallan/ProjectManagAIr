@@ -250,14 +250,21 @@ describe('Goal 5 — second-transcript acceptance (deterministic phase)', () => 
 
       // The question now exists in the register. A follow-up pass over source
       // B links it to A's already-applied decision (the answers relationship
-      // — Goal 4). Modelled as its own small packet/changeset rather than
-      // wedged into B's first packet: `Decisions` is processed before
-      // `Open_Questions` in every packet's fixed category order, so an
-      // answers-link from a Decisions op can only resolve a question that
-      // already exists in the register — never one created in the very same
-      // packet. This mirrors a real follow-up correction pass, which is
-      // exactly what Goal 4 anticipates ("was this AI-proposed or human-
-      // confirmed") rather than a same-packet shortcut.
+      // — Goal 4).
+      //
+      // This is the CROSS-SOURCE case and it is genuinely a second pass: the
+      // question and the decision came from two different meetings, so no
+      // single packet could ever have contained both. It is deliberately kept
+      // as its own small packet/changeset because that is what really happens
+      // — a later correction pass, or a human confirming the link once both
+      // sides exist.
+      //
+      // The same-SOURCE case no longer needs a second pass. A question raised
+      // and answered in ONE meeting now links inside one packet, one
+      // changeset and one provider call: `applyReviewedChangeset` allocates
+      // every durable row before resolving any relationship, so register
+      // category order no longer decides whether a target exists. That is
+      // proved separately in `tests/packetInternalRelationships.test.ts`.
       const questionExternalId = String((db.prepare("SELECT external_register_id FROM project_register_rows WHERE project_id = ? AND register_name = 'Open_Questions'").get(project.projectId) as { external_register_id: string }).external_register_id);
       const sourceBRegisterId = String((db.prepare("SELECT external_register_id FROM project_register_rows WHERE project_id = ? AND register_name = 'Sources' AND source_id = ?").get(project.projectId, intakeB.sourceId) as { external_register_id: string }).external_register_id);
       const linkRunId = trustedRun(db, project.projectId, intakeB.sourceId);

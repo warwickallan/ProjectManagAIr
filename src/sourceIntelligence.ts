@@ -568,6 +568,28 @@ export function validatePacket(db: DatabaseSync, rawPacket: unknown, options: Va
   const anchoredSegmentsByRef = new Map<string, number[]>();
   const sourceParticipants = source ? (JSON.parse(String(source.participants_json ?? '[]')) as string[]) : [];
 
+  // Packet-internal relationship resolution (two-phase, phase 0).
+  //
+  // A packet is a single statement about a single source, so a relationship it
+  // asserts between two rows it is itself creating is an ordinary, expected
+  // case — one meeting can raise a question and answer it twenty minutes
+  // later. Register categories are applied in a fixed order
+  // (`registerNames`), so a `Decisions` row could previously never target or
+  // answer an `Open_Questions` row born in the same packet: the target did not
+  // exist yet when its own category was reached. That forced a second
+  // extraction pass — another provider call and another changeset — purely
+  // because of an internal ordering artefact.
+  //
+  // The fix is to resolve the whole packet before applying any of it. Every
+  // row whose op allocates a new durable identifier (`add`, `supersede`) is
+  // collected here, BEFORE the per-row loop, so a `target_id` may name such a
+  // row's `client_ref` and be judged legal on the register it will occupy,
+  // not on whether it happens to exist in the database yet.
+  const newRowRefs = new Map<string, RegisterName>();
+  for (const { registerName, row } of packetRows(packet)) {
+    if (row.op === 'add' || row.op === 'supersede') newRowRefs.set(row.client_ref, registerName);
+  }
+
   const refs = new Set<string>();
   for (const { registerName, row } of packetRows(packet)) {
     if (refs.has(row.client_ref)) issues.push({ rule: 'unique-client-ref', severity: 'blocker', message: `Duplicate client_ref ${row.client_ref}.`, clientRef: row.client_ref });
@@ -651,9 +673,24 @@ export function validatePacket(db: DatabaseSync, rawPacket: unknown, options: Va
       }
       if (!validDischarges.has(markerId)) validDischarges.set(markerId, row.client_ref);
     }
-    if (row.op !== 'add' && row.target_id && project) {
-      const target = db.prepare('SELECT register_name FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(project.id, row.target_id) as { register_name: string } | undefined;
-      if (!target || target.register_name !== registerName) issues.push({ rule: 'target-legality', severity: 'warning', message: `Target ${row.target_id} is not a legal ${registerName} row; reconciliation will hold it as unverified_link.`, clientRef: row.client_ref });
+    // A row may not target itself: that is a cycle, not a relationship, and it
+    // would make the operation's own materialisation its own precondition.
+    if (row.target_id && row.target_id === row.client_ref) {
+      issues.push({ rule: 'self-reference', severity: 'blocker', message: `Row ${row.client_ref} targets itself.`, clientRef: row.client_ref });
+    } else if (row.op !== 'add' && row.target_id && project) {
+      const packetInternalRegister = newRowRefs.get(row.target_id);
+      if (packetInternalRegister !== undefined) {
+        // The target is a row this same packet creates. It is legal exactly
+        // when it lands in this row's own register; existence in the database
+        // is not required, because phase 1 of apply materialises it before
+        // phase 2 resolves this reference.
+        if (packetInternalRegister !== registerName) {
+          issues.push({ rule: 'target-legality', severity: 'warning', message: `Target ${row.target_id} is created by this packet as a ${packetInternalRegister} row, not a ${registerName} row; reconciliation will hold it as unverified_link.`, clientRef: row.client_ref });
+        }
+      } else {
+        const target = db.prepare('SELECT register_name FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(project.id, row.target_id) as { register_name: string } | undefined;
+        if (!target || target.register_name !== registerName) issues.push({ rule: 'target-legality', severity: 'warning', message: `Target ${row.target_id} is not a legal ${registerName} row; reconciliation will hold it as unverified_link.`, clientRef: row.client_ref });
+      }
     }
   }
 
@@ -887,12 +924,29 @@ function deterministicOps(db: DatabaseSync, projectId: string, packet: SourceInt
   // laxer copy of the removed defect sitting behind one gate is not acceptable.
   if (!source) throw new Error('Cannot reconcile a packet whose source document is not registered.');
   const instant = humanPrecedenceInstant(source);
+  // Phase 0 of packet-internal relationship resolution, mirrored from
+  // `validatePacket`: which client_refs this packet will turn into brand-new
+  // durable rows, and in which register. A target naming one of these is a
+  // legal forward reference, not a dangling link.
+  const newRowRefs = new Map<string, RegisterName>();
+  for (const { registerName, row } of packetRows(packet)) {
+    if (row.op === 'add' || row.op === 'supersede') newRowRefs.set(row.client_ref, registerName);
+  }
   return packetRows(packet).map(({ registerName, row }, index) => {
     let op: string = row.op;
     let reason: string | null = null;
     let contested: string[] = [];
     let duplicateOf: string | null = null;
-    if (row.op !== 'add' && row.target_id) {
+    const packetInternalTarget = row.target_id !== null && newRowRefs.has(row.target_id);
+    if (row.op !== 'add' && row.target_id && packetInternalTarget) {
+      // A forward reference to a row this packet creates. There is nothing to
+      // contest — the target has no prior state and no prior field events, so
+      // no earlier source or human edit can be overwritten by reaching it.
+      if (newRowRefs.get(row.target_id) !== registerName) {
+        op = 'unverified_link';
+        reason = 'Target is created by this packet in a different register.';
+      }
+    } else if (row.op !== 'add' && row.target_id) {
       const target = db.prepare('SELECT register_name FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(projectId, row.target_id) as { register_name: string } | undefined;
       if (!target || target.register_name !== registerName) {
         op = 'unverified_link';
@@ -1068,16 +1122,68 @@ function writeTyped(db: DatabaseSync, registerName: RegisterName, rowId: string,
   else if (registerName === 'Uncertainty') db.prepare('INSERT OR REPLACE INTO register_uncertainty (register_row_id, project_id, external_register_id, why_uncertain, resolve_by, status) VALUES (?, ?, ?, ?, ?, ?)').run(rowId, projectId, externalId, text(detail.why_uncertain) || title, text(detail.resolve_by) || null, status);
 }
 
-function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode: string; packetId: string; packetHash: string; sourceId: string; importRunId: string; timestamp: string; refMap: Map<string, string>; verifiedQuotes: Set<string> }, op: Record<string, unknown>) {
+/**
+ * Apply context for one changeset, shared by both phases.
+ *
+ * `allocations` holds only the identifiers this packet itself creates
+ * (client_ref → newly allocated durable id). `refMap` is the wider
+ * client_ref → durable id map used to resolve declarative reference arrays,
+ * and additionally maps a non-creating operation's client_ref to the row it
+ * targets.
+ */
+interface ApplyContext {
+  projectId: string;
+  projectCode: string;
+  packetId: string;
+  packetHash: string;
+  sourceId: string;
+  importRunId: string;
+  timestamp: string;
+  refMap: Map<string, string>;
+  allocations: Map<string, string>;
+  verifiedQuotes: Set<string>;
+  /**
+   * Rows whose anchors from THIS source have already been cleared during this
+   * apply.
+   *
+   * Anchors are replaced rather than appended so re-applying or replaying a
+   * packet cannot duplicate them. But a packet may legitimately touch one row
+   * twice — a question raised by an `add` and closed by a `resolve` in the
+   * same meeting — and the second operation must not delete the evidence the
+   * first one anchored. Clearing once per row per apply keeps replacement
+   * idempotent across applies while letting every operation within one packet
+   * contribute its own anchor.
+   */
+  clearedAnchors: Set<string>;
+}
+
+/**
+ * Resolve an operation's `target_external_id` to a durable identifier.
+ *
+ * A target may name a client_ref of a row this same packet creates (validated
+ * as a legal forward reference in `validatePacket`/`deterministicOps`); by the
+ * time either phase reads it, phase 1 has allocated that identifier.
+ */
+function resolveTargetId(context: ApplyContext, op: Record<string, unknown>): string | null {
+  if (!op.target_external_id) return null;
+  const declared = String(op.target_external_id);
+  return context.allocations.get(declared) ?? declared;
+}
+
+/**
+ * Phase 1 — materialise one durable row.
+ *
+ * This writes the row, its fields, typed detail, anchors, marker discharges
+ * and field-level chronology events. It deliberately writes NO relationship
+ * that names another row (`answers`/`answered_by`, supersession status,
+ * `reaffirm`): those are phase 2, so they can name rows this same packet
+ * creates in a later register category.
+ */
+function materialiseFact(db: DatabaseSync, context: ApplyContext, op: Record<string, unknown>) {
   const registerName = String(op.register_name) as RegisterName;
   const proposed = JSON.parse(String(op.proposed_row_json)) as JsonObject;
-  const targetId = op.target_external_id ? String(op.target_external_id) : null;
+  const targetId = resolveTargetId(context, op);
   if (['conflict', 'unverified_link', 'possible_duplicate'].includes(String(op.op))) throw new Error(`${op.op} requires adjudication and cannot be applied directly.`);
-  if (op.op === 'reaffirm' && targetId) {
-    db.prepare("INSERT INTO register_row_events (id, project_id, external_register_id, occurred_at, actor, event_type, field, previous_value, new_value, reason, evidence_ref, source_id, origin) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, 'source')")
-      .run(randomUUID(), context.projectId, targetId, context.timestamp, String(op.reviewer ?? 'reviewer'), 'reaffirm', 'Source reaffirmed the existing record.', context.packetId, context.sourceId);
-    return targetId;
-  }
   const externalId = context.refMap.get(String(op.client_ref)) ?? targetId;
   if (!externalId) throw new Error('Apply operation has no target or allocated ID.');
   const existing = db.prepare('SELECT * FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(context.projectId, externalId) as Record<string, unknown> | undefined;
@@ -1093,7 +1199,8 @@ function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode:
   const resolveRefs = (value: unknown): string[] => (Array.isArray(value) ? value.map((entry) => context.refMap.get(String(entry)) ?? String(entry)) : []);
   const relatedIds = resolveRefs(proposed.related_refs);
   const supersedesIds = resolveRefs(proposed.supersedes);
-  const answersIds = resolveRefs(proposed.answers);
+  // `answers` is resolved and written in phase 2 (`applyFactRelationships`),
+  // once every row this packet creates exists.
   raw.related_refs = relatedIds;
   raw.supersedes = supersedesIds;
   if (op.op === 'resolve') raw.status = 'resolved';
@@ -1168,7 +1275,10 @@ function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode:
       sourceId: context.sourceId, occurredAt: sourceInstant, origin: 'source',
     });
   }
-  db.prepare('DELETE FROM register_row_anchors WHERE project_id = ? AND external_register_id = ? AND source_id = ?').run(context.projectId, externalId, context.sourceId);
+  if (!context.clearedAnchors.has(externalId)) {
+    db.prepare('DELETE FROM register_row_anchors WHERE project_id = ? AND external_register_id = ? AND source_id = ?').run(context.projectId, externalId, context.sourceId);
+    context.clearedAnchors.add(externalId);
+  }
   const insertAnchor = db.prepare('INSERT INTO register_row_anchors (id, project_id, external_register_id, source_id, segment_id, speaker, t_ms, quote, verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
   for (const anchor of JSON.parse(String(op.anchors_json)) as Array<{ segment_seq: number; speaker: string | null; t_ms: number | null; quote: string | null }>) {
     // `verified` records whether this quote was mechanically confirmed against
@@ -1182,9 +1292,50 @@ function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode:
   // is answerable after the fact rather than being a transient gate result (B3).
   const dischargeStatement = db.prepare('UPDATE source_markers SET discharged_by_item_ref = ? WHERE id = ? AND source_id = ?');
   for (const markerId of (Array.isArray(proposed.discharges_markers) ? proposed.discharges_markers : []) as string[]) dischargeStatement.run(externalId, String(markerId), context.sourceId);
-  if (op.op === 'supersede' && targetId) {
-    db.prepare("UPDATE project_register_rows SET record_status = 'superseded', supersession_ids_json = ? WHERE project_id = ? AND external_register_id = ?").run(JSON.stringify([externalId]), context.projectId, targetId);
+  db.prepare('UPDATE register_change_ops SET allocated_external_id = ? WHERE id = ?').run(externalId, String(op.id));
+  return externalId;
+}
+
+/**
+ * Phase 2 — resolve and apply one operation's packet-internal relationships.
+ *
+ * Runs only after EVERY durable row in the packet has been materialised, so a
+ * relationship may name a row created later in the same packet's category
+ * order. Nothing here allocates an identifier or creates a row; it writes only
+ * the relationship itself.
+ *
+ * Every write is stamped with the SOURCE's own event-time, not apply
+ * wall-clock, so a relationship asserted by a chronologically older source
+ * sorts before one asserted by a newer source in the replayed event trail —
+ * the same chronology rule field updates already follow (Goal 2).
+ */
+function applyFactRelationships(db: DatabaseSync, context: ApplyContext, op: Record<string, unknown>, sourceInstant: string) {
+  const proposed = JSON.parse(String(op.proposed_row_json)) as JsonObject;
+  const targetId = resolveTargetId(context, op);
+  const externalId = context.refMap.get(String(op.client_ref)) ?? targetId;
+  const reviewerActor = String(op.reviewer ?? 'reviewer');
+  const rowExists = (id: string) => Boolean(db.prepare('SELECT 1 FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(context.projectId, id));
+
+  // A reaffirmation asserts nothing new about the row's fields — it records
+  // that this source restated an existing record. It is a relationship
+  // between a source and a row, so it belongs here, and deferring it means a
+  // source may reaffirm a record the very same packet re-established.
+  if (op.op === 'reaffirm' && targetId) {
+    if (!rowExists(targetId)) return targetId;
+    db.prepare("INSERT INTO register_row_events (id, project_id, external_register_id, occurred_at, actor, event_type, field, previous_value, new_value, reason, evidence_ref, source_id, origin) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, 'source')")
+      .run(randomUUID(), context.projectId, targetId, context.timestamp, reviewerActor, 'reaffirm', 'Source reaffirmed the existing record.', context.packetId, context.sourceId);
+    return targetId;
   }
+  if (!externalId) return null;
+
+  if (op.op === 'supersede' && targetId && rowExists(targetId)) {
+    db.prepare("UPDATE project_register_rows SET record_status = 'superseded', supersession_ids_json = ? WHERE project_id = ? AND external_register_id = ?").run(JSON.stringify([externalId]), context.projectId, targetId);
+    insertRawRegisterRowEvent(db, context.projectId, targetId, {
+      actor: reviewerActor, eventType: 'superseded_by', reason: `Superseded by ${externalId}.`,
+      sourceId: context.sourceId, occurredAt: sourceInstant, origin: 'source', relatedExternalId: externalId,
+    });
+  }
+
   // Goal 4 — a formal, stored "answers" relationship, distinct from the
   // generic `related_refs`. Mirrored onto both rows so either side of the
   // relationship is independently discoverable: the answering row records
@@ -1192,20 +1343,24 @@ function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode:
   // declarative — it never mutates the question's own status; if the source
   // also resolves the question, that goes through its own `resolve` op on the
   // question row, reviewed and applied like any other operation.
-  const reviewerActor = String(op.reviewer ?? 'reviewer');
-  for (const questionId of answersIds) {
-    const questionExists = Boolean(db.prepare('SELECT 1 FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(context.projectId, questionId));
-    if (!questionExists) continue;
+  //
+  // The existence check below is now a guard against a genuinely dangling
+  // identifier only. A reference to a question created later in this same
+  // packet resolves through `refMap` and its row is already materialised, so
+  // the relationship survives instead of being silently dropped.
+  const resolveRefs = (value: unknown): string[] => (Array.isArray(value) ? value.map((entry) => context.refMap.get(String(entry)) ?? String(entry)) : []);
+  for (const questionId of resolveRefs(proposed.answers)) {
+    if (questionId === externalId) continue;
+    if (!rowExists(questionId)) continue;
     insertRawRegisterRowEvent(db, context.projectId, externalId, {
       actor: reviewerActor, eventType: 'answers', reason: `Answers ${questionId}.`,
-      sourceId: context.sourceId, occurredAt: context.timestamp, origin: 'source', relatedExternalId: questionId,
+      sourceId: context.sourceId, occurredAt: sourceInstant, origin: 'source', relatedExternalId: questionId,
     });
     insertRawRegisterRowEvent(db, context.projectId, questionId, {
       actor: reviewerActor, eventType: 'answered_by', reason: `Answered by ${externalId}.`,
-      sourceId: context.sourceId, occurredAt: context.timestamp, origin: 'source', relatedExternalId: externalId,
+      sourceId: context.sourceId, occurredAt: sourceInstant, origin: 'source', relatedExternalId: externalId,
     });
   }
-  db.prepare('UPDATE register_change_ops SET allocated_external_id = ? WHERE id = ?').run(externalId, String(op.id));
   return externalId;
 }
 
@@ -1236,17 +1391,49 @@ export function applyReviewedChangeset(db: DatabaseSync, changesetId: string) {
     db.prepare(`INSERT OR IGNORE INTO project_register_import_runs (id, project_id, packet_type, packet_version, project_code, source_workbook_name, source_workbook_hash, benchmark_json_hash, status, started_at, completed_at, records_total, records_imported, blocking_errors_json, verification_status, raw_packet_json)
       VALUES (?, ?, 'project_register_delta', 1, ?, NULL, NULL, ?, 'completed', ?, ?, ?, ?, '[]', 'human-reviewed', ?)`)
       .run(importRunId, String(changeset.project_id), project.code, String(packet.packet_sha256), timestamp, timestamp, ops.length, ops.length, String(packet.packet_json));
-    // Two passes: allocate every durable identifier first, so intra-packet
-    // references can resolve to identifiers allocated later in the same
-    // changeset (C14). Allocation happens inside this transaction, so a failure
-    // rolls the sequence back with everything else.
-    const refMap = new Map<string, string>();
+    // Deterministic two-phase packet application.
+    //
+    // Phase 0 — allocate every durable identifier this packet creates, before
+    // anything is written, so an intra-packet reference resolves to an
+    // identifier whose row does not exist yet (C14). Allocation happens inside
+    // this transaction, so a failure rolls the sequence back with everything
+    // else.
+    //
+    // Phase 1 — materialise every durable row. Row-creating operations run
+    // first, in `seq` order, then the operations that mutate an existing row,
+    // also in `seq` order. This stable partition is what lets an operation
+    // target a row the same packet creates in a LATER register category:
+    // register category order (`registerNames`) no longer decides whether a
+    // target exists, because all creation precedes all mutation.
+    //
+    // Phase 2 — resolve and apply every relationship between rows
+    // (`answers`/`answered_by`, supersession, reaffirmation). By this point
+    // every row named by any reference in this packet exists, so a question
+    // raised and answered in one meeting links up inside ONE packet, ONE
+    // changeset and ONE review — no second provider call, no follow-up
+    // extraction pass.
+    //
+    // The review/apply boundary is untouched: this reorders work strictly
+    // inside a single already-reviewed changeset's apply transaction. Only
+    // operations a human accepted are read, and the whole thing still commits
+    // or rolls back as one unit.
+    const sourceForInstant = db.prepare('SELECT event_date, created_at FROM source_documents WHERE id = ?').get(String(changeset.source_id)) as { event_date: string | null; created_at: string };
+    const sourceInstant = humanPrecedenceInstant(sourceForInstant);
+    const allocations = new Map<string, string>();
+    for (const op of ops) {
+      if (op.op === 'add' || op.op === 'supersede') allocations.set(String(op.client_ref), allocateId(db, String(changeset.project_id), project.code, String(op.register_name) as RegisterName));
+    }
+    const refMap = new Map<string, string>(allocations);
     for (const op of ops) {
       const clientRef = String(op.client_ref);
-      if (op.op === 'add' || op.op === 'supersede') refMap.set(clientRef, allocateId(db, String(changeset.project_id), project.code, String(op.register_name) as RegisterName));
-      else if (op.target_external_id) refMap.set(clientRef, String(op.target_external_id));
+      if (refMap.has(clientRef)) continue;
+      if (op.target_external_id) refMap.set(clientRef, allocations.get(String(op.target_external_id)) ?? String(op.target_external_id));
     }
-    for (const op of ops) upsertFact(db, { projectId: String(changeset.project_id), projectCode: project.code, packetId: String(packet.id), packetHash: String(packet.packet_sha256), sourceId: String(changeset.source_id), importRunId, timestamp, refMap, verifiedQuotes }, op);
+    const context: ApplyContext = { projectId: String(changeset.project_id), projectCode: project.code, packetId: String(packet.id), packetHash: String(packet.packet_sha256), sourceId: String(changeset.source_id), importRunId, timestamp, refMap, allocations, verifiedQuotes, clearedAnchors: new Set<string>() };
+    const creating = ops.filter((op) => op.op === 'add' || op.op === 'supersede');
+    const mutating = ops.filter((op) => op.op !== 'add' && op.op !== 'supersede' && op.op !== 'reaffirm');
+    for (const op of [...creating, ...mutating]) materialiseFact(db, context, op);
+    for (const op of ops) applyFactRelationships(db, context, op, sourceInstant);
     db.prepare('INSERT INTO project_register_revisions (project_id, revision, updated_at) VALUES (?, 1, ?) ON CONFLICT(project_id) DO UPDATE SET revision = revision + 1, updated_at = excluded.updated_at').run(String(changeset.project_id), timestamp);
     rebuildProjection(db, String(changeset.project_id), timestamp);
     db.prepare("UPDATE register_changesets SET review_status = 'applied', applied_at = ? WHERE id = ?").run(timestamp, changesetId);
