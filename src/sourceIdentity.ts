@@ -22,10 +22,18 @@
  */
 import { createHash } from 'node:crypto';
 
-/** Lines of dialogue per fingerprinted chunk. Small enough that a short overlap is still visible, large enough that a single shared pleasantry is not. */
-export const CHUNK_LINES = 8;
-/** Chunks advance by this many lines, so a chunk boundary landing mid-overlap cannot hide it. */
-export const CHUNK_STRIDE = 4;
+/**
+ * Lines of dialogue per fingerprinted chunk.
+ *
+ * Three consecutive utterances, verbatim and in order, is a strong signal —
+ * strong enough that two unrelated meetings essentially never share one, and
+ * small enough that a short partial transcript still produces several. A larger
+ * window made short transcripts collapse into a single chunk, which hid overlap
+ * entirely.
+ */
+export const CHUNK_LINES = 3;
+/** Chunks advance one line at a time, so a partial transcript starting mid-meeting still aligns with the full transcript's chunks. */
+export const CHUNK_STRIDE = 1;
 /** Containment at or above this is reported as a possible partial overlap for human confirmation. */
 export const OVERLAP_REVIEW_THRESHOLD = 0.25;
 /** Containment at or above this means one transcript essentially contains the other. */
@@ -38,8 +46,16 @@ const NOTE_BLOCK = /^NOTE\b/i;
 const TIMESTAMP_CUE = /^\s*(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[.,]\d{1,3})?\s*-->\s*(?:\d{1,2}:)?\d{1,2}:\d{2}(?:[.,]\d{1,3})?/;
 /** A bare cue identifier: a number, or a UUID-ish token Teams emits, alone on its line. */
 const CUE_IDENTIFIER = /^\s*(?:\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\/\d+-\d+)?)\s*$/i;
-/** Inline cue styling Teams and other exporters add around speaker names. */
-const INLINE_TAGS = /<\/?[cvbiu](?:\.[^>\s]+)?(?:\s[^>]*)?>/gi;
+/**
+ * A WebVTT voice span, `<v Alex>` or `<v.loud Alex>`, which carries the SPEAKER
+ * NAME inside the tag. It is rewritten to `Alex: ` rather than stripped:
+ * exporters differ on whether they use a voice tag or a plain `Alex:` prefix,
+ * and the two must canonicalise identically or every re-export would look like
+ * a different meeting.
+ */
+const VOICE_TAG = /<v(?:\.[^>\s]+)*\s+([^>]+)>/gi;
+/** Remaining inline cue styling, which carries no content and is simply removed. */
+const INLINE_TAGS = /<\/?[cvbiu](?:\.[^>\s]+)*(?:\s[^>]*)?>/gi;
 
 /**
  * Reduce a VTT (or plain transcript) to the speech it records.
@@ -71,7 +87,7 @@ export function canonicaliseTranscript(text: string): string[] {
   const lines: string[] = [];
   let inNote = false;
   for (const rawLine of normalised.split('\n')) {
-    const line = rawLine.replace(INLINE_TAGS, '').trim();
+    const line = rawLine.replace(VOICE_TAG, '$1: ').replace(INLINE_TAGS, '').trim();
     if (line === '') { inNote = false; continue; }
     if (inNote) continue;
     if (NOTE_BLOCK.test(line)) { inNote = true; continue; }

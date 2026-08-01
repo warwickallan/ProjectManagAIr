@@ -860,6 +860,15 @@ export interface VoidDisposition {
  * from "this source mentioned a row that something else asserted". An
  * unverified or inference-only reference is not independent evidence.
  *
+ * KNOWN LIMIT, stated rather than papered over: a verified quote proves the
+ * words were said in that meeting, not that they were said INDEPENDENTLY. A
+ * later source that reads a prior decision aloud verbatim looks, to any
+ * deterministic rule, exactly like one that reached it on its own. The rule
+ * therefore errs toward RETAINING and flagging, because wrongly retaining a row
+ * a human must review is recoverable, while wrongly removing one is the silent
+ * data loss this whole design exists to prevent. Both outcomes are flagged;
+ * neither is silent.
+ *
  * A human event on the row also retains it: a person has deliberately worked on
  * this record, and the void contract requires human events to survive. Deleting
  * a row somebody owns because an unrelated transcript was withdrawn would be
