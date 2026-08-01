@@ -165,9 +165,16 @@ function toCached(row: Record<string, unknown>): CachedReasoning {
  * current state hash. Called after an apply. Results are never deleted: the
  * superseded brief is how the consultant sees what changed.
  */
-export function markReasoningStale(db: DatabaseSync, projectId: string, currentStateHash: string, reason: string): number {
-  const result = db.prepare('UPDATE consultant_reasoning_results SET stale = 1, stale_reason = ?, stale_at = ? WHERE project_id = ? AND project_state_hash != ? AND stale = 0')
-    .run(reason, nowIso(), projectId, currentStateHash);
+export function markReasoningStale(db: DatabaseSync, projectId: string, currentStateHash: string, reason: string, mode?: string): number {
+  // Scoped to one mode when given. Today every mode over one project shares a
+  // state hash, so the distinction is invisible — but staling another mode's
+  // brief as a side effect of accepting this one would be wrong the moment
+  // that stops being true.
+  const result = mode
+    ? db.prepare('UPDATE consultant_reasoning_results SET stale = 1, stale_reason = ?, stale_at = ? WHERE project_id = ? AND mode = ? AND project_state_hash != ? AND stale = 0')
+      .run(reason, nowIso(), projectId, mode, currentStateHash)
+    : db.prepare('UPDATE consultant_reasoning_results SET stale = 1, stale_reason = ?, stale_at = ? WHERE project_id = ? AND project_state_hash != ? AND stale = 0')
+      .run(reason, nowIso(), projectId, currentStateHash);
   return Number(result.changes ?? 0);
 }
 
@@ -216,11 +223,14 @@ export function readConsultantReasoning(
   const current = all.find((row) => row.projectStateHash === stateHash && !row.stale) ?? null;
   const latest = all[0] ?? null;
 
-  const failure = db.prepare("SELECT status, error, violations_json, created_at FROM consultant_reasoning_runs WHERE project_id = ? AND mode = ? AND status != 'accepted' ORDER BY created_at DESC LIMIT 1").get(projectId, mode) as Record<string, unknown> | undefined;
-  // A stored failure only matters while it is the most recent word on the
-  // current state; an accepted run afterwards supersedes it.
-  const lastAccepted = db.prepare("SELECT created_at FROM consultant_reasoning_runs WHERE project_id = ? AND mode = ? AND status = 'accepted' ORDER BY created_at DESC LIMIT 1").get(projectId, mode) as { created_at: string } | undefined;
-  const failureIsCurrent = Boolean(failure && (!lastAccepted || String(failure.created_at) > lastAccepted.created_at));
+  // A stored failure only matters while it is the most recent word on this
+  // mode; an accepted run afterwards supersedes it. Ordered by rowid, not by
+  // `created_at`: ISO timestamps are millisecond-resolution, and two runs
+  // recorded in the same millisecond made the comparison a coin toss that
+  // could hide a genuine failure behind an older success.
+  const lastRun = db.prepare('SELECT status, error, violations_json, created_at FROM consultant_reasoning_runs WHERE project_id = ? AND mode = ? ORDER BY rowid DESC LIMIT 1').get(projectId, mode) as Record<string, unknown> | undefined;
+  const failureIsCurrent = Boolean(lastRun && String(lastRun.status) !== 'accepted');
+  const failure = failureIsCurrent ? lastRun : undefined;
 
   const availability = provider.availability?.() ?? { available: provider.isAvailable(), detail: provider.isAvailable() ? 'ok' : 'unavailable', kind: null, version: null, checkedAt: Date.now() };
 
@@ -374,7 +384,7 @@ export async function generateConsultantReasoning(
       skill.revision.promptTemplateVersion, provider.identity.providerId, provider.identity.modelLabel,
       resultJson, resultSha256, JSON.stringify(validation.citedRegisterIds), nowIso());
 
-  markReasoningStale(db, projectId, stateHash, 'A newer reasoning result exists for the current project state.');
+  markReasoningStale(db, projectId, stateHash, 'A newer reasoning result exists for the current project state.', mode);
 
   return { view: view(), providerCalls: 1, outcome: 'accepted', violations: [], message: null, runId };
 }

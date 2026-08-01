@@ -41,6 +41,10 @@ import { GitHubRestPort, GoogleDriveRestPort, beginDriveAuthorization, driveCred
 import { isKnownManifestPath, readBuildHandoffs, resolveHandoffRoot } from './src/buildHandoffs.js';
 import { ClaudeCodeStructuredExtractionProvider } from './src/extractionProvider.js';
 import { ClaudeCodeGroundedBriefProvider } from './src/briefProvider.js';
+import { ClaudeCodeConsultantReasoningProvider } from './src/consultantReasoningProvider.js';
+import { generateConsultantReasoning, readConsultantReasoning } from './src/consultantReasoning.js';
+import { BRIEF_MODES, type BriefMode } from './src/consultantReasoningContract.js';
+import { renderReasoningMarkdown, resolveReasoningEvidence } from './src/consultantReasoningRender.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -68,6 +72,7 @@ function db() {
 
 const structuredExtractionProvider = new ClaudeCodeStructuredExtractionProvider();
 const groundedBriefProvider = new ClaudeCodeGroundedBriefProvider();
+const consultantReasoningProvider = new ClaudeCodeConsultantReasoningProvider();
 let extractionWorker = Promise.resolve();
 
 function scheduleSourceExtraction(sourceId: string) {
@@ -309,6 +314,57 @@ app.get('/api/projects/:projectId/consultant-view/download', (request, response)
   response.setHeader('Content-Type', 'text/markdown; charset=utf-8');
   response.setHeader('Content-Disposition', `attachment; filename="consultant-view-${mode}.md"`);
   response.send(renderSynthesisMarkdown(view));
+});
+/* ------------------------------------------------------------------ *
+ * Consultant Reasoning — the second intelligence.
+ *
+ * GET reads: zero provider calls, always. POST generates: at most one
+ * bounded call, and only on an explicit Generate/Refresh from Warwick, so
+ * token spend is never a side effect of navigating.
+ * ------------------------------------------------------------------ */
+function reasoningMode(value: unknown): BriefMode | null {
+  return (BRIEF_MODES as readonly string[]).includes(String(value)) ? String(value) as BriefMode : null;
+}
+app.get('/api/projects/:projectId/consultant-reasoning', (request, response) => {
+  const mode = reasoningMode(request.query.mode ?? 'meeting');
+  if (!mode) { response.status(400).json({ error: `mode must be one of ${BRIEF_MODES.join(', ')}.` }); return; }
+  const view = readConsultantReasoning(db(), String(request.params.projectId), mode, consultantReasoningProvider);
+  // Resolve citations to canonical rows and anchors so the UI can drill down
+  // without a second round trip. The model supplied the IDs; these quotes come
+  // from the register.
+  const evidence = view.current ? resolveReasoningEvidence(db(), String(request.params.projectId), view.current.resultJson) : { rows: {}, unresolved: [] };
+  response.json({ ...view, evidence });
+});
+app.post('/api/projects/:projectId/consultant-reasoning', asyncRoute(async (request, response) => {
+  const body = request.body as { mode?: string; force?: boolean; meetingContext?: string };
+  const mode = reasoningMode(body.mode ?? 'meeting');
+  if (!mode) { response.status(400).json({ error: `mode must be one of ${BRIEF_MODES.join(', ')}.` }); return; }
+  const result = await generateConsultantReasoning(db(), String(request.params.projectId), mode, consultantReasoningProvider, {
+    mode, force: Boolean(body.force), actor: 'current-user',
+    meetingContext: body.meetingContext ?? null,
+  });
+  const evidence = result.view.current ? resolveReasoningEvidence(db(), String(request.params.projectId), result.view.current.resultJson) : { rows: {}, unresolved: [] };
+  response.json({ ...result, view: { ...result.view, evidence } });
+}));
+app.get('/api/projects/:projectId/consultant-reasoning/download', (request, response) => {
+  const mode = reasoningMode(request.query.mode ?? 'meeting');
+  if (!mode) { response.status(400).json({ error: `mode must be one of ${BRIEF_MODES.join(', ')}.` }); return; }
+  const projectId = String(request.params.projectId);
+  const view = readConsultantReasoning(db(), projectId, mode, consultantReasoningProvider);
+  const accepted = view.current ?? view.latest;
+  if (!accepted) { response.status(404).json({ error: 'No accepted reasoning result to download.' }); return; }
+  const project = db().prepare('SELECT name FROM projects WHERE id = ?').get(projectId) as { name: string } | undefined;
+  const evidence = resolveReasoningEvidence(db(), projectId, accepted.resultJson);
+  response.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+  response.setHeader('Content-Disposition', `attachment; filename="consultant-reasoning-${mode}.md"`);
+  response.send(renderReasoningMarkdown(accepted.resultJson, evidence, {
+    projectName: project?.name ?? projectId, generatedAt: accepted.generatedAt,
+    skillId: accepted.skillId, skillVersion: accepted.skillVersion,
+    promptTemplateVersion: accepted.promptTemplateVersion,
+    providerId: accepted.providerId, modelLabel: accepted.modelLabel,
+    projectStateHash: accepted.projectStateHash, resultSha256: accepted.resultSha256,
+    registerRevision: accepted.registerRevision, providerCalls: 0,
+  }));
 });
 /** Preserved raw provider responses for one source: the acceptance evidence trail. */
 app.get('/api/projects/:projectId/sources/:sourceId/provider-outputs', (request, response) => {
