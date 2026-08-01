@@ -319,7 +319,7 @@ select.input { appearance: auto; }
 .modal-panel { width: min(920px, calc(100vw - 48px)); max-height: calc(100vh - 48px); overflow: auto; padding: 22px 24px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: 0 4px 20px rgba(14,27,27,.16); }
 .settings-status-row { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; color: var(--muted); font-size: 11px; }
 .table-tools { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(150px, .35fr) minmax(150px, .35fr) auto; gap: 10px; align-items: center; margin-bottom: 12px; }
-.table-tools > span { color: var(--muted); font-size: 10px; font-weight: 700; text-align: right; }
+.table-tools > span { color: var(--muted); font-size: 10px; font-weight: 700; text-align: right; margin-right: 64px; }
 .dense-table { max-height: 62vh; border: 1px solid var(--line); border-radius: 8px; }
 .dense-table thead th { position: sticky; top: 0; z-index: 1; }
 .dense-table tbody tr { cursor: pointer; }
