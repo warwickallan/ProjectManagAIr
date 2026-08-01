@@ -217,6 +217,7 @@ h3 { color: #1b2840; letter-spacing: -.015em; }
 .form-grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 select.input { appearance: auto; }
 .inline-note { margin: 10px 0 0; color: var(--green); font-size: 11px; font-weight: 700; }
+.table-hint { margin: 0 0 10px; color: var(--muted); font-size: 11px; }
 .form-error { color: #b64c44; font-size: 11px; font-weight: 700; }
 .drop-zone { display: grid; place-items: center; gap: 10px; min-height: 150px; padding: 22px; border: 1px dashed #b9c4d8; border-radius: 8px; background: #f8faff; text-align: center; }
 .drop-zone.dragging { border-color: var(--blue); background: #edf1ff; }
@@ -244,6 +245,9 @@ select.input { appearance: auto; }
 .dense-table tbody tr:hover td { background: #f8faff; }
 .dense-table td strong, .dense-table td small { display: block; }
 .dense-table td small { margin-top: 4px; color: var(--subtle); line-height: 1.4; }
+.row-update-button { display: inline-flex; align-items: center; gap: 4px; padding: 6px 10px; border: 1px solid #b9c4f0; border-radius: 6px; background: #eef1ff; color: var(--blue); font-size: 10px; font-weight: 750; white-space: nowrap; cursor: pointer; }
+.row-update-button:hover, .row-update-button:focus-visible { background: var(--blue); color: #fff; border-color: var(--blue); }
+.row-update-button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .detail-drawer { position: fixed; top: 20px; right: 20px; bottom: 20px; z-index: 50; width: min(560px, calc(100vw - 40px)); overflow: auto; padding: 20px; border: 1px solid #dfe5f0; border-radius: 8px; background: #fff; box-shadow: 0 18px 38px rgba(20, 29, 45, .22); }
 .detail-drawer header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
 .detail-drawer h4 { margin: 16px 0 8px; color: #25324a; font-size: 12px; }

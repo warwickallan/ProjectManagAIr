@@ -1,8 +1,9 @@
 # build/source-intelligence-usefulness-v1 — two-intelligence architecture, Consultant Reasoning, usefulness proof
 
 **Baseline** `6de535f17ada80f8b30c92626ca10cdd1e9e2228` (build/source-intelligence-acceptance-prompts-v1)
-**Head** `a9697c643878954c348ae218c2f5f0b6c1b6c7c9`, extended by this commit (human project events, migration 015) — see `git log` for the exact tip.
-**Built by** claude-opus-5, 31 July – 1 August 2026
+**Head** `92d12c6...` (human project events, migration 015), extended again by this
+commit (row-interaction discoverability, UI-only) — see `git log` for the exact tip.
+**Built by** claude-opus-5 / claude-sonnet-5, 31 July – 1 August 2026
 **Verdict** PENDING WARWICK'S VISUAL ASSESSMENT — everything below is built and
 verified; **no skill has been promoted and this branch has not been merged.**
 That is a deliberate stop, not an omission: this record exists so Warwick can
@@ -154,6 +155,40 @@ standalone note. This commit completes that path; it does not redesign it.
   confirmation banner, zero POST requests beyond the one `events` call per
   action.
 
+## Row-interaction discoverability (this commit, UI-only)
+
+Warwick opened the Cockpit after the human-event commit and reported no
+apparent change. Inspection confirmed the feature was fully working but
+invisible: the only affordance a register row was interactive was
+`cursor: pointer` plus a hover-only background tint — nothing static, nothing
+visible in a screenshot or a quick scan of a 42-row table. No code from the
+previous commit changed; this is presentation only.
+
+- **Persistent "Update" column** on every register table (`RegisterTable`,
+  `src/RegisterViews.tsx`): a `Update ›` button on every row, styled as an
+  actual button (bordered, tinted, `.row-update-button`), not a bare icon.
+  Its `onClick` calls `event.stopPropagation()` before opening the drawer, so
+  clicking it cannot also fire the row's own click handler a second time.
+  Its accessible label names the row: `Update NPL-A-001: <title>`. Being a
+  real `<button>`, it is focusable and activates on Enter/Space with no extra
+  code.
+- **Static hint** above every register table: "Select a row or choose Update
+  to review evidence, add notes and change its current state." (`.table-hint`).
+- **Drawer heading** made explicit: the previously unlabelled button row is
+  now headed `Update current state`.
+- Clicking anywhere else on the row still opens the drawer, unchanged; the
+  Update button is simply the visible, obvious way in now.
+- Existing search, filter, sort, History, evidence and the note/status/owner/
+  due-date controls themselves are untouched — verified unchanged in the
+  browser and by the full `tests/humanProjectEvents.test.ts` suite still
+  passing.
+- Verified against the **original, unmutated** acceptance database, read-only
+  (zero POST requests across the entire inspection): the Update column and
+  hint render on Actions, Decisions, Risks & Issues and Mined Data; keyboard
+  focus + Enter on the Update button opens the correct row's drawer; opening
+  a drawer writes no event. Narrow-width (390px) behaviour is unchanged from
+  before — the table already scrolled horizontally, and still does.
+
 ## Migrations
 
 - `013_provider_outputs_prompt_registry_and_consultant_views.sql` — carried
@@ -208,6 +243,8 @@ standalone note. This commit completes that path; it does not redesign it.
 ## Still required
 
 1. Warwick's visual assessment of the Cockpit and a merge decision — unchanged.
+   The discoverability gap that blocked the previous assessment attempt is
+   now addressed; nothing else about this ask is outstanding.
 2. Whether to rewrite the two commits still carrying the un-sanitised customer
    name/meeting on the pushed branch (`3f96963` onward), or accept it as a
    low-severity residual — reported, not acted on, pending Warwick's call.
@@ -215,9 +252,9 @@ standalone note. This commit completes that path; it does not redesign it.
    that Mined Data exists, and whether the three overlapping "meeting/needs-
    warwick" mechanisms (Consultant Reasoning's own modes, `AdaptiveOverview`,
    `consultantViews.ts`) should be reconciled — both explicitly out of scope
-   for this ticket.
-4. No skill was promoted and nothing was merged on this ticket either. No AI
-   extraction or reasoning call occurred: `recordRegisterEvent` and everything
-   it calls touch only SQLite.
+   for every ticket so far.
+4. No skill was promoted and nothing was merged. No AI extraction or reasoning
+   call occurred on any of these tickets: this one touched only React
+   markup/CSS, no route, no schema, no service function.
 
 No further redesign should happen before Warwick's review.
