@@ -52,7 +52,7 @@ export function RegisterTable({ title, registerName, rows, comparisonRows, focus
   const [status, setStatus] = useState('all');
   const [sort, setSort] = useState<'id' | 'title' | 'status'>('id');
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const statuses = useMemo(() => Array.from(new Set(rows.map(currentRowStatus).filter(Boolean))).sort(), [rows]);
+  const statuses = useMemo(() => statusFilterOptions(registerName, rows.map(currentRowStatus)), [registerName, rows]);
   const filtered = rows.filter((row) => {
     const haystack = `${row.externalRegisterId} ${row.title} ${row.summary} ${currentRowStatus(row)} ${row.sourceRef ?? ''} ${row.sourceAnchor ?? ''}`.toLowerCase();
     return (status === 'all' || currentRowStatus(row) === status) && haystack.includes(search.toLowerCase());
@@ -62,7 +62,7 @@ export function RegisterTable({ title, registerName, rows, comparisonRows, focus
   return (
     <Section id={registerName} title={title} kicker="SQLite register" count={filtered.length}>
       <p className="table-hint">Select a row or choose Update to review evidence, add notes and change its current state.</p>
-      <div className="table-tools"><input className="input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search IDs, titles, sources" /><select className="input" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">All statuses</option>{statuses.map((item) => <option key={item} value={item}>{item}</option>)}</select><select className="input" value={sort} onChange={(event) => setSort(event.target.value as 'id' | 'title' | 'status')}><option value="id">Sort by ID</option><option value="title">Sort by title</option><option value="status">Sort by status</option></select><span>{filtered.length} rows</span></div>
+      <div className="table-tools"><input className="input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search IDs, titles, sources" /><select className="input" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">All statuses</option>{statuses.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}</select><select className="input" value={sort} onChange={(event) => setSort(event.target.value as 'id' | 'title' | 'status')}><option value="id">Sort by ID</option><option value="title">Sort by title</option><option value="status">Sort by status</option></select><span>{filtered.length} rows</span></div>
       {filtered.length === 0 ? <EmptyState>No register rows loaded.</EmptyState> : <div className="table-wrap dense-table"><table><thead><tr><th>ID</th><th>Title</th><th>Importance</th><th>Status</th><th>Owner / due</th><th>Source</th><th>Related</th><th>Update</th></tr></thead><tbody>{filtered.map((row) => <tr key={row.id} onClick={() => selectRow(row)}><td><button className="inline-button">{row.externalRegisterId}</button></td><td><strong>{row.title}</strong><small>{row.summary}</small></td><td>{row.score ? <span className={`importance-band band-${row.score.band.toLowerCase()}`}>{row.score.band} / {row.score.value}</span> : '-'}</td><td><StatusChip value={currentRowStatus(row)} /></td><td>{row.currentState?.owner ?? row.owner ?? 'Unassigned'}<small>{formatDate(row.currentState?.dueDate ?? row.dueDate)}</small></td><td>{row.sourceRef ?? '-'}<small>{row.sourceAnchor ?? ''}</small></td><td>{[...row.relatedIds, ...row.supersessionIds].join(', ') || '-'}</td><td><button type="button" className="row-update-button" aria-label={`Update ${row.externalRegisterId}: ${row.title}`} onClick={(event) => { event.stopPropagation(); selectRow(row); }}>Update <span aria-hidden="true">{'›'}</span></button></td></tr>)}</tbody></table></div>}
       {selected ? <RegisterDetail row={selected} comparisonRows={comparisonRows.filter((row) => row.externalRegisterId === selected.externalRegisterId)} userId={userId} onChanged={onChanged} onClose={() => { setSelectedId(null); window.location.hash = window.location.hash.split('?')[0]; }} /> : null}
     </Section>
@@ -112,6 +112,119 @@ export function formatAnchorTime(value: number | null) { if (value === null) ret
 export function registerForId(id: string) { const marker = id.match(/-([ADRQMCESU])-/)?.[1]; return ({ A: 'Actions', D: 'Decisions', R: 'Risks_Issues', Q: 'Open_Questions', M: 'Milestones', C: 'Config_Changes', E: 'Entities', S: 'Sources', U: 'Uncertainty' } as Record<string, string>)[marker ?? ''] ?? 'Actions'; }
 export function currentRowStatus(row: RegisterRow) { return row.currentState?.status ?? row.recordStatus; }
 export function sortValue(row: RegisterRow, sort: 'id' | 'title' | 'status') { if (sort === 'title') return row.title; if (sort === 'status') return row.recordStatus; return row.externalRegisterId; }
+
+/* -------------------------------------------------------------------------- *
+ * Status-filter canonicalisation.
+ *
+ * `currentRowStatus` is either a small, fixed machine value that
+ * `EVENT_TYPE_STATUS` in registerProjection.ts writes once a human event has
+ * fired (`open`, `in-progress`, `blocked`, `completed`, `cancelled`,
+ * `resolved`, `parked`, `ratified`, `rejected`, `superseded`, `mitigated`,
+ * `accepted`, `achieved`, `missed`, `applied`, `verified`, `reverted`) or, for
+ * a row no human event has ever touched, the raw status wording a source
+ * document used verbatim ("To Do", "Agreed in Principle", "TBC", anything).
+ * The filter dropdown used to show that raw string unmodified as both the
+ * option's value and its label, so the same operational state could appear
+ * under several different-looking options and every register's dropdown read
+ * in whatever casing and wording its source documents happened to use.
+ *
+ * This groups recognised wording into the workflow vocabulary a consultant
+ * actually thinks in, for the option's LABEL only. The option's `value` stays
+ * the exact stored string returned by `currentRowStatus`, so filtering
+ * behaviour, the event API payload and the audit trail are completely
+ * unchanged — only what the option reads as changes. A raw value this
+ * register's groups do not recognise is never forced into one: it falls back
+ * to a plain humanized rendering of the stored string, exactly as before.
+ * -------------------------------------------------------------------------- */
+
+interface StatusGroup { label: string; rank: number; match: (normalized: string) => boolean }
+
+function normalizeStatusText(value: string): string {
+  return value.toLowerCase().replace(/[_\s]+/g, '-').replace(/[^a-z0-9-]/g, '');
+}
+
+const STATUS_GROUPS: Partial<Record<string, StatusGroup[]>> = {
+  Actions: [
+    { label: 'To do', rank: 0, match: (s) => /^(open|to-?do|not-?started|new|backlog|planned)$/.test(s) },
+    { label: 'In progress', rank: 1, match: (s) => /in-?progress|started|underway|ongoing|^active$/.test(s) },
+    { label: 'Blocked', rank: 2, match: (s) => /block|stuck|on-?hold|waiting/.test(s) },
+    { label: 'Done', rank: 3, match: (s) => /complet|^done$|closed|resolved|finished/.test(s) },
+    { label: 'Cancelled', rank: 4, match: (s) => /cancel|abandon|dropped|withdrawn/.test(s) },
+  ],
+  Open_Questions: [
+    { label: 'Open', rank: 0, match: (s) => /^(open|pending|outstanding|awaiting|to-?do)$/.test(s) },
+    { label: 'Answered', rank: 1, match: (s) => /answer|resolved|closed|complet/.test(s) },
+    { label: 'Parked', rank: 2, match: (s) => /park|on-?hold|deferred/.test(s) },
+  ],
+  Risks_Issues: [
+    { label: 'Open', rank: 0, match: (s) => /^(open|identified|new|active)$/.test(s) },
+    { label: 'Mitigated', rank: 1, match: (s) => /mitigat/.test(s) },
+    { label: 'Accepted', rank: 2, match: (s) => /accept/.test(s) },
+    { label: 'Resolved', rank: 3, match: (s) => /resolv|closed|complet/.test(s) },
+  ],
+  Decisions: [
+    { label: 'Proposed', rank: 0, match: (s) => /propos|draft/.test(s) },
+    { label: 'Agreed in principle', rank: 1, match: (s) => /agreed-?in-?principle/.test(s) },
+    { label: 'Agreed', rank: 2, match: (s) => /^agreed$/.test(s) },
+    { label: 'Pending ratification', rank: 3, match: (s) => /pending-?ratification/.test(s) },
+    { label: 'Ratified', rank: 4, match: (s) => /ratif|decided|approve|sign-?off|signed-?off|finalis|finaliz/.test(s) },
+    { label: 'Rejected', rank: 5, match: (s) => /reject|declin/.test(s) },
+    { label: 'Parked', rank: 6, match: (s) => /park|on-?hold|deferred/.test(s) },
+    { label: 'Superseded', rank: 7, match: (s) => /supersed/.test(s) },
+  ],
+  Milestones: [
+    { label: 'Upcoming', rank: 0, match: (s) => /^(not-?started|open|planned|pending|scheduled|to-?do|upcoming|forecast)$/.test(s) },
+    { label: 'In progress', rank: 1, match: (s) => /in-?progress|underway|started|in-?flight|ongoing/.test(s) },
+    { label: 'At risk', rank: 2, match: (s) => /at-?risk|slip|delayed|late/.test(s) },
+    { label: 'Achieved', rank: 3, match: (s) => /achiev|complet|delivered|^done$|resolved|closed/.test(s) },
+    { label: 'Missed', rank: 4, match: (s) => /miss|breach|overdue|not-?achieved|fail/.test(s) },
+  ],
+  Config_Changes: [
+    { label: 'Proposed', rank: 0, match: (s) => /^(open|propos|planned|pending)$/.test(s) },
+    { label: 'Applied', rank: 1, match: (s) => /appl/.test(s) },
+    { label: 'Verified', rank: 2, match: (s) => /verif/.test(s) },
+    { label: 'Reverted', rank: 3, match: (s) => /revert|rollback|rolled-?back/.test(s) },
+  ],
+  Uncertainty: [
+    { label: 'Open', rank: 0, match: (s) => /^(open|uncertain|unclear|unknown)$/.test(s) },
+    { label: 'Resolved', rank: 1, match: (s) => /resolv|closed|clarif/.test(s) },
+  ],
+  // Entities and Sources are reference-only rows with no status-change actions
+  // (see `FIELD_ACTIONS_EXCLUDED` / the absence of a `STATUS_ACTIONS` entry
+  // below): there is no workflow to group their status wording into, so they
+  // are deliberately left out of this map and fall back to a plain humanized
+  // label in whatever order the raw values sort in, exactly as before.
+};
+
+function statusGroupFor(registerName: string, raw: string): StatusGroup | undefined {
+  return STATUS_GROUPS[registerName]?.find((group) => group.match(normalizeStatusText(raw)));
+}
+
+/** The status filter's options for one register: canonical label where recognised, workflow order, raw value untouched. */
+export function statusFilterOptions(registerName: string, rawStatuses: string[]): Array<{ value: string; label: string }> {
+  const distinct = Array.from(new Set(rawStatuses.filter(Boolean)));
+  const groupMemberCounts = new Map<string, number>();
+  for (const raw of distinct) {
+    const group = statusGroupFor(registerName, raw);
+    if (group) groupMemberCounts.set(group.label, (groupMemberCounts.get(group.label) ?? 0) + 1);
+  }
+  return distinct
+    .toSorted((a, b) => {
+      const rankDiff = (statusGroupFor(registerName, a)?.rank ?? 999) - (statusGroupFor(registerName, b)?.rank ?? 999);
+      return rankDiff !== 0 ? rankDiff : a.localeCompare(b);
+    })
+    .map((raw) => {
+      const group = statusGroupFor(registerName, raw);
+      const humanized = humanize(raw.replaceAll('_', '-'));
+      // More than one raw wording maps to the same canonical group (e.g. two
+      // different source spellings that both mean "open"): keep the raw
+      // wording visible in parentheses so the two remain distinguishable
+      // options rather than two identical-looking entries for different
+      // stored values.
+      const label = !group ? humanized : (groupMemberCounts.get(group.label) ?? 0) > 1 ? `${group.label} (${humanized})` : group.label;
+      return { value: raw, label };
+    });
+}
 function originTone(origin: string) { return origin === 'human' ? 'in-progress' : origin === 'system' ? 'neutral' : 'verified'; }
 function originLabel(origin: string) { return origin === 'human' ? 'Human' : origin === 'system' ? 'System' : 'Source'; }
 

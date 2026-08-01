@@ -149,6 +149,13 @@ function text(value: unknown): string {
 // ICU collation, so two machines with different LANG produced different packet
 // hashes for byte-identical packets, and the determinism claim failed silently.
 function stable(value: unknown): string {
+  // `JSON.stringify(undefined)` returns the JS value `undefined`, not a
+  // string — interpolating that into the template literals below produced
+  // the bare (invalid-JSON) token `undefined` wherever a field was omitted
+  // rather than explicitly null, which only surfaced once a packet row
+  // started carrying an optional field (`work_package_tags`/`answers`) that
+  // is legitimately absent rather than always present-or-null.
+  if (value === undefined) return 'null';
   if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
   if (value && typeof value === 'object') {
     return `{${Object.entries(value as JsonObject).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([key, child]) => `${JSON.stringify(key)}:${stable(child)}`).join(',')}}`;
@@ -778,6 +785,11 @@ function assertedFields(row: PacketRow): Record<string, unknown> {
     source_ref: row.source_ref,
     related_refs: row.related_refs,
     supersedes: row.supersedes,
+    // Goal 3/4 additions to the packet contract — omitting these here silently
+    // dropped them before `upsertFact` ever saw them, even though the schema
+    // itself accepted them.
+    work_package_tags: row.work_package_tags,
+    answers: row.answers,
     details: row.details,
   };
   if (row.op === 'add') return candidate;
