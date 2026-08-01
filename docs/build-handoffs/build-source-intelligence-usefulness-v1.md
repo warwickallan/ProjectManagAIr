@@ -1,9 +1,9 @@
 # build/source-intelligence-usefulness-v1 — two-intelligence architecture, Consultant Reasoning, usefulness proof
 
 **Baseline** `6de535f17ada80f8b30c92626ca10cdd1e9e2228` (build/source-intelligence-acceptance-prompts-v1)
-**Head** `094399edf8a728b1abb8ff63fe575a20b995a350` (second-source readiness,
-source reconciliation and usability pass — see below); prior tip was `a434d92`
-(reasoning-first primary navigation) — see `git log` for the full history.
+**Head** `c5eee4fc2f24db8e12b80d87bc8e982a134034b9` (packet-internal relationship
+resolution — see below); prior tips were `3e6a351` (Goal 8 verification) and
+`094399e` (second-source readiness) — see `git log` for the full history.
 **Built by** claude-opus-5 / claude-sonnet-5, 31 July – 1 August 2026
 **Verdict** PENDING WARWICK'S ASSESSMENT — everything below is built and
 verified; **no skill has been promoted and this branch has not been merged.**
@@ -551,6 +551,111 @@ viewport heights (`.table-tools > span` given clearance margin). See the
 ticket-format final report delivered to Warwick for full per-item evidence
 and screenshots.
 
+## Packet-internal relationship resolution (`c5eee4f`, this ticket)
+
+Removes residual risk 5 below. A relationship asserted by a packet row could not
+name another row the same packet created in a LATER register category: the fixed
+category order (`Decisions` before `Open_Questions`, …) meant an answers-link
+from a Decisions row could only resolve a question that already existed. One
+meeting raising a question and answering it twenty minutes later therefore cost
+a second extraction pass — another provider call, another changeset, another
+review — purely because of an internal ordering artefact.
+
+`applyReviewedChangeset` now applies a packet in explicit phases, inside its
+existing transaction:
+
+- **phase 0** — allocate every durable identifier this packet creates;
+- **phase 1** — materialise every durable row: row-creating operations first, in
+  `seq` order, then row-mutating operations, also in `seq` order;
+- **phase 2** — resolve and apply every relationship between rows.
+
+Because all creation precedes all mutation, and all mutation precedes all
+relationship resolution, register category order no longer decides whether a
+reference has a target. `upsertFact` was split into `materialiseFact` (rows,
+fields, typed detail, anchors, marker discharges, field chronology) and
+`applyFactRelationships` (`answers`/`answered_by`, supersession, reaffirmation).
+
+`target_id` may now name the `client_ref` of a row the same packet creates.
+`validatePacket` and `deterministicOps` treat that as a legal forward reference
+when it lands in the operation's own register, and still hold it as
+`unverified_link` when it does not. A row targeting itself is a new blocker. A
+forward-referenced target has no prior state, so no contested-field check runs
+against it and nothing can be silently overwritten.
+
+Relationship events are stamped with the source's own event-time rather than
+apply wall-clock, so they sort by meeting chronology like field updates already
+do. Supersession now also writes a mirrored `superseded_by` event, so the
+relationship is inspectable from the superseded row.
+
+**One real defect found by writing the proof.** Anchors were deleted and
+re-inserted per operation, so when a packet touched one row twice — a question
+raised by an `add` and closed by a `resolve` in the same meeting — the second
+operation deleted the evidence the first had anchored. Anchors are now cleared
+once per row per apply, which keeps replacement idempotent across applies while
+letting every operation within one packet contribute its own anchor.
+
+The review/apply boundary is unchanged: this reorders work strictly inside a
+single already-reviewed changeset's apply transaction, only accepted operations
+are read, and the whole thing still commits or rolls back as one unit. No
+provider call, no schema change, no migration.
+
+`tests/packetInternalRelationships.test.ts` (2 tests) proves the case end to end
+through the real intake, extraction and apply pipeline with a fake provider that
+throws if called twice: one meeting raises a question and answers it later in
+the same source, preserving the original question, its earlier anchor, the
+answering decision and its later anchor, effective answered status via its own
+reviewed `resolve` operation, the bidirectional answer relationship with source
+and origin on both halves, one reviewed and applied packet, and exactly one
+provider call. A second test confirms a cross-register forward reference is
+still held as `unverified_link`.
+
+`tsc` clean. Full suite 553 passed, 1 skipped, 73 failed — the same pre-existing
+Windows EBUSY/EPERM teardown baseline as every prior ticket, unchanged in count
+and file set. Repository data-boundary scan clean.
+
+**Stopped deliberately after this commit.** The real-provider second-source
+acceptance run, the branch-history correction and the merge decision were all
+still outstanding when a more fundamental source-safety question was raised —
+see the next section.
+
+## Source-safety inspection (this session, inspection only — nothing implemented)
+
+Warwick holds two real Teams VTTs whose filenames differ only by ` (2)` but
+which are different meetings, and neither carries a trustworthy meeting date.
+An inspection-only pass (read-only against the normal assessment database; no
+ingest, no provider call, no write) established the following. **None of it is
+implemented.**
+
+1. **One of the two files is already in the database.** SHA-256
+   `4c67ed61…ee208f` is `source_documents.SRC-001` in the live customer
+   project, stored under a THIRD filename. SHA-256 `ee5d3018…fabf096` is
+   unknown. Filename matching would have found neither.
+2. **Duplicate protection is byte-exact only.** `intakeProjectSource` keys on
+   `(project_id, content_hash)` and the watcher's `isKnownHash` does the same,
+   both before any provider call. A re-export with harmless formatting
+   differences, a partial overlapping transcript, and two different meetings
+   with near-identical titles are all undetected.
+3. **The mandatory date gate does force an invented date.**
+   `confirmSourceMetadata` hard-requires a valid `YYYY-MM-DD`. Worse, the
+   confirmed date is not what chronology actually reads: `humanPrecedenceInstant`
+   reads the immutable `source_documents.event_date`, which is NULL for a real
+   Teams VTT, so precedence silently falls back to `created_at` — upload order.
+   A later-uploaded source can become precedent purely by arriving second.
+4. **There is no discard and no post-apply void.** Source-level routes are
+   `sources`, `retry`, `skip`, `metadata` only. No mark-duplicate, no
+   wrong-project, no wrong-file, no discard, no void. The event-sourced
+   projection could support a void cleanly — `rebuildProjection` already replays
+   `register_row_events`, which carry `source_id` and `origin` — but nothing
+   filters by voided source today.
+
+**Next action** is a bounded source-safety ticket. See REPORT 5 in the session
+transcript for the full recommendation; the smallest coherent scope is
+(a) `Meeting date unknown` as an explicit first-class state with separate
+chronology precision, (b) chronology reading the confirmed date and refusing to
+order an unknown-date source against a dated one, (c) near-duplicate detection
+surfaced before extraction, and (d) a governed source void that rebuilds
+effective state by excluding that source's own events.
+
 ## Migrations
 
 - `013_provider_outputs_prompt_registry_and_consultant_views.sql` — carried
@@ -622,17 +727,20 @@ and screenshots.
    verdict, but Warwick may want the real-provider run performed separately
    before treating second-source ingestion as fully proven end to end with
    the actual model.
-5. **(New, this ticket)** The `answers` relationship, when the answering
-   source is ingested BEFORE the question it answers exists in the register
-   (as in this ticket's own out-of-order scenario), cannot be expressed
-   within a single packet — `Decisions` is always processed before
-   `Open_Questions` in the fixed category order. It requires a second, later
-   pass over the same source (a real follow-up correction, or a human
-   confirming the link once both sides exist). This is now understood and
-   demonstrated, not silently broken, but it means a provider generating a
-   single one-shot packet per source cannot itself create a same-packet
-   answers-link to a row category-ordered after it — worth flagging to
-   whoever writes the real extraction skill's prompt guidance.
+5. ~~The `answers` relationship cannot be expressed within a single packet~~ —
+   **RESOLVED in `c5eee4f`** by deterministic two-phase packet application. A
+   question raised and answered in ONE meeting now links inside one packet, one
+   changeset and one provider call. The CROSS-source case (question and answer
+   in two different meetings) still legitimately needs a second pass, because no
+   single packet could ever contain both.
+6. **(New, this session — inspection only, not fixed)** Source identity,
+   duplicate detection, meeting-date handling and post-apply rollback are all
+   materially weaker than the rest of the pipeline. Byte-exact duplicate
+   detection only; the mandatory date gate forces an invented date; chronology
+   silently falls back to upload order for any transcript with no recoverable
+   date; there is no discard and no source void. This blocks real second-source
+   acceptance with real transcripts and is the reason this branch stopped where
+   it did. Details in the section above.
 
 ## Still required
 
