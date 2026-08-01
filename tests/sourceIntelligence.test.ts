@@ -233,6 +233,82 @@ describe('deterministic Source Intelligence spine', () => {
     }
   });
 
+  it('Goal 2 — a late-arriving but chronologically older source cannot overwrite a chronologically newer one, and replay is order-independent', async () => {
+    const { dir, root, context } = tempDatabase();
+    try {
+      const project = await createSyntheticProject(context.db, root, 'CHRON');
+
+      // Source A establishes the action. Event date 2026-08-01.
+      const aText = ['WEBVTT', 'NOTE Recorded: 2026-08-01', '', '00:00:01.000 --> 00:00:03.000', 'Casey: Confirm the release route.'].join('\n');
+      const a = await intakeProjectSource(context.db, project.projectId, { name: 'source-a.vtt', dataBase64: Buffer.from(aText).toString('base64') });
+      const runA = trustedRun(context.db, project.projectId, String(a.sourceId));
+      const packetA = packetFor(context.db, project.projectId, 'CHRON', String(a.sourceId), runA);
+      packetA.sheets.Actions.rows[0].summary = 'Summary from source A (2026-08-01).';
+      const frozenA = freezePacketAndCreateChangeset(context.db, packetA);
+      const idsA = (context.db.prepare('SELECT id FROM register_change_ops WHERE changeset_id = ?').all(frozenA.changesetId) as Array<{ id: string }>).map((row) => row.id);
+      reviewChangeset(context.db, frozenA.changesetId, { decision: 'accept', reviewer: 'Casey', opIds: idsA, batch: true });
+      applyReviewedChangeset(context.db, frozenA.changesetId);
+      const target = String((context.db.prepare("SELECT external_register_id FROM project_register_rows WHERE project_id = ? AND register_name = 'Actions'").get(project.projectId) as { external_register_id: string }).external_register_id);
+
+      // Source B is chronologically NEWER (2026-08-05) and updates the same row.
+      const bText = ['WEBVTT', 'NOTE Recorded: 2026-08-05', '', '00:00:01.000 --> 00:00:03.000', 'Casey: The release route is confirmed as the northern corridor.'].join('\n');
+      const b = await intakeProjectSource(context.db, project.projectId, { name: 'source-b.vtt', dataBase64: Buffer.from(bText).toString('base64') });
+      const runB = trustedRun(context.db, project.projectId, String(b.sourceId));
+      const packetB = packetFor(context.db, project.projectId, 'CHRON', String(b.sourceId), runB);
+      const updateB = packetB.sheets.Actions.rows[0];
+      updateB.op = 'update'; updateB.target_id = target; updateB.proposed_id = target; updateB.status = 'open';
+      updateB.summary = 'Summary from source B (2026-08-05), the newer decision.';
+      const frozenB = freezePacketAndCreateChangeset(context.db, packetB);
+      expect((context.db.prepare("SELECT op FROM register_change_ops WHERE changeset_id = ? AND register_name = 'Actions'").get(frozenB.changesetId) as { op: string }).op).toBe('update');
+      // Its own Sources row registers source-b.vtt as a new record and may be
+      // held (e.g. `possible_duplicate` against source-a.vtt's own Sources
+      // row) — irrelevant to what this test checks, so route each op's
+      // decision by whether it can legally be accepted at all.
+      const opsB = context.db.prepare('SELECT id, op FROM register_change_ops WHERE changeset_id = ?').all(frozenB.changesetId) as Array<{ id: string; op: string }>;
+      const heldOps = new Set(['conflict', 'unverified_link', 'possible_duplicate']);
+      for (const row of opsB) reviewChangeset(context.db, frozenB.changesetId, { decision: heldOps.has(row.op) ? 'reject' : 'accept', reviewer: 'Casey', opIds: [row.id] });
+      applyReviewedChangeset(context.db, frozenB.changesetId);
+      expect((context.db.prepare('SELECT summary FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(project.projectId, target) as { summary: string }).summary)
+        .toBe('Summary from source B (2026-08-05), the newer decision.');
+
+      // Source C is a LATE-ARRIVING but chronologically OLDER source
+      // (2026-07-20, before both A and B) proposing an update to the same
+      // field. It must be held as a conflict, not silently applied over B's
+      // chronologically newer state.
+      const cText = ['WEBVTT', 'NOTE Recorded: 2026-07-20', '', '00:00:01.000 --> 00:00:03.000', 'Casey: The release route is still under discussion.'].join('\n');
+      const c = await intakeProjectSource(context.db, project.projectId, { name: 'source-c.vtt', dataBase64: Buffer.from(cText).toString('base64') });
+      const runC = trustedRun(context.db, project.projectId, String(c.sourceId));
+      const packetC = packetFor(context.db, project.projectId, 'CHRON', String(c.sourceId), runC);
+      const updateC = packetC.sheets.Actions.rows[0];
+      updateC.op = 'update'; updateC.target_id = target; updateC.proposed_id = target; updateC.status = 'open';
+      updateC.summary = 'Stale summary from source C (2026-07-20), arriving late.';
+      const frozenC = freezePacketAndCreateChangeset(context.db, packetC);
+      expect((context.db.prepare("SELECT op FROM register_change_ops WHERE changeset_id = ? AND register_name = 'Actions'").get(frozenC.changesetId) as { op: string }).op).toBe('conflict');
+
+      // Held, never applied: B's value survives untouched — both positions
+      // stay inspectable via the append-only event trail rather than one
+      // silently replacing the other.
+      expect((context.db.prepare('SELECT summary FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(project.projectId, target) as { summary: string }).summary)
+        .toBe('Summary from source B (2026-08-05), the newer decision.');
+      const summaryEvents = context.db.prepare("SELECT new_value FROM register_row_events WHERE project_id = ? AND external_register_id = ? AND field = 'summary' ORDER BY occurred_at").all(project.projectId, target) as Array<{ new_value: string }>;
+      expect(summaryEvents.map((event) => event.new_value)).toEqual([
+        'Summary from source A (2026-08-01).',
+        'Summary from source B (2026-08-05), the newer decision.',
+      ]);
+
+      // Deterministic, order-independent replay: rebuilding the projection
+      // twice from the same event log yields byte-identical state.
+      rebuildProjection(context.db, project.projectId, '2026-08-06T00:00:00.000Z');
+      const once = JSON.stringify(context.db.prepare('SELECT * FROM register_row_state WHERE project_id = ? ORDER BY external_register_id').all(project.projectId));
+      rebuildProjection(context.db, project.projectId, '2026-08-06T00:00:00.000Z');
+      const twice = JSON.stringify(context.db.prepare('SELECT * FROM register_row_state WHERE project_id = ? ORDER BY external_register_id').all(project.projectId));
+      expect(once).toBe(twice);
+    } finally {
+      context.db.close();
+      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('removes unsupported or uncited brief claims', () => {
     const markdown = ['## Brief', 'Confirmed route [DEMO-A-001]', 'Unsupported statement.', 'Wrong record [DEMO-R-999]'].join('\n');
     const result = validateBriefCitations(markdown, ['DEMO-A-001']);

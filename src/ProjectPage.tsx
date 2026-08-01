@@ -420,7 +420,7 @@ function ProjectInbox({ projectId, userId, sources, proposals, sourceIntelligenc
     <SourceProcessingAlerts sources={sources} />
     {sourceIntelligence ? <ReviewLanes projectId={projectId} userId={userId} intelligence={sourceIntelligence} onChanged={onChanged} /> : null}
     {proposals.length ? <details className="legacy-proposals"><summary>Legacy source proposals ({proposals.length})</summary><div className="stacked-records">{proposals.map((proposal) => <article className="stacked-record" key={proposal.id}><div className="record-line"><div><h3>{proposal.payload.sourceMetadata.originalFileName}</h3><p>{proposal.payload.items.length} legacy proposed item(s)</p></div><StatusChip value={proposal.status} /></div><ul className="proposal-list">{proposal.payload.items.map((item) => <li key={item.id}><strong>{humanize(item.type)}</strong><span>{item.title}</span></li>)}</ul>{proposal.status === 'proposed' ? <p className="inline-note">Read-only historical proposal. Use governed changesets for review and apply.</p> : null}</article>)}</div></details> : null}
-    <h3 className="subhead">Sources</h3><SourceList sources={sources} />
+    <h3 className="subhead">Sources</h3><SourceList projectId={projectId} userId={userId} sources={sources} onChanged={onChanged} />
   </Section>;
 }
 
@@ -495,14 +495,119 @@ function OperationReview({ operation, busy, disabled, onDecision }: { operation:
 function operationTitle(operation: ChangeOperation) { return String(operation.proposedRow.title ?? operation.proposedRow.question ?? operation.proposedRow.name ?? operation.targetExternalId ?? operation.clientRef); }
 function operationSummary(operation: ChangeOperation) { return String(operation.proposedRow.summary ?? operation.proposedRow.description ?? operation.proposedRow.question ?? 'Review the proposed structured fields and evidence anchors.'); }
 
-function SourceList({ sources }: { sources: Project['inboxSources'] }) {
+function SourceList({ projectId, userId, sources, onChanged }: { projectId: string; userId: string; sources: Project['inboxSources']; onChanged: () => void }) {
   const [openError, setOpenError] = useState('');
+  const [openMetadataFor, setOpenMetadataFor] = useState<string | null>(null);
   async function openSource(filePath: string) { try { setOpenError(''); await postJson('/api/files/open', 'POST', { path: filePath }); } catch (caught) { setOpenError(caught instanceof Error ? caught.message : 'Could not open original file.'); } }
   if (sources.length === 0) return <EmptyState>No sources have been taken into this project yet.</EmptyState>;
   return <div className="stacked-records">{openError ? <p className="form-error" role="alert">{openError}</p> : null}{sources.map((source) => {
     const processing = sourceProcessingView(source);
-    return <article className="stacked-record" key={source.id}><div className="record-line"><div><h3>{source.originalFileName}</h3><p>{safePathLabel(source.currentExternalPath)}</p></div><StatusChip value={processing.chipValue} label={processing.chipLabel} /></div><dl className="inline-details"><div><dt>Type</dt><dd>{source.sourceType}</dd></div><div><dt>Hash</dt><dd>{source.contentHash}</dd></div><div><dt>Received</dt><dd>{formatDateTime(source.originalReceivedAt)}</dd></div><div><dt>Processor</dt><dd>{source.processorProvider}</dd></div><div><dt>Stage</dt><dd>{processing.stage ?? 'Not recorded'}</dd></div><div><dt>Last change</dt><dd>{formatDateTime(source.updatedAt)}</dd></div></dl><SourceProcessingNotice source={source} /><button className="inline-button" onClick={() => openSource(source.currentExternalPath)}>Open original</button></article>;
+    const open = openMetadataFor === source.id;
+    return <article className="stacked-record" key={source.id}><div className="record-line"><div><h3>{source.originalFileName}</h3><p>{safePathLabel(source.currentExternalPath)}</p></div><StatusChip value={processing.chipValue} label={processing.chipLabel} /></div><dl className="inline-details"><div><dt>Type</dt><dd>{source.sourceType}</dd></div><div><dt>Hash</dt><dd>{source.contentHash}</dd></div><div><dt>Received</dt><dd>{formatDateTime(source.originalReceivedAt)}</dd></div><div><dt>Processor</dt><dd>{source.processorProvider}</dd></div><div><dt>Stage</dt><dd>{processing.stage ?? 'Not recorded'}</dd></div><div><dt>Last change</dt><dd>{formatDateTime(source.updatedAt)}</dd></div></dl><SourceProcessingNotice source={source} /><div className="action-row"><button className="inline-button" onClick={() => openSource(source.currentExternalPath)}>Open original</button><button className={processing.awaitingMetadata ? 'button' : 'inline-button'} onClick={() => setOpenMetadataFor(open ? null : source.id)}>{processing.awaitingMetadata ? 'Confirm meeting details' : open ? 'Close meeting details' : 'Meeting details'}</button></div>{open ? <MetadataConfirmationForm projectId={projectId} userId={userId} sourceId={source.id} onDone={() => { setOpenMetadataFor(null); onChanged(); }} /> : null}</article>;
   })}</div>;
+}
+
+interface SourceMetadataRecord {
+  sourceId: string;
+  meetingSubject: string | null;
+  eventDate: string | null;
+  eventTime: string | null;
+  timezone: string | null;
+  primaryWorkPackage: string | null;
+  additionalWorkPackages: string[];
+  participants: string[];
+  recordingGapNotes: string | null;
+  confirmed: boolean;
+  confirmedAt: string | null;
+  confirmedBy: string | null;
+}
+
+function MetadataConfirmationForm({ projectId, userId, sourceId, onDone }: { projectId: string; userId: string; sourceId: string; onDone: () => void }) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [meetingSubject, setMeetingSubject] = useState('');
+  const [eventDate, setEventDate] = useState('');
+  const [eventTime, setEventTime] = useState('');
+  const [timezone, setTimezone] = useState('');
+  const [primaryWorkPackage, setPrimaryWorkPackage] = useState('');
+  const [additionalWorkPackages, setAdditionalWorkPackages] = useState('');
+  const [participants, setParticipants] = useState('');
+  const [recordingGapNotes, setRecordingGapNotes] = useState('');
+  const [reason, setReason] = useState('');
+  const [wasConfirmed, setWasConfirmed] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/sources/${encodeURIComponent(sourceId)}/metadata`);
+        if (!response.ok) throw new Error('Could not load meeting metadata.');
+        const record = await response.json() as SourceMetadataRecord;
+        if (cancelled) return;
+        setMeetingSubject(record.meetingSubject ?? '');
+        setEventDate(record.eventDate ?? '');
+        setEventTime(record.eventTime ?? '');
+        setTimezone(record.timezone ?? '');
+        setPrimaryWorkPackage(record.primaryWorkPackage ?? '');
+        setAdditionalWorkPackages(record.additionalWorkPackages.join(', '));
+        setParticipants(record.participants.join(', '));
+        setRecordingGapNotes(record.recordingGapNotes ?? '');
+        setWasConfirmed(record.confirmed);
+      } catch (caught) {
+        if (!cancelled) setError(caught instanceof Error ? caught.message : 'Could not load meeting metadata.');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [projectId, sourceId]);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    try {
+      setSaving(true);
+      setError('');
+      await postJson(`/api/projects/${encodeURIComponent(projectId)}/sources/${encodeURIComponent(sourceId)}/metadata`, 'POST', {
+        actor: userId,
+        meetingSubject,
+        eventDate,
+        eventTime: eventTime || null,
+        timezone: timezone || null,
+        primaryWorkPackage,
+        additionalWorkPackages: splitList(additionalWorkPackages),
+        participants: splitList(participants),
+        recordingGapNotes: recordingGapNotes || null,
+        reason: reason || null,
+      });
+      onDone();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Could not save meeting metadata.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (loading) return <p className="inline-note">Loading meeting details…</p>;
+
+  return <form className="metadata-confirmation-form" onSubmit={(event) => void submit(event)}>
+    {wasConfirmed ? <p className="inline-note">Correcting confirmed meeting details preserves the previous values as an audited event — nothing is silently overwritten.</p> : <p className="inline-note">Confirm the mandatory meeting details before this source can be extracted.</p>}
+    {error ? <p className="form-error" role="alert">{error}</p> : null}
+    <label>Meeting subject *<input required value={meetingSubject} onChange={(event) => setMeetingSubject(event.target.value)} /></label>
+    <label>Meeting date *<input required type="date" value={eventDate} onChange={(event) => setEventDate(event.target.value)} /></label>
+    <label>Start time<input type="time" value={eventTime} onChange={(event) => setEventTime(event.target.value)} /></label>
+    <label>Timezone<input value={timezone} onChange={(event) => setTimezone(event.target.value)} placeholder="e.g. Europe/London" /></label>
+    <label>Primary work package *<input required value={primaryWorkPackage} onChange={(event) => setPrimaryWorkPackage(event.target.value)} /></label>
+    <label>Other work packages discussed<input value={additionalWorkPackages} onChange={(event) => setAdditionalWorkPackages(event.target.value)} placeholder="Comma-separated" /></label>
+    <label>Participants<input value={participants} onChange={(event) => setParticipants(event.target.value)} placeholder="Comma-separated" /></label>
+    <label>Recording gap notes<textarea value={recordingGapNotes} onChange={(event) => setRecordingGapNotes(event.target.value)} /></label>
+    {wasConfirmed ? <label>Reason for this correction<input value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Optional, recorded in the audit trail" /></label> : null}
+    <div className="action-row"><button className="button" type="submit" disabled={saving}>{wasConfirmed ? 'Save correction' : 'Confirm meeting details'}</button></div>
+  </form>;
+}
+
+function splitList(value: string): string[] {
+  return value.split(',').map((item) => item.trim()).filter((item) => item.length > 0);
 }
 
 function PlaceholderSection({ id, title }: { id: string; title: string }) { return <Section id={id} title={title} kicker="SQLite-backed workspace" count={0}><EmptyState>This workspace tab is ready for approved source-derived records.</EmptyState></Section>; }

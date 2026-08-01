@@ -804,7 +804,7 @@ function humanPrecedenceInstant(source: { event_date: string | null; created_at:
 // Precedence is checked per field, not per row (B6): a newer human note on
 // `owner` must not block an extracted update to `mitigation`. Only fields this
 // packet actually asserts a change to can be contested.
-function contestedFields(db: DatabaseSync, projectId: string, targetId: string, row: PacketRow, instant: string): string[] {
+function contestedFields(db: DatabaseSync, projectId: string, targetId: string, row: PacketRow, instant: string, sourceId: string): string[] {
   const asserted = assertedFields(row);
   const stored = db.prepare('SELECT raw_row_json FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(projectId, targetId) as { raw_row_json: string } | undefined;
   const existing = stored ? (JSON.parse(stored.raw_row_json) as JsonObject) : {};
@@ -832,8 +832,15 @@ function contestedFields(db: DatabaseSync, projectId: string, targetId: string, 
     if (canonicalValueJson(value) === canonicalValueJson(currentOf(key, existingDetails[key]))) continue;
     changed.add(key);
   }
-  const statement = db.prepare('SELECT 1 FROM register_row_events WHERE project_id = ? AND external_register_id = ? AND field = ? AND occurred_at > ? LIMIT 1');
-  return [...changed].sort().filter((field) => Boolean(statement.get(projectId, targetId, field, instant)));
+  // A strictly later event always wins outright. An event recorded at the
+  // EXACT same instant from a DIFFERENT source is same-day/no-reliable-time
+  // ambiguity (Goal 2) — this must surface as an explicit conflict for human
+  // adjudication rather than either side silently winning by apply order. A
+  // same-source match at the identical instant (a retry or idempotent
+  // replay of this same packet) is excluded, or every re-run would contest
+  // its own prior write.
+  const statement = db.prepare("SELECT 1 FROM register_row_events WHERE project_id = ? AND external_register_id = ? AND field = ? AND (occurred_at > ? OR (occurred_at = ? AND source_id IS NOT NULL AND source_id != ?)) LIMIT 1");
+  return [...changed].sort().filter((field) => Boolean(statement.get(projectId, targetId, field, instant, instant, sourceId)));
 }
 
 // Deterministic near-duplicate detection for additions (B8). The
@@ -879,10 +886,10 @@ function deterministicOps(db: DatabaseSync, projectId: string, packet: SourceInt
         op = 'unverified_link';
         reason = 'Target does not exist in the same project and register.';
       } else {
-        contested = contestedFields(db, projectId, row.target_id, row, instant);
+        contested = contestedFields(db, projectId, row.target_id, row, instant, packet.source.source_id);
         if (contested.length > 0) {
           op = 'conflict';
-          reason = `A newer human field event outranks this source assertion on: ${contested.join(', ')}.`;
+          reason = `A newer or same-day field event outranks this source assertion on: ${contested.join(', ')}.`;
         }
       }
     } else if (row.op === 'add') {
@@ -1062,10 +1069,11 @@ function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode:
   const externalId = context.refMap.get(String(op.client_ref)) ?? targetId;
   if (!externalId) throw new Error('Apply operation has no target or allocated ID.');
   const existing = db.prepare('SELECT * FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(context.projectId, externalId) as Record<string, unknown> | undefined;
+  const previousRaw = existing ? (JSON.parse(String(existing.raw_row_json)) as JsonObject) : ({} as JsonObject);
   // `proposed` carries only the fields this source actually asserted, so an
   // update genuinely patches the row instead of nulling everything the source
   // did not mention (C13).
-  const raw = existing ? { ...(JSON.parse(String(existing.raw_row_json)) as JsonObject), ...proposed } : { ...proposed };
+  const raw = existing ? { ...previousRaw, ...proposed } : { ...proposed };
   delete raw.discharges_markers;
   // Intra-packet references arrive as client refs and must resolve to the
   // durable identifiers allocated in this same transaction (C14). Previously
@@ -1077,7 +1085,7 @@ function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode:
   raw.related_refs = relatedIds;
   raw.supersedes = supersedesIds;
   if (op.op === 'resolve') raw.status = 'resolved';
-  const sourceRow = db.prepare('SELECT event_date, primary_work_package FROM source_documents WHERE id = ?').get(context.sourceId) as { event_date: string | null; primary_work_package: string | null };
+  const sourceRow = db.prepare('SELECT event_date, created_at, primary_work_package FROM source_documents WHERE id = ?').get(context.sourceId) as { event_date: string | null; created_at: string; primary_work_package: string | null };
   const due = resolveDate(proposed.due_date_raw, sourceRow.event_date);
   // A row's own work-package tags win when the source stated one; otherwise it
   // falls back to the source's confirmed primary work package (Goal 3 — a
@@ -1098,6 +1106,56 @@ function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode:
   // the moment a changeset applied.
   for (const [field, value] of Object.entries(raw)) insertField.run(randomUUID(), rowId, context.projectId, registerName, externalId, field, canonicalValueJson(value), canonicalNormalizedValue(value));
   writeTyped(db, registerName, rowId, context.projectId, externalId, (raw.details ?? {}) as JsonObject, String(raw.title), String(raw.status ?? 'open'));
+  // Goal 2 — one source-origin `register_row_events` row per field this
+  // packet actually changed, stamped with the SOURCE's own event-time
+  // (`humanPrecedenceInstant`, day-granular), not apply wall-clock time. This
+  // gives the existing human-precedence conflict check in `contestedFields`
+  // (run at changeset-creation, in `deterministicOps`) the trail it needs to
+  // also protect against a chronologically-OLDER source applied AFTER a
+  // chronologically-NEWER one: the older source's later-arriving update sees
+  // a field event with a later `occurred_at` than its own instant and is held
+  // as a conflict for review, instead of silently overwriting. Current state
+  // stays keyed on event chronology, not upload/apply order (extends the same
+  // mechanism that already protects a human edit from a stale source, rather
+  // than building a parallel one).
+  const sourceInstant = humanPrecedenceInstant({ event_date: sourceRow.event_date, created_at: sourceRow.created_at });
+  // `due_date` is deliberately excluded here: it is a resolved value computed
+  // by `resolveDate` and written to its own column, not a plain corrections-
+  // map field, so writing its raw (often natural-language) asserted value as
+  // a replay event would feed an unresolved string into `register_row_state`.
+  // Its own conflict-detection already runs unchanged through
+  // `contestedFields`, comparing against whatever due-date events already
+  // exist (currently only human corrections write one).
+  const STRUCTURAL_PROPOSED_KEYS = new Set(['details', 'related_refs', 'supersedes', 'answers', 'discharges_markers', 'work_package_tags', 'due_date_raw']);
+  const fieldChanges: Array<{ field: string; previous: unknown; next: unknown }> = [];
+  for (const [key, value] of Object.entries(proposed)) {
+    if (STRUCTURAL_PROPOSED_KEYS.has(key)) continue;
+    const field = key;
+    if (canonicalValueJson(value) === canonicalValueJson(previousRaw[key])) continue;
+    fieldChanges.push({ field, previous: previousRaw[key] ?? null, next: value });
+  }
+  const previousDetails = (previousRaw.details ?? {}) as JsonObject;
+  for (const [key, value] of Object.entries((proposed.details ?? {}) as JsonObject)) {
+    if (canonicalValueJson(value) === canonicalValueJson(previousDetails[key])) continue;
+    fieldChanges.push({ field: key, previous: previousDetails[key] ?? null, next: value });
+  }
+  if (op.op === 'resolve' && canonicalValueJson('resolved') !== canonicalValueJson(previousRaw.status)) {
+    fieldChanges.push({ field: 'status', previous: previousRaw.status ?? null, next: 'resolved' });
+  }
+  for (const change of fieldChanges) {
+    // Stored plain, like every other `register_row_events` field value
+    // (`recordRegisterEvent` stores `String(previous)`/the raw new value) —
+    // `canonicalValueJson` above is only for equality-checking whether a
+    // field actually changed, not the persisted representation, or replay
+    // would read back a JSON-quoted string as the field's literal value.
+    insertRawRegisterRowEvent(db, context.projectId, externalId, {
+      actor: String(op.reviewer ?? 'reviewer'), eventType: 'source-update', field: change.field,
+      previousValue: change.previous === null || change.previous === undefined ? null : String(change.previous),
+      newValue: change.next === null || change.next === undefined ? null : String(change.next),
+      reason: `Source asserted a new value for ${change.field}.`,
+      sourceId: context.sourceId, occurredAt: sourceInstant, origin: 'source',
+    });
+  }
   db.prepare('DELETE FROM register_row_anchors WHERE project_id = ? AND external_register_id = ? AND source_id = ?').run(context.projectId, externalId, context.sourceId);
   const insertAnchor = db.prepare('INSERT INTO register_row_anchors (id, project_id, external_register_id, source_id, segment_id, speaker, t_ms, quote, verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
   for (const anchor of JSON.parse(String(op.anchors_json)) as Array<{ segment_seq: number; speaker: string | null; t_ms: number | null; quote: string | null }>) {
