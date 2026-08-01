@@ -1,22 +1,13 @@
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import { useApi, type ProjectResponse } from './api';
 import { AIChatPanel } from './AIChatPanel';
 import { ConsultantViewPanel } from './ConsultantViewPanel';
+import { ConsultantReasoningPanel } from './ConsultantReasoningPanel';
+import { DetailFieldList, RegisterTable, Stacked, registerForTab, registerRowRoute, type RegisterRow } from './RegisterViews';
 import { ActivityList, AttentionList, EmptyState, ErrorState, FreshnessNotice, LoadingState, PageIntro, ProgressBar, Section, SourceProcessingAlerts, SourceProcessingNotice, StatusChip, formatDate, formatDateTime, humanize, sourceProcessingView } from './components';
 
 type Project = ProjectResponse['project'];
 type JsonRecord = Record<string, unknown>;
-type RegisterRow = Project['registerRows'][number] & {
-  derivation?: string;
-  confidence?: string;
-  dueDateRaw?: string | null;
-  dueDateConfidence?: string;
-  typedDetails?: JsonRecord;
-  anchors?: Array<{ id: string; sourceId: string; segmentId: string; speaker: string | null; tMs: number | null; quote: string | null; verified: boolean }>;
-  events?: Array<{ id: string; occurredAt: string; actor: string; eventType: string; field: string | null; previousValue: string | null; newValue: string | null; reason: string; evidenceRef: string | null }>;
-  currentState?: { status: string; owner: string | null; dueDate: string | null; resolution: string | null; lastHumanEventAt: string | null } | null;
-  score?: { value: number; band: string; inputs: JsonRecord; scoringVersion: string } | null;
-};
 type LensId = 'needsWarwick' | 'needsCustomer' | 'topRisksIssues' | 'decisionsRequired' | 'blockingQuestions' | 'dueNext' | 'challengeNextMeeting' | 'uncertainOrConflicting' | 'changesSinceLatestSource';
 type OverviewMode = 'changes' | 'meeting' | 'needs-warwick';
 type LensRecord = { id: string; registerName: string; title: string; summary: string; status: string; owner: string | null; dueDate: string | null; score: number; band: string; scoreInputs: JsonRecord };
@@ -77,16 +68,22 @@ type IntelligenceResponse = ProjectResponse & {
   sourceIntelligence?: SourceIntelligence;
   consultantBrief?: ConsultantBrief;
 };
-type TabId = 'overview' | 'inbox' | 'actions' | 'risks' | 'decisions' | 'config-changes' | 'open-questions' | 'milestones' | 'entities' | 'sources' | 'uncertainty' | 'activity' | 'register-comparison' | 'work-packages' | 'data-config' | 'meetings-comms' | 'deliverables' | 'uat-training' | 'handover';
+type TabId = 'overview' | 'inbox' | 'mined-data' | 'actions' | 'risks' | 'decisions' | 'config-changes' | 'open-questions' | 'milestones' | 'entities' | 'sources' | 'uncertainty' | 'activity' | 'register-comparison' | 'work-packages' | 'data-config' | 'meetings-comms' | 'deliverables' | 'uat-training' | 'handover';
 
 const primaryTabs: Array<[TabId, string]> = [
-  ['overview', 'Overview'], ['inbox', 'Inbox'], ['actions', 'Actions'], ['risks', 'Risks & Issues'], ['decisions', 'Decisions'], ['config-changes', 'Config Changes'], ['open-questions', 'Open Questions'], ['milestones', 'Milestones'], ['entities', 'Entities'], ['sources', 'Sources'], ['uncertainty', 'Uncertainty'], ['activity', 'Activity / Verification'],
+  ['overview', 'Overview'], ['inbox', 'Inbox'], ['mined-data', 'Mined Data'], ['actions', 'Actions'], ['risks', 'Risks & Issues'], ['decisions', 'Decisions'], ['config-changes', 'Config Changes'], ['open-questions', 'Open Questions'], ['milestones', 'Milestones'], ['entities', 'Entities'], ['sources', 'Sources'], ['uncertainty', 'Uncertainty'], ['activity', 'Activity / Verification'],
 ];
 const moreTabs: Array<[TabId, string]> = [['register-comparison', 'Register Comparison'], ['work-packages', 'Work Packages'], ['data-config', 'Data & Configuration'], ['meetings-comms', 'Meetings & Comms'], ['deliverables', 'Deliverables'], ['uat-training', 'UAT & Training'], ['handover', 'Handover']];
 
-const registerForTab: Partial<Record<TabId, string>> = {
-  actions: 'Actions', risks: 'Risks_Issues', decisions: 'Decisions', 'config-changes': 'Config_Changes', 'open-questions': 'Open_Questions', milestones: 'Milestones', entities: 'Entities', uncertainty: 'Uncertainty', sources: 'Sources',
-};
+/**
+ * The nine approved registers, in the order the Mined Data workspace presents
+ * them. Decisions first because that is what a consultant reaches for; the
+ * provenance registers last.
+ */
+const minedRegisters: Array<[string, string]> = [
+  ['Decisions', 'Decisions'], ['Actions', 'Actions'], ['Risks_Issues', 'Risks & Issues'], ['Config_Changes', 'Config Changes'],
+  ['Open_Questions', 'Open Questions'], ['Milestones', 'Milestones'], ['Entities', 'Entities'], ['Sources', 'Sources'], ['Uncertainty', 'Uncertainty'],
+];
 
 const overviewModes: Array<{ id: OverviewMode; label: string; description: string; lens: LensId }> = [
   { id: 'changes', label: 'Changes since latest source', description: 'Lead with newly applied or unacknowledged source movement.', lens: 'changesSinceLatestSource' },
@@ -153,6 +150,7 @@ function ProjectTabContent({ project, activeTab, attention, attentionLabel, user
   if (activeTab === 'work-packages') return <WorkPackagesTab project={project} />;
   if (activeTab === 'deliverables') return <DeliverablesTab project={project} attentionLabel={attentionLabel} userId={userId} />;
   if (['data-config', 'meetings-comms', 'uat-training', 'handover'].includes(activeTab)) return <PlaceholderSection id={activeTab} title={labelFor(activeTab)} />;
+  if (activeTab === 'mined-data') return <MinedDataTab project={project} focusedRecordId={focusedRecordId} />;
   const registerName = registerForTab[activeTab];
   if (registerName) return <RegisterBackedTab project={project} tab={activeTab} registerName={registerName} attentionLabel={attentionLabel} userId={userId} focusedRecordId={focusedRecordId} />;
   return <OverviewTab project={project} attention={attention} attentionLabel={attentionLabel} overview={projectOverview} brief={consultantBrief} onChanged={onChanged} />;
@@ -170,11 +168,53 @@ function OverviewTab({ project, attention, attentionLabel, overview, brief, onCh
           <div><dt>Storage schema</dt><dd>{project.storageSchemaVersion}</dd></div>
         </dl>
       </section>
+      <ConsultantReasoningPanel projectId={project.id} />
       {overview ? <AdaptiveOverview projectId={project.id} overview={overview} onChanged={onChanged} /> : null}
-      <ConsultantViewPanel projectId={project.id} deterministicViews={(project.consultantViews ?? []) as never} />
-      {brief ? <ConsultantBriefPanel brief={brief} /> : null}
+      <div className="fallback-surface">
+        <h2 className="fallback-heading">Zero-call deterministic fallback</h2>
+        <p className="fallback-note">
+          Everything below is computed from the register by rule, with no model involved. It is kept as the fallback for when
+          consultant reasoning has not been generated, has gone stale, or failed its contract — it is no longer the primary briefing surface.
+        </p>
+        <ConsultantViewPanel projectId={project.id} deterministicViews={(project.consultantViews ?? []) as never} />
+        {brief ? <ConsultantBriefPanel brief={brief} /> : null}
+      </div>
       <Section id="attention" title={attentionLabel} kicker="Legacy operational attention" count={attention.length} className="attention-panel"><AttentionList items={attention} emptyLabel="This project has nothing assigned to your attention." /></Section>
       <RegisterComparison project={project} compact />
+    </div>
+  );
+}
+
+/**
+ * Mined Data — every approved register row, in full, for inspection.
+ *
+ * This is deliberately not the briefing surface. It is the audit and
+ * correction workspace: the granular project memory that consultant reasoning
+ * reads from, exposed so a wrong row can be found and challenged. The
+ * per-register tabs still exist and still deep-link, so `registerRowRoute`
+ * targets are unaffected by anything here.
+ */
+function MinedDataTab({ project, focusedRecordId }: { project: Project; focusedRecordId: string | null }) {
+  const [selectedRegister, setSelectedRegister] = useState<string>(minedRegisters[0][0]);
+  const label = minedRegisters.find(([name]) => name === selectedRegister)?.[1] ?? humanize(selectedRegister);
+  const rows = project.registerRows.filter((row) => row.registerName === selectedRegister) as RegisterRow[];
+  return (
+    <div className="page-stack mined-data">
+      <section className="panel mined-data-intro" aria-label="About mined data">
+        <p className="section-kicker">Granular approved project memory</p>
+        <h2>Mined Data</h2>
+        <p>
+          Every row below was mined from an approved source and accepted through review. This workspace exists for inspection,
+          audit and correction — not for briefing. For what actually matters next, use the consultant reasoning on the Overview tab.
+        </p>
+      </section>
+      <nav className="section-nav mined-register-nav" aria-label="Registers">
+        {minedRegisters.map(([name, text]) => {
+          const count = project.registerRows.filter((row) => row.registerName === name).length;
+          return <button key={name} type="button" className={selectedRegister === name ? 'active' : ''} aria-pressed={selectedRegister === name} onClick={() => setSelectedRegister(name)}>{text}<span>{count}</span></button>;
+        })}
+      </nav>
+      <RegisterTable title={label} registerName={selectedRegister} rows={rows} comparisonRows={project.registerComparisonRows.filter((row) => row.registerName === selectedRegister)} focusedRecordId={focusedRecordId} />
     </div>
   );
 }
@@ -256,11 +296,6 @@ function overviewModeAvailable(overview: ProjectOverview, mode: OverviewMode) {
 
 function modeLabel(mode: OverviewMode) { return overviewModes.find((item) => item.id === mode)?.label ?? humanize(mode); }
 
-function registerRowRoute(projectId: string, registerName: string, rowId: string) {
-  const tab = Object.entries(registerForTab).find(([, register]) => register === registerName)?.[0] ?? 'overview';
-  return `#/projects/${encodeURIComponent(projectId)}/${tab}?record=${encodeURIComponent(rowId)}`;
-}
-
 function RegisterBackedTab({ project, tab, registerName, attentionLabel, userId, focusedRecordId }: { project: Project; tab: TabId; registerName: string; attentionLabel: string; userId: string; focusedRecordId: string | null }) {
   const rows = project.registerRows.filter((row) => row.registerName === registerName) as RegisterRow[];
   if (rows.length > 0) return <RegisterTable title={labelFor(tab)} registerName={registerName} rows={rows} comparisonRows={project.registerComparisonRows.filter((row) => row.registerName === registerName)} focusedRecordId={focusedRecordId} />;
@@ -273,61 +308,6 @@ function RegisterBackedTab({ project, tab, registerName, attentionLabel, userId,
   return <RegisterTable title={labelFor(tab)} registerName={registerName} rows={rows} comparisonRows={[]} focusedRecordId={focusedRecordId} />;
 }
 
-function RegisterTable({ title, registerName, rows, comparisonRows, focusedRecordId }: { title: string; registerName: string; rows: RegisterRow[]; comparisonRows: Project['registerComparisonRows']; focusedRecordId: string | null }) {
-  const [search, setSearch] = useState('');
-  const [status, setStatus] = useState('all');
-  const [sort, setSort] = useState<'id' | 'title' | 'status'>('id');
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const statuses = useMemo(() => Array.from(new Set(rows.map(currentRowStatus).filter(Boolean))).sort(), [rows]);
-  const filtered = rows.filter((row) => {
-    const haystack = `${row.externalRegisterId} ${row.title} ${row.summary} ${currentRowStatus(row)} ${row.sourceRef ?? ''} ${row.sourceAnchor ?? ''}`.toLowerCase();
-    return (status === 'all' || currentRowStatus(row) === status) && haystack.includes(search.toLowerCase());
-  }).toSorted((a, b) => sortValue(a, sort).localeCompare(sortValue(b, sort)));
-  const selected = rows.find((row) => row.externalRegisterId === (focusedRecordId ?? selectedId)) ?? null;
-  const selectRow = (row: RegisterRow) => { setSelectedId(row.externalRegisterId); window.location.hash = `${window.location.hash.split('?')[0]}?record=${encodeURIComponent(row.externalRegisterId)}`; };
-  return (
-    <Section id={registerName} title={title} kicker="SQLite register" count={filtered.length}>
-      <div className="table-tools"><input className="input" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search IDs, titles, sources" /><select className="input" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">All statuses</option>{statuses.map((item) => <option key={item} value={item}>{item}</option>)}</select><select className="input" value={sort} onChange={(event) => setSort(event.target.value as 'id' | 'title' | 'status')}><option value="id">Sort by ID</option><option value="title">Sort by title</option><option value="status">Sort by status</option></select><span>{filtered.length} rows</span></div>
-      {filtered.length === 0 ? <EmptyState>No register rows loaded.</EmptyState> : <div className="table-wrap dense-table"><table><thead><tr><th>ID</th><th>Title</th><th>Importance</th><th>Status</th><th>Owner / due</th><th>Source</th><th>Related</th></tr></thead><tbody>{filtered.map((row) => <tr key={row.id} onClick={() => selectRow(row)}><td><button className="inline-button">{row.externalRegisterId}</button></td><td><strong>{row.title}</strong><small>{row.summary}</small></td><td>{row.score ? <span className={`importance-band band-${row.score.band.toLowerCase()}`}>{row.score.band} / {row.score.value}</span> : '-'}</td><td><StatusChip value={currentRowStatus(row)} /></td><td>{row.currentState?.owner ?? row.owner ?? 'Unassigned'}<small>{formatDate(row.currentState?.dueDate ?? row.dueDate)}</small></td><td>{row.sourceRef ?? '-'}<small>{row.sourceAnchor ?? ''}</small></td><td>{[...row.relatedIds, ...row.supersessionIds].join(', ') || '-'}</td></tr>)}</tbody></table></div>}
-      {selected ? <RegisterDetail row={selected} comparisonRows={comparisonRows.filter((row) => row.externalRegisterId === selected.externalRegisterId)} onClose={() => { setSelectedId(null); window.location.hash = window.location.hash.split('?')[0]; }} /> : null}
-    </Section>
-  );
-}
-
-function RegisterDetail({ row, comparisonRows, onClose }: { row: RegisterRow; comparisonRows: Project['registerComparisonRows']; onClose: () => void }) {
-  const current = row.currentState;
-  return <aside className="detail-drawer intelligence-drawer" role="dialog" aria-modal="true" aria-labelledby="register-detail-title">
-    <header><div><p className="section-kicker">{humanize(row.registerName)}</p><h3 id="register-detail-title">{row.externalRegisterId}</h3></div><button className="button secondary" onClick={onClose}>Close</button></header>
-    <div className="drawer-title"><div><h4>{row.title}</h4><p>{row.summary}</p></div>{row.score ? <span className={`importance-band band-${row.score.band.toLowerCase()}`}>{row.score.band} / score {row.score.value}</span> : null}</div>
-    <h4>Projected current state</h4><dl className="inline-details"><div><dt>Status</dt><dd>{humanize(current?.status ?? row.recordStatus)}</dd></div><div><dt>Owner</dt><dd>{current?.owner ?? row.owner ?? 'Unassigned'}</dd></div><div><dt>Due date</dt><dd>{formatDate(current?.dueDate ?? row.dueDate)}</dd></div><div><dt>Resolution</dt><dd>{current?.resolution ?? 'Not recorded'}</dd></div><div><dt>Last human event</dt><dd>{current?.lastHumanEventAt ? formatDateTime(current.lastHumanEventAt) : 'None'}</dd></div><div><dt>Scoring version</dt><dd>{row.score?.scoringVersion ?? 'Not scored'}</dd></div></dl>
-    <h4>Typed register detail</h4><DetailFieldList values={row.typedDetails ?? {}} empty="No typed detail is stored for this row." />
-    <h4>Importance explanation</h4><DetailFieldList values={row.score?.inputs ?? {}} empty="No scoring inputs are available." />
-    <h4>Evidence and source anchors</h4>{(row.anchors ?? []).length === 0 ? <EmptyState>No mechanically resolved anchors are available.</EmptyState> : <ol className="anchor-list">{(row.anchors ?? []).map((anchor) => <li key={anchor.id}><div className="anchor-meta"><StatusChip value={anchor.verified ? 'verified' : 'failed'} label={anchor.verified ? 'Verified quote' : 'Unverified'} /><span>{anchor.speaker ?? 'Unknown speaker'}</span><span>{formatAnchorTime(anchor.tMs)}</span></div><blockquote>{anchor.quote ?? 'No quotation retained.'}</blockquote><small>Source {anchor.sourceId} / segment {anchor.segmentId}</small></li>)}</ol>}
-    <h4>Human operational history</h4>{(row.events ?? []).length === 0 ? <EmptyState>No human events have been recorded.</EmptyState> : <ol className="event-timeline">{(row.events ?? []).map((event) => <li key={event.id}><span className="event-dot" aria-hidden="true" /><div><div className="record-line"><strong>{humanize(event.eventType)}</strong><time dateTime={event.occurredAt}>{formatDateTime(event.occurredAt)}</time></div><p>{event.reason}</p><small>{event.actor}{event.field ? ` / ${fieldLabel(event.field)}: ${event.previousValue ?? 'empty'} -> ${event.newValue ?? 'empty'}` : ''}{event.evidenceRef ? ` / ${event.evidenceRef}` : ''}</small></div></li>)}</ol>}
-    <h4>Relationships</h4><dl className="inline-details"><div><dt>Related records</dt><dd>{row.relatedIds.length ? row.relatedIds.map((id) => <a key={id} href={registerRowRoute(row.projectId, registerForId(id), id)}>{id}</a>) : '-'}</dd></div><div><dt>Supersedes / reverses</dt><dd>{row.supersessionIds.length ? row.supersessionIds.map((id) => <a key={id} href={registerRowRoute(row.projectId, registerForId(id), id)}>{id}</a>) : '-'}</dd></div><div><dt>Work packages</dt><dd>{row.workPackageTags.join(', ') || '-'}</dd></div></dl>
-    <h4>Extraction and packet provenance</h4><dl className="inline-details"><div><dt>Import / extraction run</dt><dd>{row.importRunId}</dd></div><div><dt>Derivation</dt><dd>{row.derivation ?? 'fact'}</dd></div><div><dt>Confidence</dt><dd>{row.confidence ?? 'Unknown'}</dd></div><div><dt>Source reference</dt><dd>{row.sourceRef ?? '-'}</dd></div><div><dt>Source anchor</dt><dd>{row.sourceAnchor ?? '-'}</dd></div><div><dt>Original location</dt><dd>{row.originalTabName} / row {row.originalRowNumber ?? '-'}</dd></div><div><dt>Original status</dt><dd>{row.originalStatusWording ?? '-'}</dd></div><div><dt>Raw due wording</dt><dd>{row.dueDateRaw ?? '-'} ({row.dueDateConfidence ?? 'none'})</dd></div></dl>
-    <details className="drawer-details"><summary>Original fields</summary><DetailFieldList values={row.rawRow} empty="No raw fields are retained." /></details>
-    <details className="drawer-details"><summary>Field comparison ({comparisonRows.length})</summary><Stacked records={comparisonRows.map((item) => ({ id: item.id, title: item.fieldName ?? 'Row', text: item.detail ?? '', chip: item.comparisonStatus, details: [['Status', item.comparisonStatus]] }))} empty="No field comparison rows." /></details>
-  </aside>;
-}
-
-function DetailFieldList({ values, empty }: { values: JsonRecord; empty: string }) {
-  const entries = Object.entries(values).filter(([, value]) => value !== null && value !== undefined && value !== '');
-  if (entries.length === 0) return <EmptyState>{empty}</EmptyState>;
-  return <dl className="raw-field-list">{entries.map(([key, value]) => <div key={key}><dt>{fieldLabel(key)}</dt><dd>{displayValue(value)}</dd></div>)}</dl>;
-}
-
-function displayValue(value: unknown): string {
-  if (Array.isArray(value)) return value.map(displayValue).join('; ');
-  if (typeof value === 'object' && value) return JSON.stringify(value);
-  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
-  return String(value ?? '');
-}
-
-function fieldLabel(value: string) { return humanize(value.replaceAll('_', '-')); }
-function formatAnchorTime(value: number | null) { if (value === null) return 'No timestamp'; const seconds = Math.floor(value / 1000); return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`; }
-function registerForId(id: string) { const marker = id.match(/-([ADRQMCESU])-/)?.[1]; return ({ A: 'Actions', D: 'Decisions', R: 'Risks_Issues', Q: 'Open_Questions', M: 'Milestones', C: 'Config_Changes', E: 'Entities', S: 'Sources', U: 'Uncertainty' } as Record<string, string>)[marker ?? ''] ?? 'Actions'; }
-function currentRowStatus(row: RegisterRow) { return row.currentState?.status ?? row.recordStatus; }
 function RegisterComparison({ project, compact = false }: { project: Project; compact?: boolean }) {
   const rows = compact ? project.registerComparisonSummary.filter((row) => row.sqliteRowCount > 0) : project.registerComparisonSummary;
   const latestBlindReport = project.blindExtractionComparisonReports[0];
@@ -480,10 +460,8 @@ function SourceList({ sources }: { sources: Project['inboxSources'] }) {
 }
 
 function PlaceholderSection({ id, title }: { id: string; title: string }) { return <Section id={id} title={title} kicker="SQLite-backed workspace" count={0}><EmptyState>This workspace tab is ready for approved source-derived records.</EmptyState></Section>; }
-function Stacked({ records, empty }: { records: Array<{ id: string; title: string; text: string; chip: string; details: Array<[string, string]> }>; empty: string }) { if (records.length === 0) return <EmptyState>{empty}</EmptyState>; return <div className="stacked-records">{records.map((record) => <article className="stacked-record" key={record.id}><div className="record-line"><div><h3>{record.title}</h3><p>{record.text}</p></div><StatusChip value={record.chip} /></div><dl className="inline-details">{record.details.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl></article>)}</div>; }
 function RecordTitle({ title, summary, attention }: { title: string; summary: string; attention: string | null }) { return <div className="table-title"><strong>{title}</strong><span>{summary}</span>{attention ? <em>{attention}</em> : null}</div>; }
 function RecordTable({ label, columns, rows }: { label: string; columns: string[]; rows: Array<Array<React.ReactNode>> }) { if (rows.length === 0) return <EmptyState />; return <div className="table-wrap"><table><caption className="sr-only">{label}</caption><thead><tr>{columns.map((column) => <th key={column} scope="col">{column}</th>)}</tr></thead><tbody>{rows.map((row, rowIndex) => <tr key={rowIndex}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody></table></div>; }
-function sortValue(row: RegisterRow, sort: 'id' | 'title' | 'status') { if (sort === 'title') return row.title; if (sort === 'status') return row.recordStatus; return row.externalRegisterId; }
 function labelFor(tab: TabId) { return [...primaryTabs, ...moreTabs].find(([id]) => id === tab)?.[1] ?? humanize(tab); }
 function safePathLabel(value: string) { const normal = value.replace(/\\/g, '/'); const marker = '/Projects/'; const index = normal.lastIndexOf(marker); return index >= 0 ? normal.slice(index + marker.length) : normal.split('/').slice(-3).join('/'); }
 function fileToBase64(file: File): Promise<string> { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(',')[1] ?? ''); reader.onerror = () => reject(reader.error); reader.readAsDataURL(file); }); }

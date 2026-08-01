@@ -8,6 +8,26 @@ import { buildPortfolioResponse, buildProjectResponse, portfolioFixtureSchema } 
 const fixture = portfolioFixtureSchema.parse(fixtureJson);
 const jsonResponse = (data: unknown, ok = true) => Promise.resolve({ ok, status: ok ? 200 : 500, json: () => Promise.resolve(data) });
 
+/** Synthetic identity, matching the shape both consultant panels read. */
+const syntheticIdentity = {
+  skillId: 'consultant-reasoning', skillVersion: '0.1.0', promptTemplateVersion: 'consultant-reasoning-prompt-v1',
+  providerId: 'local-stub', modelLabel: 'stub-model', packetContractVersion: 1,
+  providerAvailable: false, providerDetail: 'no provider configured in this environment', skillResolved: true,
+};
+
+/** A read of the reasoning cache that has never been generated: zero calls, no result. */
+const reasoningView = {
+  projectId: 'atlas', mode: 'meeting', current: null, latest: null, state: 'none',
+  projectStateHash: '0'.repeat(64), registerRevision: 1, identity: syntheticIdentity,
+  lastFailure: null, providerCallsThisRequest: 0, evidence: { rows: {}, unresolved: [] },
+};
+
+/** The demoted deterministic fallback panel's read. */
+const consultantView = {
+  projectId: 'atlas', mode: 'meeting', deterministic: null, synthesis: null,
+  identity: syntheticIdentity, synthesisState: 'none', failure: null, providerCallsThisRequest: 0,
+};
+
 beforeEach(() => {
   window.location.hash = '#/projects';
   vi.restoreAllMocks();
@@ -54,6 +74,55 @@ describe('Cockpit states and routes', () => {
       expect(await screen.findByRole('heading', { name: 'Project Atlas' })).toBeInTheDocument();
       expect(await screen.findByRole('heading', { name: heading })).toBeInTheDocument();
     }
+  });
+
+  it('renders the Mined Data workspace on its own route rather than falling back to Overview', async () => {
+    window.location.hash = '#/projects/atlas/mined-data';
+    const response = buildProjectResponse(fixture, 'atlas', new Date(fixture.asOf));
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(response)));
+    render(<App />);
+    expect(await screen.findByRole('heading', { name: 'Mined Data' })).toBeInTheDocument();
+    // The fallback to 'overview' would have rendered the project hero instead.
+    expect(screen.queryByRole('heading', { name: /Consultant reasoning/i })).not.toBeInTheDocument();
+  });
+
+  it('never posts to the consultant-reasoning endpoint while navigating the cockpit', async () => {
+    const response = buildProjectResponse(fixture, 'atlas', new Date(fixture.asOf));
+    const calls: Array<{ url: string; method: string }> = [];
+    const fetchSpy = vi.fn((input: unknown, init?: { method?: string }) => {
+      const url = String(input);
+      calls.push({ url, method: init?.method ?? 'GET' });
+      if (url.includes('/consultant-reasoning')) return jsonResponse(reasoningView);
+      if (url.includes('/consultant-view')) return jsonResponse(consultantView);
+      return jsonResponse(response);
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+    for (const route of ['overview', 'mined-data', 'actions', 'decisions'] as const) {
+      cleanup();
+      window.location.hash = `#/projects/atlas/${route}`;
+      render(<App />);
+      expect(await screen.findByRole('heading', { name: 'Project Atlas' })).toBeInTheDocument();
+    }
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every((call) => call.method.toUpperCase() === 'GET')).toBe(true);
+    expect(calls.filter((call) => call.url.includes('consultant-reasoning') && call.method.toUpperCase() === 'POST')).toHaveLength(0);
+  });
+
+  it('leads the overview with consultant reasoning, explains the ungenerated state and disables Generate when no provider is reachable', async () => {
+    window.location.hash = '#/projects/atlas/overview';
+    const response = buildProjectResponse(fixture, 'atlas', new Date(fixture.asOf));
+    vi.stubGlobal('fetch', vi.fn((input: unknown) => {
+      const url = String(input);
+      if (url.includes('/consultant-reasoning')) return jsonResponse(reasoningView);
+      if (url.includes('/consultant-view')) return jsonResponse(consultantView);
+      return jsonResponse(response);
+    }));
+    render(<App />);
+    expect(await screen.findByRole('heading', { level: 2, name: 'Consultant reasoning' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: /No consultant reasoning has been generated/i })).toBeInTheDocument();
+    expect(screen.getAllByRole('link', { name: 'Mined Data' }).every((link) => link.getAttribute('href') === '#/projects/atlas/mined-data')).toBe(true);
+    expect(await screen.findByRole('button', { name: 'Generate consultant reasoning' })).toBeDisabled();
+    expect(screen.getByRole('heading', { name: /Zero-call deterministic fallback/i })).toBeInTheDocument();
   });
 
   it('renders an honest empty state for an empty project tab', async () => {
