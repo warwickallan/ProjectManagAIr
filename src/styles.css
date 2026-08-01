@@ -714,3 +714,52 @@ select.input { appearance: auto; }
 .mined-register-nav button:hover { color: var(--blue); background: var(--blue-soft); }
 .mined-register-nav button.active { color: var(--blue); background: var(--blue-soft); box-shadow: inset 0 0 0 1px var(--blue-soft); }
 .mined-register-nav button span { padding: 1px 6px; border-radius: 4px; background: rgba(23,35,58,.06); font-size: 11px; font-weight: 800; }
+
+/* ---------------------------------------------------------------------------- *
+ * Source safety (migration 017): duplicate verdicts, chronology state, and the
+ * governed discard/void actions.
+ *
+ * Tone follows the existing semantic palette exactly - teal for interaction,
+ * red for stop, amber for decide, green for carry on - so a safety chip reads
+ * the same way as every other status in the Cockpit.
+ * ---------------------------------------------------------------------------- */
+.safety-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 10px; }
+.safety-chip { display: inline-block; padding: 2px 9px; border-radius: 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.02em; border: 1px solid transparent; }
+.safety-chip-neutral { background: var(--color-surface-soft); color: var(--color-muted); border-color: var(--color-border); }
+.safety-chip-success { background: var(--color-success-bg); color: var(--color-success); }
+.safety-chip-attention { background: var(--color-attention-bg); color: var(--color-attention); }
+.safety-chip-critical { background: var(--color-critical-bg); color: var(--color-critical); }
+
+.notice-attention { background: var(--color-attention-bg); color: var(--color-attention); border-left: 3px solid var(--color-attention); padding: 8px 12px; border-radius: 3px; font-size: 13px; margin: 8px 0; }
+
+.source-safety-detail { margin-top: 14px; border-top: 1px solid var(--color-border); padding-top: 14px; }
+.source-safety-detail section { margin-bottom: 18px; }
+.source-safety-detail h4 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-muted); font-weight: 600; }
+.hash-value { font-family: ui-monospace, Consolas, monospace; font-size: 11px; word-break: break-all; }
+.muted-block { display: block; color: var(--color-muted); font-size: 11px; margin-top: 2px; }
+.plain-list { list-style: none; padding: 0; margin: 0; font-size: 13px; }
+.plain-list li { padding: 5px 0; border-bottom: 1px solid var(--color-border); }
+
+.compact-table { width: 100%; border-collapse: collapse; font-size: 12px; display: block; overflow-x: auto; }
+.compact-table th, .compact-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--color-border); vertical-align: top; }
+.compact-table th { color: var(--color-muted); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.04em; }
+
+.decision-panel { margin-top: 12px; padding: 12px; background: var(--color-attention-bg); border-radius: 4px; }
+.decision-form label, .danger-confirm label { display: block; margin: 8px 0; font-size: 13px; font-weight: 600; }
+.decision-form textarea, .danger-confirm textarea, .decision-form select { width: 100%; margin-top: 4px; font: inherit; font-weight: 400; padding: 6px; border: 1px solid var(--color-border); border-radius: 3px; }
+
+.danger-button { border-color: var(--color-critical); color: var(--color-critical); }
+button.button.danger-button { background: var(--color-critical); color: #fff; border-color: var(--color-critical); }
+.danger-button:disabled { opacity: 0.5; cursor: not-allowed; }
+.danger-confirm { margin-top: 10px; padding: 12px; border: 1px solid var(--color-critical); border-radius: 4px; background: var(--color-critical-bg); }
+.danger-confirm-lede { margin: 0 0 6px; font-size: 13px; }
+
+.chronology-fieldset { border: 1px solid var(--color-border); border-radius: 4px; padding: 10px 12px; margin: 10px 0; }
+.chronology-fieldset legend { font-size: 13px; font-weight: 600; padding: 0 4px; }
+.radio-line { display: block; font-weight: 400; margin: 4px 0; }
+.radio-line input { margin-right: 6px; }
+.chronology-suggestions { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--color-border); }
+.chronology-suggestions .inline-button { display: block; text-align: left; margin: 4px 0; }
+.awaiting-note { background: var(--color-attention-bg); border-left: 3px solid var(--color-attention); color: var(--color-attention); padding: 10px 12px; border-radius: 3px; margin: 8px 0; font-size: 13px; }
+.awaiting-note strong { display: block; margin-bottom: 3px; }
+.awaiting-note p { margin: 0; }

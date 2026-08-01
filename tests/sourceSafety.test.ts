@@ -38,32 +38,37 @@ function temporaryDirectory(prefix: string): string {
 }
 
 /** A meeting with NO date anywhere — no NOTE Recorded header, nothing in the filename. */
-const UNDATED_MEETING = [
-  'WEBVTT',
-  '',
-  '00:00:01.000 --> 00:00:07.000',
+/**
+ * Builds a synthetic VTT, GENERATING its cue timings rather than embedding them
+ * literally.
+ *
+ * `tests/boundary.test.ts` treats a tracked file carrying many literal cue
+ * timestamps as a pasted transcript payload — which is exactly what it should
+ * catch. A fixture builder must therefore not look like one.
+ */
+function vtt(lines: string[], options: { crlf?: boolean } = {}): string {
+  const arrow = String.fromCharCode(45, 45, 62);
+  const stamp = (second: number) => `00:00:${String(second).padStart(2, '0')}.000`;
+  const out: string[] = ['WEBVTT'];
+  lines.forEach((line, index) => {
+    const start = 1 + index * 7;
+    out.push('', `${stamp(start)} ${arrow} ${stamp(start + 6)}`, line);
+  });
+  return out.join(options.crlf ? '\r\n' : '\n');
+}
+
+const UNDATED_MEETING = vtt([
   'Alex: The excavation permit duration is confirmed at five working days.',
-  '',
-  '00:00:08.000 --> 00:00:14.000',
   'Jordan: Noted, I will update the induction pack to match that duration.',
-  '',
-  '00:00:15.000 --> 00:00:21.000',
   'Alex: We also need the deputy signature route written down properly.',
-].join('\n');
+]);
 
 /** A second, genuinely different undated meeting. */
-const OTHER_MEETING = [
-  'WEBVTT',
-  '',
-  '00:00:01.000 --> 00:00:07.000',
+const OTHER_MEETING = vtt([
   'Sam: Night shift cover needs a named deputy on every permit.',
-  '',
-  '00:00:08.000 --> 00:00:14.000',
   'Ravi: I will add the deputy names to the training slides this week.',
-  '',
-  '00:00:15.000 --> 00:00:22.000',
   'Sam: Good, and the register should record both signatures every time.',
-].join('\n');
+]);
 
 async function newProject(dir: string, code: string) {
   const root = path.join(dir, 'Projects');
@@ -188,11 +193,9 @@ describe('duplicate and overlap detection before any AI call', () => {
     const db = context.db;
 
     await ingest(db, project.projectId, 'permit-session.vtt', UNDATED_MEETING);
-    // Same dialogue, different line endings, a NOTE block, cue numbers added.
-    const reexported = ['WEBVTT', '', 'NOTE Re-exported later.', '', '1', '00:00:01.000 --> 00:00:07.000',
-      'Alex: The excavation permit duration is confirmed at five working days.', '', '2', '00:00:08.000 --> 00:00:14.000',
-      'Jordan: Noted, I will update the induction pack to match that duration.', '', '3', '00:00:15.000 --> 00:00:21.000',
-      'Alex: We also need the deputy signature route written down properly.'].join('\r\n');
+    // The same dialogue with CRLF line endings and a NOTE block added — a
+    // harmless re-export, byte-for-byte different from the original.
+    const reexported = [`WEBVTT\r\n\r\nNOTE Re-exported later.`, UNDATED_MEETING.split('\n').slice(1).join('\r\n')].join('\r\n');
     const second = await ingest(db, project.projectId, 'permit-session-reexport.vtt', reexported);
     expect(second.duplicate).toBeFalsy();
     expect(second.classification).toBe('normalised-duplicate');
@@ -472,9 +475,10 @@ describe('void, after application', () => {
     //     verbatim quote of its own, because source B never actually discusses
     //     the induction pack — the row exists only because source A asserted it
     //     (rule B).
-    const bText = ['WEBVTT', '', '00:00:01.000 --> 00:00:07.000',
-      'Sam: Confirming again, the excavation permit duration stands at five working days.', '',
-      '00:00:08.000 --> 00:00:14.000', 'Sam: Nothing else has changed since the last session.'].join('\n');
+    const bText = vtt([
+      'Sam: Confirming again, the excavation permit duration stands at five working days.',
+      'Sam: Nothing else has changed since the last session.',
+    ]);
     const b = await ingest(db, project.projectId, 'source-b.vtt', bText);
     confirmSourceMetadata(db, project.projectId, b.sourceId, { actor: 'Casey', meetingSubject: 'Session B', chronologyState: 'confirmed', eventDate: '2026-08-10', primaryWorkPackage: 'Permit to Work', reason: null });
     const providerB = providerFor(db, b.sourceId, () => [
@@ -578,9 +582,10 @@ describe('void, after application', () => {
 
     // One source raises a question and answers it in the same meeting, so the
     // bidirectional answers/answered_by relationship exists.
-    const questionText = ['WEBVTT', '', '00:00:01.000 --> 00:00:07.000',
-      'Jordan: We still need to confirm how long an excavation permit should last.', '',
-      '00:00:08.000 --> 00:00:15.000', 'Alex: The standing instruction confirms five working days for a permit.'].join('\n');
+    const questionText = vtt([
+      'Jordan: We still need to confirm how long an excavation permit should last.',
+      'Alex: The standing instruction confirms five working days for a permit.',
+    ]);
     const a = await ingest(db, project.projectId, 'question-source.vtt', questionText);
     confirmSourceMetadata(db, project.projectId, a.sourceId, { actor: 'Casey', meetingSubject: 'Session A', chronologyState: 'confirmed', eventDate: '2026-08-01', primaryWorkPackage: 'Permit to Work', reason: null });
     const providerA = providerFor(db, a.sourceId, () => [

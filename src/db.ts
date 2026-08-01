@@ -8,6 +8,9 @@ import { readRegisterState } from './projectRegisters.js';
 import { buildDeterministicBrief, computeProjectOverview, readSourceIntelligence } from './sourceIntelligence.js';
 import { CONSULTANT_VIEW_MODES, buildDeterministicConsultantView } from './consultantViews.js';
 import { buildProjectThemes } from './projectThemes.js';
+import { chronologyFromRow, describeChronology, UNKNOWN_CHRONOLOGY } from './sourceChronology.js';
+import { CLASSIFICATION_LABELS } from './sourceIdentity.js';
+import { LIFECYCLE_LABELS, readSourceComparisons, type SourceLifecycleState } from './sourceSafety.js';
 
 type SqlValue = string | number | bigint | null;
 
@@ -91,6 +94,49 @@ function userConfig(db: DatabaseSync): UserConfig {
 
 function bool(value: unknown): boolean {
   return value === 1 || value === true;
+}
+
+/**
+ * The safety facts the Inbox shows on every source row without opening it:
+ * what the duplicate check concluded, whether a decision is still owed, what
+ * is known about the meeting date, and whether the source has been retired.
+ *
+ * Reads only; makes no provider call.
+ */
+function sourceSafetySummary(db: DatabaseSync, projectId: string, intakeSourceId: string) {
+  const source = db.prepare('SELECT * FROM source_documents WHERE intake_source_id = ?').get(intakeSourceId) as Record<string, unknown> | undefined;
+  const comparisons = readSourceComparisons(db, intakeSourceId);
+  const pending = comparisons.find((row) => row.decision === null && (row.blocksExtraction || row.requiresDecision)) ?? null;
+  // The strongest verdict is the one already sorted first by the comparison
+  // reader; when nothing matched at all the source is simply new.
+  const verdict = comparisons[0] ?? null;
+  const chronology = source ? chronologyFromRow(source) : UNKNOWN_CHRONOLOGY;
+  const lifecycleState = String(source?.lifecycle_state ?? 'active') as SourceLifecycleState;
+  const appliedChangesets = source
+    ? Number((db.prepare("SELECT count(*) c FROM register_changesets WHERE source_id = ? AND review_status = 'applied' AND voided_at IS NULL").get(String(source.id)) as { c: number }).c)
+    : 0;
+  return {
+    sourceDocumentId: source ? String(source.id) : null,
+    comparisonClassification: verdict ? verdict.classification : 'apparently-new',
+    comparisonLabel: verdict ? verdict.label : CLASSIFICATION_LABELS['apparently-new'],
+    comparisonDetail: verdict ? verdict.detail : 'No existing source shares this content.',
+    comparisonMatchCount: comparisons.filter((row) => row.matchedSourceId !== null).length,
+    awaitingDuplicateDecision: pending !== null,
+    duplicateBlocksExtraction: pending?.blocksExtraction ?? false,
+    chronologyState: chronology.state,
+    chronologyBasis: chronology.basis,
+    chronologyLabel: describeChronology(chronology),
+    metadataConfirmed: Boolean(item_metadataConfirmedAt(db, intakeSourceId)),
+    lifecycleState,
+    lifecycleLabel: LIFECYCLE_LABELS[lifecycleState] ?? lifecycleState,
+    lifecycleReason: source?.lifecycle_reason ? String(source.lifecycle_reason) : null,
+    hasAppliedChangeset: appliedChangesets > 0,
+  };
+}
+
+function item_metadataConfirmedAt(db: DatabaseSync, intakeSourceId: string): string | null {
+  const row = db.prepare('SELECT metadata_confirmed_at FROM project_source_intake WHERE id = ?').get(intakeSourceId) as { metadata_confirmed_at: string | null } | undefined;
+  return row?.metadata_confirmed_at ?? null;
 }
 
 function jsonArray(value: string | null): string[] {
@@ -178,6 +224,12 @@ function readProjectFromRows(db: DatabaseSync, row: Record<string, unknown>): Pr
       // these is what turns a permanent "processing" chip back into a diagnosable failure.
       processingStage: item.processing_stage ? String(item.processing_stage) : null, processingError: item.processing_error ? String(item.processing_error) : null, processingRecoveryAction: item.processing_recovery_action ? String(item.processing_recovery_action) : null,
       createdAt: String(item.created_at), updatedAt: String(item.updated_at),
+      // Source safety, resolved inline so the Inbox can show the duplicate
+      // verdict, the chronology state and the lifecycle state on the row
+      // itself. Without these the consultant would have to open every source to
+      // find out whether it is a duplicate — which is the one question they
+      // need answered the moment a file lands.
+      ...sourceSafetySummary(db, projectId, String(item.id)),
     })),
     proposedChanges: (db.prepare('SELECT * FROM proposed_changes WHERE project_id = ? ORDER BY created_at DESC').all(projectId) as Array<Record<string, unknown>>).map((item) => ({
       id: String(item.id), projectId, sourceId: String(item.source_id), status: String(item.status), payload: JSON.parse(String(item.payload_json)) as unknown, createdAt: String(item.created_at), reviewedAt: item.reviewed_at ? String(item.reviewed_at) : null, reviewedBy: item.reviewed_by ? String(item.reviewed_by) : null, appliedAt: item.applied_at ? String(item.applied_at) : null,

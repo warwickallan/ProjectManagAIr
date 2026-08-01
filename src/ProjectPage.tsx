@@ -3,6 +3,7 @@ import { useApi, type ProjectResponse } from './api';
 import { AIChatPanel } from './AIChatPanel';
 import { ConsultantViewPanel } from './ConsultantViewPanel';
 import { ConsultantReasoningPanel } from './ConsultantReasoningPanel';
+import { SourceSafetyChips, SourceSafetyDetail } from './SourceSafetyPanel';
 import {
   CustomerDependenciesTab, DecisionsNeededTab, MeetingBriefTab, MyActionsTab, OverviewReasoningCard, QuestionsTab, RecentChangesTab, RisksBlockersTab,
 } from './ReasoningTabs';
@@ -582,12 +583,32 @@ function operationSummary(operation: ChangeOperation) { return String(operation.
 function SourceList({ projectId, userId, sources, onChanged }: { projectId: string; userId: string; sources: Project['inboxSources']; onChanged: () => void }) {
   const [openError, setOpenError] = useState('');
   const [openMetadataFor, setOpenMetadataFor] = useState<string | null>(null);
+  const [openSafetyFor, setOpenSafetyFor] = useState<string | null>(null);
   async function openSource(filePath: string) { try { setOpenError(''); await postJson('/api/files/open', 'POST', { path: filePath }); } catch (caught) { setOpenError(caught instanceof Error ? caught.message : 'Could not open original file.'); } }
   if (sources.length === 0) return <EmptyState>No sources have been taken into this project yet.</EmptyState>;
   return <div className="stacked-records">{openError ? <p className="form-error" role="alert">{openError}</p> : null}{sources.map((source) => {
     const processing = sourceProcessingView(source);
     const open = openMetadataFor === source.id;
-    return <article className="stacked-record" key={source.id}><div className="record-line"><div><h3>{source.originalFileName}</h3><p>{safePathLabel(source.currentExternalPath)}</p></div><StatusChip value={processing.chipValue} label={processing.chipLabel} /></div><dl className="inline-details"><div><dt>Type</dt><dd>{source.sourceType}</dd></div><div><dt>Hash</dt><dd>{source.contentHash}</dd></div><div><dt>Received</dt><dd>{formatDateTime(source.originalReceivedAt)}</dd></div><div><dt>Processor</dt><dd>{source.processorProvider}</dd></div><div><dt>Stage</dt><dd>{processing.stage ?? 'Not recorded'}</dd></div><div><dt>Last change</dt><dd>{formatDateTime(source.updatedAt)}</dd></div></dl><SourceProcessingNotice source={source} /><div className="action-row"><button className="inline-button" onClick={() => openSource(source.currentExternalPath)}>Open original</button><button className={processing.awaitingMetadata ? 'button' : 'inline-button'} onClick={() => setOpenMetadataFor(open ? null : source.id)}>{processing.awaitingMetadata ? 'Confirm meeting details' : open ? 'Close meeting details' : 'Meeting details'}</button></div>{open ? <MetadataConfirmationForm projectId={projectId} userId={userId} sourceId={source.id} onDone={() => { setOpenMetadataFor(null); onChanged(); }} /> : null}</article>;
+    const safetyOpen = openSafetyFor === source.id;
+    return <article className="stacked-record" key={source.id}>
+      <div className="record-line"><div><h3>{source.originalFileName}</h3><p>{safePathLabel(source.currentExternalPath)}</p></div><StatusChip value={processing.chipValue} label={processing.chipLabel} /></div>
+      {/* The duplicate verdict, the chronology state and the lifecycle state,
+          on the row itself — the questions a consultant has the moment a file
+          lands, answered without opening anything. */}
+      <SourceSafetyChips summary={source} />
+      <dl className="inline-details"><div><dt>Type</dt><dd>{source.sourceType}</dd></div><div><dt>Hash</dt><dd>{source.contentHash}</dd></div><div><dt>Received</dt><dd>{formatDateTime(source.originalReceivedAt)}</dd></div><div><dt>Processor</dt><dd>{source.processorProvider}</dd></div><div><dt>Stage</dt><dd>{processing.stage ?? 'Not recorded'}</dd></div><div><dt>Last change</dt><dd>{formatDateTime(source.updatedAt)}</dd></div></dl>
+      <SourceProcessingNotice source={source} />
+      {source.awaitingDuplicateDecision
+        ? <p className="notice-attention" role="status">{source.comparisonLabel}: {source.comparisonDetail}{source.duplicateBlocksExtraction ? ' No AI call is made until you decide.' : ''}</p>
+        : null}
+      <div className="action-row">
+        <button className="inline-button" onClick={() => openSource(source.currentExternalPath)}>Open original</button>
+        <button className={processing.awaitingMetadata ? 'button' : 'inline-button'} onClick={() => setOpenMetadataFor(open ? null : source.id)}>{processing.awaitingMetadata ? 'Confirm meeting details' : open ? 'Close meeting details' : 'Meeting details'}</button>
+        <button className={source.awaitingDuplicateDecision ? 'button' : 'inline-button'} onClick={() => setOpenSafetyFor(safetyOpen ? null : source.id)}>{safetyOpen ? 'Close source record' : source.awaitingDuplicateDecision ? 'Decide duplicate' : 'Source record'}</button>
+      </div>
+      {open ? <MetadataConfirmationForm projectId={projectId} userId={userId} sourceId={source.id} onDone={() => { setOpenMetadataFor(null); onChanged(); }} /> : null}
+      {safetyOpen ? <SourceSafetyDetail projectId={projectId} sourceId={source.id} userId={userId} onChanged={onChanged} /> : null}
+    </article>;
   })}</div>;
 }
 
@@ -604,6 +625,9 @@ interface SourceMetadataRecord {
   confirmed: boolean;
   confirmedAt: string | null;
   confirmedBy: string | null;
+  chronology?: { state: 'confirmed' | 'approximate' | 'unknown'; precision: 'exact-datetime' | 'date' | 'month' | 'range' | 'none'; basis: string; date: string | null; time: string | null; rangeStart: string | null; rangeEnd: string | null };
+  chronologyLabel?: string;
+  suggestions?: Array<{ basis: string; date: string; label: string }>;
 }
 
 function MetadataConfirmationForm({ projectId, userId, sourceId, onDone }: { projectId: string; userId: string; sourceId: string; onDone: () => void }) {
@@ -613,6 +637,11 @@ function MetadataConfirmationForm({ projectId, userId, sourceId, onDone }: { pro
   const [eventDate, setEventDate] = useState('');
   const [eventTime, setEventTime] = useState('');
   const [timezone, setTimezone] = useState('');
+  const [chronologyState, setChronologyState] = useState<'confirmed' | 'approximate' | 'unknown'>('confirmed');
+  const [chronologyPrecision, setChronologyPrecision] = useState<'date' | 'exact-datetime' | 'month' | 'range'>('date');
+  const [rangeStart, setRangeStart] = useState('');
+  const [rangeEnd, setRangeEnd] = useState('');
+  const [suggestions, setSuggestions] = useState<Array<{ basis: string; date: string; label: string }>>([]);
   const [primaryWorkPackage, setPrimaryWorkPackage] = useState('');
   const [additionalWorkPackages, setAdditionalWorkPackages] = useState('');
   const [participants, setParticipants] = useState('');
@@ -633,6 +662,11 @@ function MetadataConfirmationForm({ projectId, userId, sourceId, onDone }: { pro
         setEventDate(record.eventDate ?? '');
         setEventTime(record.eventTime ?? '');
         setTimezone(record.timezone ?? '');
+        setChronologyState(record.chronology?.state ?? 'confirmed');
+        setChronologyPrecision((record.chronology?.precision === 'none' ? 'date' : record.chronology?.precision) ?? 'date');
+        setRangeStart(record.chronology?.rangeStart ?? '');
+        setRangeEnd(record.chronology?.rangeEnd ?? '');
+        setSuggestions(record.suggestions ?? []);
         setPrimaryWorkPackage(record.primaryWorkPackage ?? '');
         setAdditionalWorkPackages(record.additionalWorkPackages.join(', '));
         setParticipants(record.participants.join(', '));
@@ -655,9 +689,16 @@ function MetadataConfirmationForm({ projectId, userId, sourceId, onDone }: { pro
       await postJson(`/api/projects/${encodeURIComponent(projectId)}/sources/${encodeURIComponent(sourceId)}/metadata`, 'POST', {
         actor: userId,
         meetingSubject,
-        eventDate,
-        eventTime: eventTime || null,
+        // An unknown meeting date sends no date at all. It is never replaced by
+        // an inferred value, here or on the server.
+        eventDate: chronologyState === 'unknown' || chronologyPrecision === 'month' || chronologyPrecision === 'range' ? null : eventDate,
+        eventTime: chronologyState === 'unknown' ? null : eventTime || null,
         timezone: timezone || null,
+        chronologyState,
+        chronologyPrecision: chronologyState === 'unknown' ? null : chronologyPrecision,
+        chronologyBasis: chronologyState === 'unknown' ? null : 'human-confirmed',
+        chronologyRangeStart: chronologyState !== 'unknown' && (chronologyPrecision === 'month' || chronologyPrecision === 'range') ? rangeStart : null,
+        chronologyRangeEnd: chronologyState !== 'unknown' && chronologyPrecision === 'range' ? rangeEnd : null,
         primaryWorkPackage,
         additionalWorkPackages: splitList(additionalWorkPackages),
         participants: splitList(participants),
@@ -678,8 +719,46 @@ function MetadataConfirmationForm({ projectId, userId, sourceId, onDone }: { pro
     {wasConfirmed ? <p className="inline-note">Correcting confirmed meeting details preserves the previous values as an audited event — nothing is silently overwritten.</p> : <p className="inline-note">Confirm the mandatory meeting details before this source can be extracted.</p>}
     {error ? <p className="form-error" role="alert">{error}</p> : null}
     <label>Meeting subject *<input required value={meetingSubject} onChange={(event) => setMeetingSubject(event.target.value)} /></label>
-    <label>Meeting date *<input required type="date" value={eventDate} onChange={(event) => setEventDate(event.target.value)} /></label>
-    <label>Start time<input type="time" value={eventTime} onChange={(event) => setEventTime(event.target.value)} /></label>
+
+    {/* The meeting date must be ANSWERED, never invented. "Unknown" is a real
+        answer and a permanent, legitimate state — not an omission to be chased. */}
+    <fieldset className="chronology-fieldset">
+      <legend>When did this meeting happen? *</legend>
+      <label className="radio-line"><input type="radio" name="chronology-state" checked={chronologyState === 'confirmed'} onChange={() => setChronologyState('confirmed')} /> I know the date</label>
+      <label className="radio-line"><input type="radio" name="chronology-state" checked={chronologyState === 'approximate'} onChange={() => setChronologyState('approximate')} /> I know roughly when</label>
+      <label className="radio-line"><input type="radio" name="chronology-state" checked={chronologyState === 'unknown'} onChange={() => setChronologyState('unknown')} /> Meeting date unknown</label>
+
+      {chronologyState === 'unknown'
+        ? <p className="inline-note">This source will be preserved, duplicate-checked, extracted and reviewed as normal. It simply cannot claim to be later than another meeting, so any change that would depend on that ordering is held for you as &ldquo;Chronology unresolved&rdquo; rather than being guessed.</p>
+        : <>
+          <label>Precision
+            <select value={chronologyPrecision} onChange={(event) => setChronologyPrecision(event.target.value as typeof chronologyPrecision)}>
+              <option value="date">A particular day</option>
+              <option value="exact-datetime">A particular day and time</option>
+              <option value="month">A month</option>
+              <option value="range">A range of dates</option>
+            </select>
+          </label>
+          {chronologyPrecision === 'month'
+            ? <label>Month<input type="month" value={rangeStart.slice(0, 7)} onChange={(event) => setRangeStart(event.target.value)} /></label>
+            : chronologyPrecision === 'range'
+              ? <><label>From<input type="date" value={rangeStart} onChange={(event) => setRangeStart(event.target.value)} /></label><label>To<input type="date" value={rangeEnd} onChange={(event) => setRangeEnd(event.target.value)} /></label></>
+              : <><label>Meeting date<input type="date" value={eventDate} onChange={(event) => setEventDate(event.target.value)} /></label>
+                {chronologyPrecision === 'exact-datetime' ? <label>Start time<input type="time" value={eventTime} onChange={(event) => setEventTime(event.target.value)} /></label> : null}</>}
+        </>}
+
+      {/* Suggestions are offered and labelled with where they came from.
+          Nothing applies one automatically; clicking is an explicit human act. */}
+      {suggestions.length > 0 && chronologyState !== 'unknown'
+        ? <div className="chronology-suggestions">
+          <p className="muted">Possible dates — none of these is applied unless you choose it:</p>
+          {suggestions.map((suggestion) => <button key={`${suggestion.basis}:${suggestion.date}`} type="button" className="inline-button" onClick={() => { setChronologyPrecision('date'); setEventDate(suggestion.date); }}>
+            Use {suggestion.date} <span className="muted-block">{suggestion.label}</span>
+          </button>)}
+        </div>
+        : null}
+    </fieldset>
+
     <label>Timezone<input value={timezone} onChange={(event) => setTimezone(event.target.value)} placeholder="e.g. Europe/London" /></label>
     <label>Primary work package *<input required value={primaryWorkPackage} onChange={(event) => setPrimaryWorkPackage(event.target.value)} /></label>
     <label>Other work packages discussed<input value={additionalWorkPackages} onChange={(event) => setAdditionalWorkPackages(event.target.value)} placeholder="Comma-separated" /></label>

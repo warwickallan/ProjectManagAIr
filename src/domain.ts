@@ -181,6 +181,28 @@ export const inboxSourceSchema = z.object({
   processingRecoveryAction: z.string().nullable().default(null),
   createdAt: isoDateTime,
   updatedAt: isoDateTime,
+  /**
+   * Source safety, resolved for the Inbox row itself (migration 017).
+   *
+   * Every field defaults, so a payload written before this migration — an
+   * exported fixture, a portfolio import — still validates and simply reads as
+   * an active, apparently-new source with an unknown meeting date.
+   */
+  sourceDocumentId: z.string().nullable().default(null),
+  comparisonClassification: z.enum(['exact-duplicate', 'normalised-duplicate', 'possible-overlap', 'similar-filename-different-content', 'previously-voided-duplicate', 'cross-project-match', 'apparently-new']).default('apparently-new'),
+  comparisonLabel: z.string().default('Apparently new'),
+  comparisonDetail: z.string().default(''),
+  comparisonMatchCount: z.number().int().nonnegative().default(0),
+  awaitingDuplicateDecision: z.boolean().default(false),
+  duplicateBlocksExtraction: z.boolean().default(false),
+  chronologyState: z.enum(['confirmed', 'approximate', 'unknown']).default('unknown'),
+  chronologyBasis: z.enum(['human-confirmed', 'transcript-header', 'filename-suggestion', 'file-timestamp-suggestion', 'absent']).default('absent'),
+  chronologyLabel: z.string().default('Meeting date unknown'),
+  metadataConfirmed: z.boolean().default(false),
+  lifecycleState: z.enum(['active', 'duplicate', 'wrong-project', 'wrong-file', 'discarded', 'voided']).default('active'),
+  lifecycleLabel: z.string().default('Active'),
+  lifecycleReason: z.string().nullable().default(null),
+  hasAppliedChangeset: z.boolean().default(false),
 });
 
 export const proposedChangeSchema = z.object({

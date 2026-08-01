@@ -234,6 +234,20 @@ function processingLabel(status: string, stage: string | null, failed: boolean):
 export function SourceProcessingNotice({ source }: { source: SourceProcessingSnapshot }) {
   const view = sourceProcessingView(source);
   if (!view.needsAttention) return null;
+  // Waiting for meeting details is a NORMAL, expected state that every new
+  // source passes through — it needs the consultant's attention, but it is not
+  // a failure and must not be dressed as one. Previously it rendered the
+  // failure notice verbatim, so a healthy source one second old announced "This
+  // source reported a problem while processing" and "the pipeline recorded no
+  // error detail for this failure", which is alarming and simply untrue.
+  if (view.awaitingMetadata && !view.error) {
+    return (
+      <div className="awaiting-note" role="status">
+        <strong>Waiting for you to confirm the meeting details.</strong>
+        <p>Nothing is extracted and no AI call is made until the meeting subject, primary work package and meeting date are answered. The meeting date may be answered as &ldquo;unknown&rdquo;.</p>
+      </div>
+    );
+  }
   return (
     <div className="quarantine-note" role="alert">
       <strong>{view.failed ? 'This source stopped before it was extracted.' : 'This source reported a problem while processing.'}</strong>
@@ -259,7 +273,10 @@ export function SourceProcessingAlerts({ sources }: { sources: Array<SourceProce
         {blocked.map((source) => (
           <article className="stacked-record" key={source.id}>
             <div className="record-line">
-              <div><h3>{source.originalFileName}</h3><p>Extraction did not complete.</p></div>
+              {/* "Extraction did not complete" is false for a source that is
+                  simply waiting for its meeting details, which is the ordinary
+                  first state of every upload. */}
+              <div><h3>{source.originalFileName}</h3><p>{sourceProcessingView(source).awaitingMetadata && !sourceProcessingView(source).error ? 'Waiting for meeting details.' : 'Extraction did not complete.'}</p></div>
               <StatusChip value={sourceProcessingView(source).chipValue} label={sourceProcessingView(source).chipLabel} />
             </div>
             <SourceProcessingNotice source={source} />
