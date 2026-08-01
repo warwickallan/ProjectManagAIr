@@ -536,11 +536,20 @@ decorative element.
 
 ### Goal 8 — discoverability and table usability
 
-Re-verified rather than re-built: most of this checklist was already
-satisfied by the two prior commits on this branch (row-interaction
-discoverability; reasoning-first primary navigation). See the ticket-format
-final report delivered to Warwick for the explicit per-item verdict and
-evidence.
+Re-verified rather than re-built: all ten checklist items pass, confirmed via
+browser QA (Playwright, scratch database) — clickable rows, a labelled
+"Update ›" button, one-click-deep row History, scanning-relevant primary
+columns with detail in the drawer, no horizontal scroll at 1366px, a compact
+filter toolbar, Mined Data visually secondary to the reasoning-first tabs,
+obvious empty/stale states, visible source/meeting dates, and no raw
+register as a primary nav tab. Most of this was already satisfied by the two
+prior commits on this branch (row-interaction discoverability;
+reasoning-first primary navigation) — this pass re-verified rather than
+re-built it. One genuine, minor bug was found and fixed: the fixed-position
+AI Chat button could overlap the register table's row-count label at some
+viewport heights (`.table-tools > span` given clearance margin). See the
+ticket-format final report delivered to Warwick for full per-item evidence
+and screenshots.
 
 ## Migrations
 
