@@ -112,6 +112,7 @@ export function resolveWritableSkillDir(options: LoadSkillRegistryOptions = {}):
 export const SKILL_CONSUMERS: Readonly<Record<string, string>> = Object.freeze({
   'source-extraction': 'Structured extraction pass over each source window.',
   'consultant-brief': 'On-demand consultant synthesis for Meeting Brief and Needs Warwick.',
+  'consultant-reasoning': 'Bounded reasoning pass over the complete approved register state, on explicit Generate or Refresh.',
 });
 
 /** Maximum size of an uploaded revision. A skill is instructions, not a corpus. */
@@ -310,6 +311,10 @@ export function parseSkillRevision(text: string, file: string, source: SkillSour
 export const REQUIRED_SKILL_MARKERS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   'source-extraction-prompt-v2': ['rows', 'windowCoverage', 'categoryCoverage', 'anchors', 'client_ref'],
   'consultant-brief-prompt-v1': ['markdown', 'cite'],
+  // The reasoning contract's load-bearing vocabulary: a revision that stops
+  // naming its matters, its sections or its citation requirement has stopped
+  // being a revision of this skill.
+  'consultant-reasoning-prompt-v1': ['matters', 'supporting_register_ids', 'meeting_order', 'executive_summary'],
 });
 
 export interface SkillDraftValidation {
@@ -1399,7 +1404,7 @@ export function readSkillBenchmarks(db: DatabaseSync, filter: { skillId?: string
 
 export interface SkillVersionRunSummary {
   runId: string;
-  kind: 'extraction' | 'consultant-brief';
+  kind: 'extraction' | 'consultant-brief' | 'consultant-reasoning';
   projectId: string | null;
   sourceId: string | null;
   providerId: string;
