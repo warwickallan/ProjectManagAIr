@@ -927,7 +927,21 @@ export function validateOccurredAt(value: unknown, now: string): OccurredAtCheck
   return { ok: true, occurredAt: instant.toISOString() };
 }
 
-export function recordRegisterEvent(db: DatabaseSync, projectId: string, externalRegisterId: string, input: { actor: string; eventType: string; field?: string | null; newValue?: string | null; reason: string; evidenceRef?: string | null; occurredAt?: string; origin?: 'human' | 'system' }) {
+/**
+ * The bare `register_row_events` insert, with no revision bump and no
+ * rebuild. Used by two callers with different transaction shapes:
+ * `recordRegisterEvent` (one human event, one rebuild) and the
+ * source-extraction apply path (many relationship events across a whole
+ * changeset, one rebuild at the end) — see `upsertFact` in
+ * `sourceIntelligence.ts`. Kept as one function so both paths write the
+ * identical row shape and can never drift on column order.
+ */
+export function insertRawRegisterRowEvent(db: DatabaseSync, projectId: string, externalRegisterId: string, input: { actor: string; eventType: string; field?: string | null; previousValue?: string | null; newValue?: string | null; reason: string; evidenceRef?: string | null; sourceId?: string | null; occurredAt: string; origin: 'source' | 'human' | 'system'; relatedExternalId?: string | null }): void {
+  db.prepare('INSERT INTO register_row_events (id, project_id, external_register_id, occurred_at, actor, event_type, field, previous_value, new_value, reason, evidence_ref, source_id, origin, related_external_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(randomUUID(), projectId, externalRegisterId, input.occurredAt, input.actor, input.eventType, input.field ?? null, input.previousValue ?? null, input.newValue ?? null, input.reason, input.evidenceRef ?? null, input.sourceId ?? null, input.origin, input.relatedExternalId ?? null);
+}
+
+export function recordRegisterEvent(db: DatabaseSync, projectId: string, externalRegisterId: string, input: { actor: string; eventType: string; field?: string | null; newValue?: string | null; reason: string; evidenceRef?: string | null; occurredAt?: string; origin?: 'human' | 'system'; relatedExternalId?: string | null }) {
   const row = db.prepare('SELECT id, register_name, title, summary FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(projectId, externalRegisterId) as Record<string, unknown> | undefined;
   if (!row) throw new Error('Register row not found.');
   const register = String(row.register_name);
@@ -960,8 +974,12 @@ export function recordRegisterEvent(db: DatabaseSync, projectId: string, externa
           : readTypedDetails(db, register, String(row.id))[input.field] ?? null;
   db.exec('BEGIN IMMEDIATE;');
   try {
-    db.prepare('INSERT INTO register_row_events (id, project_id, external_register_id, occurred_at, actor, event_type, field, previous_value, new_value, reason, evidence_ref, source_id, origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)')
-      .run(randomUUID(), projectId, externalRegisterId, occurredAt, input.actor, input.eventType, input.field ?? null, previous === null || previous === undefined ? null : String(previous), input.newValue ?? null, input.reason, input.evidenceRef ?? null, input.origin ?? 'human');
+    insertRawRegisterRowEvent(db, projectId, externalRegisterId, {
+      actor: input.actor, eventType: input.eventType, field: input.field ?? null,
+      previousValue: previous === null || previous === undefined ? null : String(previous),
+      newValue: input.newValue ?? null, reason: input.reason, evidenceRef: input.evidenceRef ?? null,
+      occurredAt, origin: input.origin ?? 'human', relatedExternalId: input.relatedExternalId ?? null,
+    });
     db.prepare('INSERT INTO project_register_revisions (project_id, revision, updated_at) VALUES (?, 1, ?) ON CONFLICT(project_id) DO UPDATE SET revision = revision + 1, updated_at = excluded.updated_at').run(projectId, occurredAt);
     rebuildProjection(db, projectId, occurredAt);
     db.prepare('UPDATE consultant_briefs SET stale = 1 WHERE project_id = ?').run(projectId);
@@ -980,6 +998,6 @@ export function readRowEvidence(db: DatabaseSync, projectId: string, externalReg
   const events = db.prepare('SELECT * FROM register_row_events WHERE project_id = ? AND external_register_id = ? ORDER BY occurred_at DESC, rowid DESC').all(projectId, externalRegisterId) as Array<Record<string, unknown>>;
   return {
     anchors: anchors.map((row) => ({ id: String(row.id), sourceId: String(row.source_id), segmentId: String(row.segment_id), speaker: row.speaker ? String(row.speaker) : null, tMs: row.t_ms === null ? null : Number(row.t_ms), quote: row.quote ? String(row.quote) : null, verified: row.verified === 1 })),
-    events: events.map((row) => ({ id: String(row.id), occurredAt: String(row.occurred_at), actor: String(row.actor), eventType: String(row.event_type), field: row.field ? String(row.field) : null, previousValue: row.previous_value ? String(row.previous_value) : null, newValue: row.new_value ? String(row.new_value) : null, reason: String(row.reason), evidenceRef: row.evidence_ref ? String(row.evidence_ref) : null, origin: (row.origin ? String(row.origin) : 'human') as 'source' | 'human' | 'system' })),
+    events: events.map((row) => ({ id: String(row.id), occurredAt: String(row.occurred_at), actor: String(row.actor), eventType: String(row.event_type), field: row.field ? String(row.field) : null, previousValue: row.previous_value ? String(row.previous_value) : null, newValue: row.new_value ? String(row.new_value) : null, reason: String(row.reason), evidenceRef: row.evidence_ref ? String(row.evidence_ref) : null, origin: (row.origin ? String(row.origin) : 'human') as 'source' | 'human' | 'system', relatedExternalId: row.related_external_id ? String(row.related_external_id) : null })),
   };
 }

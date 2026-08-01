@@ -12,7 +12,7 @@ import {
   type StructuredExtractionRequest,
   type StructuredExtractionResult,
 } from '../src/extractionProvider';
-import { createProject, intakeProjectSource, updateStorageSettings } from '../src/projectLifecycle';
+import { confirmSourceMetadata, createProject, intakeProjectSource, updateStorageSettings } from '../src/projectLifecycle';
 import {
   WatchedInboxScanner,
   retrySourceJob,
@@ -68,6 +68,12 @@ async function harness(prefix = 'projectmanagair-recovery-'): Promise<Harness> {
         dataBase64: Buffer.from(text, 'utf8').toString('base64'),
       }) as unknown as { sourceId: string; intakeSourceId: string };
       const row = context.db.prepare('SELECT content_hash, intake_source_id FROM source_documents WHERE id = ?').get(intake.sourceId) as { content_hash: string; intake_source_id: string };
+      confirmSourceMetadata(context.db, project.projectId, intake.sourceId, {
+        actor: 'tester',
+        meetingSubject: `Synthetic meeting for ${name}`,
+        eventDate: '2026-01-01',
+        primaryWorkPackage: 'General',
+      });
       return {
         sourceId: intake.sourceId,
         intakeId: String(row.intake_source_id),

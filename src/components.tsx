@@ -108,7 +108,7 @@ const statusTone: Record<string, string> = {
   blocked: 'bad', critical: 'bad', failed: 'bad', missed: 'bad', overdue: 'bad', busy: 'bad', high: 'bad',
   // Source-intake processing states (migration 011). `quarantined` used to have no
   // tone at all because the schema did not admit it.
-  quarantined: 'bad', rejected: 'bad', awaiting_processing: 'watch', processing: 'info', awaiting_review: 'watch', archived: 'neutral',
+  quarantined: 'bad', rejected: 'bad', awaiting_processing: 'watch', awaiting_metadata: 'watch', processing: 'info', awaiting_review: 'watch', archived: 'neutral',
   // Human register-event statuses (015).
   applied: 'good', mitigated: 'watch', cancelled: 'neutral', reverted: 'neutral', resolved: 'good', ratified: 'good', parked: 'watch', superseded: 'neutral',
 };
@@ -189,6 +189,8 @@ export interface SourceProcessingView {
   failed: boolean;
   inProgress: boolean;
   needsAttention: boolean;
+  /** Goal 1 — waiting on a human to confirm mandatory meeting metadata, not on any pipeline step. */
+  awaitingMetadata: boolean;
   stage: string | null;
   error: string | null;
   recovery: string | null;
@@ -201,19 +203,23 @@ export function sourceProcessingView(source: SourceProcessingSnapshot): SourcePr
   const error = source.processingError?.trim() || null;
   const recovery = source.processingRecoveryAction?.trim() || null;
   const failed = FAILED_PROCESSING_STATUSES.has(source.processingStatus) || (stage !== null && FAILED_PROCESSING_STAGES.has(stage));
-  const inProgress = !failed && OPEN_PROCESSING_STATUSES.has(source.processingStatus);
-  const chipValue = failed ? 'failed' : source.processingStatus;
+  const awaitingMetadata = !failed && source.processingStatus === 'awaiting_metadata';
+  const inProgress = !failed && !awaitingMetadata && OPEN_PROCESSING_STATUSES.has(source.processingStatus);
+  const chipValue = failed ? 'failed' : awaitingMetadata ? 'awaiting_metadata' : source.processingStatus;
   return {
     failed,
     inProgress,
-    // An in-progress source that has already recorded an error is the stalled case:
-    // it will never move on its own, so it must not read as ordinary progress.
-    needsAttention: failed || (inProgress && error !== null),
+    awaitingMetadata,
+    // An in-progress source that has already recorded an error is the stalled
+    // case: it will never move on its own, so it must not read as ordinary
+    // progress. Awaiting metadata is always attention-worthy — by
+    // definition nothing proceeds until a human acts, error or not.
+    needsAttention: failed || awaitingMetadata || (inProgress && error !== null),
     stage,
     error,
     recovery,
     chipValue,
-    chipLabel: processingLabel(source.processingStatus, stage, failed),
+    chipLabel: awaitingMetadata ? 'Awaiting meeting details' : processingLabel(source.processingStatus, stage, failed),
   };
 }
 

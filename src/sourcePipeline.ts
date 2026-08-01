@@ -1266,7 +1266,7 @@ export type SourcePipelineEvent =
   | { type: 'claimed'; jobId: string; sourceId: string; attempt: number; maxAttempts: number }
   | { type: 'completed'; jobId: string; sourceId: string; packetId: string; changesetId: string | null; gateVerdict: string; calls: number }
   | { type: 'failed'; jobId: string; sourceId: string; kind: SourceFailureKind; message: string; recoveryAction: string; attempt: number; maxAttempts: number; willRetry: boolean }
-  | { type: 'skipped'; jobId: string; sourceId: string; reason: 'lease-held' | 'already-frozen' | 'no-source' ; detail: string };
+  | { type: 'skipped'; jobId: string; sourceId: string; reason: 'lease-held' | 'already-frozen' | 'no-source' | 'awaiting-metadata'; detail: string };
 
 function defaultPipelineLogger(event: SourcePipelineEvent): void {
   if (event.type === 'failed') {
@@ -1293,7 +1293,7 @@ export type SourceExtractionHandoff = Awaited<ReturnType<typeof runSourceExtract
 
 export interface SourceJobRunResult {
   ok: boolean;
-  status: 'completed' | 'already-frozen' | 'quarantined' | 'lease-held' | 'blocked';
+  status: 'completed' | 'already-frozen' | 'quarantined' | 'lease-held' | 'blocked' | 'awaiting-metadata';
   jobId: string;
   sourceId: string;
   providerCalls: number;
@@ -1321,6 +1321,19 @@ export async function runSourceExtractionJob(db: DatabaseSync, options: SourceJo
     return { ok: false, status: 'blocked', jobId: '', sourceId: options.sourceId, providerCalls: 0, attempts: 0, message: detail };
   }
   const jobId = jobIdForSource(source);
+  // Goal 1 — the single, centralised gate. Every caller (the direct-upload
+  // scheduler, the watched-folder scanner and the stalled-job sweeper) funnels
+  // through this function, so enforcing the check here — rather than only at
+  // intake — is what stops a sweeper reclaim or a retry from bypassing an
+  // unconfirmed source's metadata gate. `metadata_confirmed_at` is the single
+  // source of truth; `processing_status` is a display label that mirrors it.
+  const intakeId = resolveIntakeId(db, source);
+  const intake = intakeId ? db.prepare('SELECT metadata_confirmed_at FROM project_source_intake WHERE id = ?').get(intakeId) as { metadata_confirmed_at: string | null } | undefined : undefined;
+  if (!intake?.metadata_confirmed_at) {
+    const detail = 'Meeting subject, event date and primary work package have not been confirmed for this source; Source Intelligence is not invoked until they are. Confirm details in Inbox.';
+    emit({ type: 'skipped', jobId, sourceId: source.id, reason: 'awaiting-metadata', detail });
+    return { ok: false, status: 'awaiting-metadata', jobId, sourceId: source.id, providerCalls: 0, attempts: 0, message: detail };
+  }
   if (options.maxAttempts && options.maxAttempts > 0) {
     db.prepare('UPDATE source_processing_jobs SET max_attempts = ? WHERE id = ?').run(options.maxAttempts, jobId);
   }

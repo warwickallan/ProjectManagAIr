@@ -132,8 +132,8 @@ describe('C2 — every project can ingest a source, not only the first', () => {
         ]),
       });
 
-      expect(alphaIntake).toMatchObject({ duplicate: false, processingStatus: 'processing' });
-      expect(betaIntake).toMatchObject({ duplicate: false, processingStatus: 'processing' });
+      expect(alphaIntake).toMatchObject({ duplicate: false, processingStatus: 'awaiting_metadata' });
+      expect(betaIntake).toMatchObject({ duplicate: false, processingStatus: 'awaiting_metadata' });
       const alphaSource = String(alphaIntake.sourceId);
       const betaSource = String(betaIntake.sourceId);
       expect(alphaSource).not.toBe(betaSource);

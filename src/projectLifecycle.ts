@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { registerNormalizedSource } from './sourceIntelligence.js';
 
-export type SourceState = 'awaiting_processing' | 'processing' | 'awaiting_review' | 'verified' | 'failed' | 'rejected' | 'archived';
+export type SourceState = 'awaiting_metadata' | 'awaiting_processing' | 'processing' | 'awaiting_review' | 'verified' | 'failed' | 'rejected' | 'archived';
 export type ProposedStatus = 'proposed' | 'reviewed' | 'approved' | 'applied' | 'rejected';
 export type StructuredItemType = 'action' | 'risk_issue' | 'decision' | 'open_question' | 'milestone' | 'work_package' | 'meeting_summary' | 'stakeholder' | 'deliverable' | 'change_request' | 'source_metadata';
 
@@ -481,7 +481,11 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
   let status: SourceState = 'awaiting_review';
   let payload: ProposedPayload;
   if (sourceIntelligenceSupported) {
-    status = 'processing';
+    // Confirmed by `confirmSourceMetadata` once Warwick supplies the meeting
+    // subject, event date and primary work package; see the note beside the
+    // post-normalisation UPDATE below for why this cannot invoke Source
+    // Intelligence yet.
+    status = 'awaiting_metadata';
     payload = { contractVersion: 1, provider: 'source-intelligence-v1', sourceMetadata: { sourceType, contentHash, originalFileName: file.name }, items: [] };
   } else try {
     const text = ['vtt-transcript', 'plain-text'].includes(sourceType) ? bytes.toString('utf8') : '';
@@ -518,7 +522,14 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
       const filedAt = nowIso();
       db.exec('BEGIN IMMEDIATE;');
       try {
-        db.prepare("UPDATE project_source_intake SET current_external_path = ?, previous_external_path = ?, processing_status = 'processing', updated_at = ? WHERE id = ?").run(filed.destinationPath, target, filedAt, sourceId);
+        // Goal 1 — a VTT's own timestamps cannot be trusted to supply a
+        // reliable meeting subject, event date or work package, so a
+        // normalised source lands in an explicit `awaiting_metadata` state
+        // rather than `processing`. `scheduleSourceExtraction` (server.ts)
+        // and `runSourceExtractionJob` (sourcePipeline.ts) both refuse to
+        // call the extraction provider while this state holds; confirming
+        // metadata (`confirmSourceMetadata` below) is what advances it.
+        db.prepare("UPDATE project_source_intake SET current_external_path = ?, previous_external_path = ?, processing_status = 'awaiting_metadata', updated_at = ? WHERE id = ?").run(filed.destinationPath, target, filedAt, sourceId);
         db.prepare('INSERT INTO source_file_history (id, source_id, project_id, from_external_path, to_external_path, action, occurred_at, actor, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
           .run(randomUUID(), sourceId, projectId, target, filed.destinationPath, 'filed-immutable-original', filedAt, 'Project ManagAIr', contentHash);
         db.exec('COMMIT;');
@@ -527,7 +538,7 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
         throw error;
       }
       if (path.resolve(target) !== path.resolve(filed.destinationPath) && existsSync(target)) rmSync(target, { force: true });
-      return { ...normalized, intakeSourceId: sourceId, proposedChangeId: null, processingStatus: 'processing', extractedCount: 0, immutablePath: filed.destinationPath };
+      return { ...normalized, intakeSourceId: sourceId, proposedChangeId: null, processingStatus: 'awaiting_metadata', extractedCount: 0, immutablePath: filed.destinationPath };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       db.prepare("UPDATE project_source_intake SET processing_status = 'failed', verification_state = 'failed', updated_at = ? WHERE id = ?").run(nowIso(), sourceId);
@@ -536,6 +547,147 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
     }
   }
   return { sourceId, proposedChangeId: proposedId, duplicate: false, eventDate: null, processingStatus: status, extractedCount: payload.items.length };
+}
+
+/* -------------------------------------------------------------------------- *
+ * Goal 1 — mandatory source metadata before extraction.
+ *
+ * File names and a VTT's own embedded timestamps may only prefill this form;
+ * they are never treated as confirmed truth. The source stays in
+ * `awaiting_metadata` — and `runSourceExtractionJob` refuses to call the
+ * extraction provider — until this function has been called successfully.
+ * -------------------------------------------------------------------------- */
+
+export interface SourceMetadataInput {
+  actor: string;
+  meetingSubject: string;
+  eventDate: string;
+  eventTime?: string | null;
+  timezone?: string | null;
+  primaryWorkPackage: string;
+  additionalWorkPackages?: string[];
+  participants?: string[];
+  recordingGapNotes?: string | null;
+  reason?: string | null;
+}
+
+export interface SourceMetadataRecord {
+  sourceId: string;
+  meetingSubject: string | null;
+  eventDate: string | null;
+  eventTime: string | null;
+  timezone: string | null;
+  primaryWorkPackage: string | null;
+  additionalWorkPackages: string[];
+  participants: string[];
+  recordingGapNotes: string | null;
+  confirmed: boolean;
+  confirmedAt: string | null;
+  confirmedBy: string | null;
+}
+
+/** Every mandatory-field check `confirmSourceMetadata` enforces, named so the UI and the API agree on what "confirmed" means. */
+export const MANDATORY_SOURCE_METADATA_FIELDS = ['meetingSubject', 'eventDate', 'primaryWorkPackage'] as const;
+
+function isoDateOnly(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
+/**
+ * A caller may hand in either id: `source_documents.id` (the normalised
+ * source) or `project_source_intake.id` (what the Inbox UI actually has,
+ * since `inboxSources` is read from `project_source_intake`). Mirrors the
+ * same either-id resolution `retrySourceJob`/`resolveJobAndSource` already
+ * use in `sourcePipeline.ts`, so every source-facing route agrees on which
+ * id a caller may supply.
+ */
+function resolveSourceDocumentRow(db: DatabaseSync, idOrIntakeId: string): Record<string, unknown> | undefined {
+  const direct = db.prepare('SELECT * FROM source_documents WHERE id = ?').get(idOrIntakeId) as Record<string, unknown> | undefined;
+  if (direct) return direct;
+  return db.prepare('SELECT * FROM source_documents WHERE intake_source_id = ? LIMIT 1').get(idOrIntakeId) as Record<string, unknown> | undefined;
+}
+
+/** The confirmed metadata for one source, or nulls/empties before confirmation. Never guesses — a filename-derived prefill lives only in the UI until this is called. */
+export function readSourceMetadata(db: DatabaseSync, idOrIntakeId: string): SourceMetadataRecord | null {
+  const source = resolveSourceDocumentRow(db, idOrIntakeId);
+  if (!source) return null;
+  const sourceId = String(source.id);
+  const intake = db.prepare('SELECT metadata_confirmed_at, metadata_confirmed_by FROM project_source_intake WHERE id = ?').get(String(source.intake_source_id)) as { metadata_confirmed_at: string | null; metadata_confirmed_by: string | null } | undefined;
+  return {
+    sourceId,
+    meetingSubject: source.meeting_subject ? String(source.meeting_subject) : null,
+    eventDate: source.confirmed_event_date ? String(source.confirmed_event_date) : null,
+    eventTime: source.event_time ? String(source.event_time) : null,
+    timezone: source.timezone ? String(source.timezone) : null,
+    primaryWorkPackage: source.primary_work_package ? String(source.primary_work_package) : null,
+    additionalWorkPackages: JSON.parse(String(source.additional_work_packages_json ?? '[]')) as string[],
+    participants: JSON.parse(String(source.confirmed_participants_json ?? '[]')) as string[],
+    recordingGapNotes: source.recording_gap_notes ? String(source.recording_gap_notes) : null,
+    confirmed: Boolean(intake?.metadata_confirmed_at),
+    confirmedAt: intake?.metadata_confirmed_at ?? null,
+    confirmedBy: intake?.metadata_confirmed_by ?? null,
+  };
+}
+
+/**
+ * Confirm (or correct) a source's meeting metadata. The first confirmation
+ * unblocks extraction (the caller schedules it explicitly — this function
+ * only records the metadata and its own audit trail, never a provider call
+ * itself). A later correction is recorded exactly the same way: every field
+ * that actually changes gets one `source_metadata_events` row naming the
+ * previous and new value, so a correction after extraction never silently
+ * rewrites provenance.
+ */
+export function confirmSourceMetadata(db: DatabaseSync, projectId: string, idOrIntakeId: string, input: SourceMetadataInput): SourceMetadataRecord {
+  const source = resolveSourceDocumentRow(db, idOrIntakeId);
+  if (!source || String(source.project_id) !== projectId) throw new Error('Source not found.');
+  const sourceId = String(source.id);
+  if (!input.meetingSubject?.trim()) throw new Error('Meeting subject is required.');
+  if (!input.eventDate?.trim() || !isoDateOnly(input.eventDate.trim())) throw new Error('Meeting event date is required, as YYYY-MM-DD.');
+  if (!input.primaryWorkPackage?.trim()) throw new Error('Primary work package is required.');
+  if (!input.actor?.trim()) throw new Error('Confirming metadata requires a named actor.');
+
+  const now = new Date().toISOString();
+  const reason = input.reason?.trim() || (source.meeting_subject ? 'Corrected meeting metadata.' : 'Confirmed meeting metadata before extraction.');
+  // `confirmed_event_date`/`confirmed_participants_json` are the correctable,
+  // human-asserted facts — deliberately distinct columns from the immutable,
+  // evidence-derived `event_date`/`participants_json` (guarded by
+  // `trg_source_documents_immutable`), so a correction here never collides
+  // with that evidence-integrity invariant.
+  const next: Record<string, string | null> = {
+    meeting_subject: input.meetingSubject.trim(),
+    confirmed_event_date: input.eventDate.trim(),
+    event_time: input.eventTime?.trim() || null,
+    timezone: input.timezone?.trim() || null,
+    primary_work_package: input.primaryWorkPackage.trim(),
+    additional_work_packages_json: JSON.stringify(input.additionalWorkPackages ?? []),
+    recording_gap_notes: input.recordingGapNotes?.trim() || null,
+    confirmed_participants_json: JSON.stringify(input.participants ?? JSON.parse(String(source.confirmed_participants_json ?? '[]'))),
+  };
+
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    // One audit event per field that actually changed, mirroring
+    // `register_row_events`: a correction is recorded, never silently
+    // overwritten. JSON-valued fields are compared as JSON so `["a"]` vs
+    // `["a"]` in a different key order does not spuriously fire.
+    for (const [field, value] of Object.entries(next)) {
+      const previous = source[field] === null || source[field] === undefined ? null : String(source[field]);
+      if (previous === value) continue;
+      db.prepare('INSERT INTO source_metadata_events (id, source_id, project_id, occurred_at, actor, field, previous_value, new_value, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(randomUUID(), sourceId, projectId, now, input.actor.trim(), field, previous, value, reason);
+    }
+    db.prepare('UPDATE source_documents SET meeting_subject = ?, confirmed_event_date = ?, event_time = ?, timezone = ?, primary_work_package = ?, additional_work_packages_json = ?, recording_gap_notes = ?, confirmed_participants_json = ? WHERE id = ?')
+      .run(next.meeting_subject, next.confirmed_event_date, next.event_time, next.timezone, next.primary_work_package, next.additional_work_packages_json, next.recording_gap_notes, next.confirmed_participants_json, sourceId);
+    const intakeSourceId = String(source.intake_source_id);
+    db.prepare("UPDATE project_source_intake SET metadata_confirmed_at = COALESCE(metadata_confirmed_at, ?), metadata_confirmed_by = COALESCE(metadata_confirmed_by, ?), processing_status = CASE WHEN processing_status = 'awaiting_metadata' THEN 'processing' ELSE processing_status END, updated_at = ? WHERE id = ?")
+      .run(now, input.actor.trim(), now, intakeSourceId);
+    db.exec('COMMIT;');
+  } catch (error) {
+    db.exec('ROLLBACK;');
+    throw error;
+  }
+  return readSourceMetadata(db, sourceId)!;
 }
 
 export function recordBlindExtractionPacket(db: DatabaseSync, projectId: string, input: BlindExtractionInput) {

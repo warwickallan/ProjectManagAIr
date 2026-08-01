@@ -6,7 +6,11 @@ import { resolveDate } from './dateResolution.js';
 import { estimateTokens } from './extractionProvider.js';
 import type { GroundedBriefProvider } from './briefProvider.js';
 import { normalizeSource, SOURCE_NORMALISER_VERSION, type NormalizedDocument, type NormalizedSegment } from './sourceNormalizers.js';
-import { activeScoringVersion, canonicalNormalizedRowJson, canonicalNormalizedValue, canonicalRowJson, canonicalValueJson, needsConsultantAttention, PROJECTOR_VERSION, rebuildProjection, readRowEvidence, readTypedDetails } from './registerProjection.js';
+import { activeScoringVersion, canonicalNormalizedRowJson, canonicalNormalizedValue, canonicalRowJson, canonicalValueJson, insertRawRegisterRowEvent, needsConsultantAttention, PROJECTOR_VERSION, rebuildProjection, readRowEvidence, readTypedDetails } from './registerProjection.js';
+
+/** Work-package sentinels a row's `work_package_tags` (or a source's own primary/additional tags) may hold, alongside a real tag name. */
+export const WORK_PACKAGE_PROJECT_WIDE = 'project-wide';
+export const WORK_PACKAGE_UNCLEAR = 'unclear';
 
 export const PACKET_VERSION = 1;
 export const VALIDATOR_VERSION = 'source-intelligence-validator-v2';
@@ -58,6 +62,18 @@ const packetRowSchema = z.object({
   source_ref: z.string().min(1),
   related_refs: z.array(z.string()).default([]),
   supersedes: z.array(z.string()).default([]),
+  // Which existing register IDs this row's arrival answers — distinct from
+  // `related_refs` (merely related) and `supersedes` (replaces outright).
+  // Optional and additive: a packet that omits it behaves exactly as before.
+  // `.optional()` rather than `.default([])` deliberately — every existing
+  // fixture and test that builds a packet row as a plain object literal (not
+  // through `packetSchema.parse`) stays valid without editing dozens of
+  // files; `upsertFact`'s `resolveRefs` already treats a non-array as `[]`.
+  answers: z.array(z.string()).optional(),
+  // A row's own work-package tag(s), when the source states one. Optional:
+  // an omitting packet falls back to the source's primary work package at
+  // apply time (see `upsertFact`), so this is additive, not a new gate.
+  work_package_tags: z.array(z.string()).optional(),
   anchors: z.array(anchorSchema).min(1),
   derivation: z.enum(['fact', 'inference']),
   reasoning: z.string().min(1).nullable().default(null),
@@ -1057,15 +1073,24 @@ function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode:
   const resolveRefs = (value: unknown): string[] => (Array.isArray(value) ? value.map((entry) => context.refMap.get(String(entry)) ?? String(entry)) : []);
   const relatedIds = resolveRefs(proposed.related_refs);
   const supersedesIds = resolveRefs(proposed.supersedes);
+  const answersIds = resolveRefs(proposed.answers);
   raw.related_refs = relatedIds;
   raw.supersedes = supersedesIds;
   if (op.op === 'resolve') raw.status = 'resolved';
-  const due = resolveDate(proposed.due_date_raw, (db.prepare('SELECT event_date FROM source_documents WHERE id = ?').get(context.sourceId) as { event_date: string | null }).event_date);
+  const sourceRow = db.prepare('SELECT event_date, primary_work_package FROM source_documents WHERE id = ?').get(context.sourceId) as { event_date: string | null; primary_work_package: string | null };
+  const due = resolveDate(proposed.due_date_raw, sourceRow.event_date);
+  // A row's own work-package tags win when the source stated one; otherwise it
+  // falls back to the source's confirmed primary work package (Goal 3 — a
+  // source has a primary work package for context, but need not force every
+  // row into it when the row states its own).
+  const rowWorkPackageTags = Array.isArray(proposed.work_package_tags) && proposed.work_package_tags.length > 0
+    ? (proposed.work_package_tags as unknown[]).map(String)
+    : sourceRow.primary_work_package ? [sourceRow.primary_work_package] : [];
   const rowId = `register:${context.projectId}:${externalId}`;
   db.prepare(`INSERT INTO project_register_rows (id, project_id, register_name, external_register_id, title, summary, record_status, record_type, owner, due_date, source_ref, source_anchor, original_status_wording, related_ids_json, supersession_ids_json, work_package_tags_json, import_run_id, source_id, original_row_number, original_tab_name, raw_row_json, normalized_row_json, created_at, updated_at, derivation, confidence, first_seen_source_id, last_updated_source_id, due_date_raw, due_date_confidence)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(project_id, external_register_id) DO UPDATE SET title = excluded.title, summary = excluded.summary, record_status = excluded.record_status, record_type = excluded.record_type, owner = excluded.owner, due_date = excluded.due_date, source_ref = excluded.source_ref, original_status_wording = excluded.original_status_wording, related_ids_json = excluded.related_ids_json, supersession_ids_json = excluded.supersession_ids_json, import_run_id = excluded.import_run_id, source_id = excluded.source_id, raw_row_json = excluded.raw_row_json, normalized_row_json = excluded.normalized_row_json, updated_at = excluded.updated_at, derivation = excluded.derivation, confidence = excluded.confidence, last_updated_source_id = excluded.last_updated_source_id, due_date_raw = excluded.due_date_raw, due_date_confidence = excluded.due_date_confidence`)
-    .run(rowId, context.projectId, registerName, externalId, String(raw.title), String(raw.summary ?? ''), String(raw.status ?? 'open'), raw.record_type ? String(raw.record_type) : null, raw.owner ? String(raw.owner) : null, due.date, raw.source_ref ? String(raw.source_ref) : context.sourceId, null, String(raw.status ?? 'open'), JSON.stringify(relatedIds), JSON.stringify(supersedesIds), '[]', context.importRunId, context.sourceId, null, registerName, canonicalRowJson(raw), canonicalNormalizedRowJson(raw), context.timestamp, context.timestamp, String(op.derivation), String(op.confidence), existing?.first_seen_source_id ? String(existing.first_seen_source_id) : context.sourceId, context.sourceId, raw.due_date_raw ? String(raw.due_date_raw) : null, due.confidence);
+    ON CONFLICT(project_id, external_register_id) DO UPDATE SET title = excluded.title, summary = excluded.summary, record_status = excluded.record_status, record_type = excluded.record_type, owner = excluded.owner, due_date = excluded.due_date, source_ref = excluded.source_ref, original_status_wording = excluded.original_status_wording, related_ids_json = excluded.related_ids_json, supersession_ids_json = excluded.supersession_ids_json, work_package_tags_json = excluded.work_package_tags_json, import_run_id = excluded.import_run_id, source_id = excluded.source_id, raw_row_json = excluded.raw_row_json, normalized_row_json = excluded.normalized_row_json, updated_at = excluded.updated_at, derivation = excluded.derivation, confidence = excluded.confidence, last_updated_source_id = excluded.last_updated_source_id, due_date_raw = excluded.due_date_raw, due_date_confidence = excluded.due_date_confidence`)
+    .run(rowId, context.projectId, registerName, externalId, String(raw.title), String(raw.summary ?? ''), String(raw.status ?? 'open'), raw.record_type ? String(raw.record_type) : null, raw.owner ? String(raw.owner) : null, due.date, raw.source_ref ? String(raw.source_ref) : context.sourceId, null, String(raw.status ?? 'open'), JSON.stringify(relatedIds), JSON.stringify(supersedesIds), JSON.stringify(rowWorkPackageTags), context.importRunId, context.sourceId, null, registerName, canonicalRowJson(raw), canonicalNormalizedRowJson(raw), context.timestamp, context.timestamp, String(op.derivation), String(op.confidence), existing?.first_seen_source_id ? String(existing.first_seen_source_id) : context.sourceId, context.sourceId, raw.due_date_raw ? String(raw.due_date_raw) : null, due.confidence);
   db.prepare('DELETE FROM project_register_row_fields WHERE register_row_id = ?').run(rowId);
   const insertField = db.prepare('INSERT INTO project_register_row_fields (id, register_row_id, project_id, register_name, external_register_id, field_name, original_value_json, normalized_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
   // Import and pipeline now serialise identically (C11); previously the pipeline
@@ -1089,6 +1114,26 @@ function upsertFact(db: DatabaseSync, context: { projectId: string; projectCode:
   for (const markerId of (Array.isArray(proposed.discharges_markers) ? proposed.discharges_markers : []) as string[]) dischargeStatement.run(externalId, String(markerId), context.sourceId);
   if (op.op === 'supersede' && targetId) {
     db.prepare("UPDATE project_register_rows SET record_status = 'superseded', supersession_ids_json = ? WHERE project_id = ? AND external_register_id = ?").run(JSON.stringify([externalId]), context.projectId, targetId);
+  }
+  // Goal 4 — a formal, stored "answers" relationship, distinct from the
+  // generic `related_refs`. Mirrored onto both rows so either side of the
+  // relationship is independently discoverable: the answering row records
+  // what it answers, the question records what answered it. Purely
+  // declarative — it never mutates the question's own status; if the source
+  // also resolves the question, that goes through its own `resolve` op on the
+  // question row, reviewed and applied like any other operation.
+  const reviewerActor = String(op.reviewer ?? 'reviewer');
+  for (const questionId of answersIds) {
+    const questionExists = Boolean(db.prepare('SELECT 1 FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(context.projectId, questionId));
+    if (!questionExists) continue;
+    insertRawRegisterRowEvent(db, context.projectId, externalId, {
+      actor: reviewerActor, eventType: 'answers', reason: `Answers ${questionId}.`,
+      sourceId: context.sourceId, occurredAt: context.timestamp, origin: 'source', relatedExternalId: questionId,
+    });
+    insertRawRegisterRowEvent(db, context.projectId, questionId, {
+      actor: reviewerActor, eventType: 'answered_by', reason: `Answered by ${externalId}.`,
+      sourceId: context.sourceId, occurredAt: context.timestamp, origin: 'source', relatedExternalId: externalId,
+    });
   }
   db.prepare('UPDATE register_change_ops SET allocated_external_id = ? WHERE id = ?').run(externalId, String(op.id));
   return externalId;

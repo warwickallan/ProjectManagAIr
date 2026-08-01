@@ -164,7 +164,7 @@ export const inboxSourceSchema = z.object({
   sourceType: z.string().min(1),
   currentExternalPath: z.string().min(1),
   previousExternalPath: z.string().nullable(),
-  processingStatus: z.enum(['awaiting_processing', 'processing', 'awaiting_review', 'verified', 'failed', 'quarantined', 'rejected', 'archived']),
+  processingStatus: z.enum(['awaiting_metadata', 'awaiting_processing', 'processing', 'awaiting_review', 'verified', 'failed', 'quarantined', 'rejected', 'archived']),
   processorProvider: z.string().min(1),
   extractedItemIds: z.array(z.string()),
   reviewState: z.string().min(1),

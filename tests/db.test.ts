@@ -122,12 +122,12 @@ describe('SQLite operational database', () => {
 
       const summaryText = ['WEBVTT', '', '00:00:01.000 --> 00:00:02.000', 'General discussion without markers'].join('\n');
       const summaryOnly = await intakeProjectSource(context.db, project.projectId, { name: 'summary-only.vtt', dataBase64: Buffer.from(summaryText, 'utf8').toString('base64') });
-      expect(summaryOnly.processingStatus).toBe('processing');
+      expect(summaryOnly.processingStatus).toBe('awaiting_metadata');
       expect('segmentCount' in summaryOnly ? summaryOnly.segmentCount : null).toBe(1);
 
       const intake = await intakeProjectSource(context.db, project.projectId, { name: 'acceptance.vtt', dataBase64: Buffer.from(vtt, 'utf8').toString('base64') });
       expect(intake.duplicate).toBe(false);
-      expect(intake.processingStatus).toBe('processing');
+      expect(intake.processingStatus).toBe('awaiting_metadata');
       expect('segmentCount' in intake ? intake.segmentCount : 0).toBeGreaterThan(0);
       const afterIntake = readProjectData(context.db, project.projectId)!.projects[0];
       expect(afterIntake.proposedChanges).toHaveLength(1);
@@ -137,7 +137,7 @@ describe('SQLite operational database', () => {
       expect(acceptedSource?.windows.length).toBeGreaterThan(0);
       expect(acceptedSource?.markerCounts.length).toBeGreaterThan(0);
       const intakeRow = afterIntake.inboxSources.find((source) => source.originalFileName === 'acceptance.vtt');
-      expect(intakeRow?.processingStatus).toBe('processing');
+      expect(intakeRow?.processingStatus).toBe('awaiting_metadata');
       expect(intakeRow?.currentExternalPath).toContain(path.join('01_Sources_Immutable', 'Meeting_Transcripts'));
       expect(readFileSync(intakeRow!.currentExternalPath, 'utf8')).toBe(vtt);
       expect(afterIntake.sourceFileHistory.some((entry) => entry.sourceId === intakeRow?.id && entry.action === 'filed-immutable-original')).toBe(true);

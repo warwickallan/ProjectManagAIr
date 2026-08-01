@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { buildPortfolioResponse, buildProjectResponse, portfolioFixtureSchema } from './src/domain.js';
 import { openProjectManagairDatabase, readPortfolioData, readProjectData } from './src/db.js';
-import { approveProposedChange, createProject, openOriginalPath, readStorageSettings, recordBlindExtractionPacket, rejectProposedChange, updateStorageSettings, verifyStorageRoot, type IntakeFileInput } from './src/projectLifecycle.js';
+import { approveProposedChange, confirmSourceMetadata, createProject, openOriginalPath, readSourceMetadata, readStorageSettings, recordBlindExtractionPacket, rejectProposedChange, updateStorageSettings, verifyStorageRoot, type IntakeFileInput } from './src/projectLifecycle.js';
 import { authStatus, markMessageRead, moveMessageToDeletedItems, pollDeviceCode, readCalendarProjection, readInboxProjection, requiredScopes, startDeviceCode, syncCalendarView, syncInbox } from './src/m365.js';
 import { probeAIProviders, sendChatMessage } from './src/aiProvider.js';
 import { compareBlindExtractionToBenchmark } from './src/blindExtractionComparison.js';
@@ -279,6 +279,35 @@ app.post('/api/projects/:projectId/sources/:sourceId/skip', asyncRoute(async (re
   const body = request.body as { reason?: string; markerDismissals?: Array<{ markerId: string; reason: string }> };
   if (!body.reason || !String(body.reason).trim()) { response.status(400).json({ error: 'reason is required to skip a source after comprehension.' }); return; }
   response.json(skipSourceAfterComprehension(db(), { sourceId: String(request.params.sourceId), reason: String(body.reason), markerDismissals: body.markerDismissals }));
+}));
+app.get('/api/projects/:projectId/sources/:sourceId/metadata', (request, response) => {
+  const metadata = readSourceMetadata(db(), String(request.params.sourceId));
+  if (!metadata) { response.status(404).json({ error: 'Source not found.' }); return; }
+  response.json(metadata);
+});
+app.post('/api/projects/:projectId/sources/:sourceId/metadata', asyncRoute(async (request, response) => {
+  const body = request.body as {
+    actor?: string; meetingSubject?: string; eventDate?: string; eventTime?: string | null; timezone?: string | null;
+    primaryWorkPackage?: string; additionalWorkPackages?: string[]; participants?: string[]; recordingGapNotes?: string | null; reason?: string | null;
+  };
+  const metadata = confirmSourceMetadata(db(), String(request.params.projectId), String(request.params.sourceId), {
+    actor: String(body.actor ?? 'current-user'),
+    meetingSubject: String(body.meetingSubject ?? ''),
+    eventDate: String(body.eventDate ?? ''),
+    eventTime: body.eventTime ?? null,
+    timezone: body.timezone ?? null,
+    primaryWorkPackage: String(body.primaryWorkPackage ?? ''),
+    additionalWorkPackages: body.additionalWorkPackages,
+    participants: body.participants,
+    recordingGapNotes: body.recordingGapNotes ?? null,
+    reason: body.reason ?? null,
+  });
+  // Confirming metadata is what unblocks extraction — this is the one
+  // explicit action that turns "awaiting meeting details" into "processing".
+  // No provider call happens inside `confirmSourceMetadata` itself; this is a
+  // separate, visible step, exactly like every other schedule call.
+  if (metadata.confirmed) scheduleSourceExtraction(metadata.sourceId);
+  response.json(metadata);
 }));
 app.post('/api/projects/:projectId/changesets/:changesetId/acknowledge', asyncRoute(async (request, response) => {
   response.json(acknowledgeChangeset(db(), String(request.params.changesetId), String((request.body as { actor?: string }).actor ?? 'current-user')));
