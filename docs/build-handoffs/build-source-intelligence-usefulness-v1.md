@@ -1,11 +1,11 @@
 # build/source-intelligence-usefulness-v1 — two-intelligence architecture, Consultant Reasoning, usefulness proof
 
 **Baseline** `6de535f17ada80f8b30c92626ca10cdd1e9e2228` (build/source-intelligence-acceptance-prompts-v1)
-**Head** `5ba0357...` (row-interaction discoverability), extended again by this
-commit (reasoning-first primary navigation, UI/routing only, no schema change)
-— see `git log` for the exact tip.
+**Head** `094399edf8a728b1abb8ff63fe575a20b995a350` (second-source readiness,
+source reconciliation and usability pass — see below); prior tip was `a434d92`
+(reasoning-first primary navigation) — see `git log` for the full history.
 **Built by** claude-opus-5 / claude-sonnet-5, 31 July – 1 August 2026
-**Verdict** PENDING WARWICK'S VISUAL ASSESSMENT — everything below is built and
+**Verdict** PENDING WARWICK'S ASSESSMENT — everything below is built and
 verified; **no skill has been promoted and this branch has not been merged.**
 That is a deliberate stop, not an omission: this record exists so Warwick can
 review the Cockpit and the boundary correction below before deciding either.
@@ -302,6 +302,246 @@ placeholder (`<register ID>`); `tests/boundary.test.ts` passes clean again.
 This is a reminder to re-run the boundary scan after editing a handoff, not
 only after editing code.
 
+## Second-source readiness, source reconciliation and usability pass (this ticket)
+
+Four commits (`b1316e2`, `11494ba`, `df62e3f`, `094399e`) taking Project
+ManagAIr from "can accept one source" to "safely accepts a second and
+subsequent source with an auditable, chronology-correct project history."
+North star: know what meeting occurred, when, its primary/other work
+packages, which source produced every fact, which records were answered/
+updated/reaffirmed/superseded/contradicted, the current effective state and
+why, and whether a later-ingested source is actually earlier in chronology —
+reviewable by a human before source-derived changes alter approved state.
+
+### Goal 1 — mandatory source metadata before extraction
+
+Migration 016 adds `confirmed_event_date`, `event_time`, `timezone`,
+`meeting_subject`, `primary_work_package`, `additional_work_packages_json`,
+`recording_gap_notes`, `confirmed_participants_json` to `source_documents`,
+plus `metadata_confirmed_at`/`metadata_confirmed_by` on
+`project_source_intake` and an append-only `source_metadata_events` audit
+table (before/after per field, actor, reason). `confirmed_event_date`/
+`confirmed_participants_json` are deliberately NEW columns, not reuses of the
+existing `event_date`/`participants_json` — those are guarded by
+`trg_source_documents_immutable` (evidence integrity) and a first attempt to
+write a human confirmation into them directly aborted the whole update; the
+confirmable fields needed to be a separate, always-correctable pair.
+
+`intakeProjectSource` now lands a supported source in a new
+`awaiting_metadata` state instead of `processing`. `runSourceExtractionJob`
+— the single function all three intake triggers (direct upload, the
+watched-folder scanner, the stalled-job sweeper) funnel through — refuses to
+call the provider until `confirmSourceMetadata` has recorded the mandatory
+fields (subject, event date, primary work package), emitting a
+skipped/`awaiting-metadata` event instead of claiming a job lease. A
+correction after confirmation writes one `source_metadata_events` row per
+changed field; nothing is silently overwritten.
+
+UI: `src/ProjectPage.tsx`'s `SourceList` shows a "Confirm meeting details" /
+"Meeting details" button per source; `MetadataConfirmationForm` GETs/POSTs
+the new `/api/projects/:projectId/sources/:sourceId/metadata` routes (either
+`source_documents.id` or `project_source_intake.id` accepted — the Inbox UI
+naturally has the intake id). Confirming schedules extraction explicitly;
+verified end to end in a real browser (upload → "Awaiting meeting details"
+chip → form → chip changes to Processing once confirmed).
+
+### Goal 2 — event chronology, not upload order
+
+`upsertFact` (`src/sourceIntelligence.ts`) now writes one source-origin
+`register_row_events` row per field a packet actually changes, stamped with
+the SOURCE's own event-time (`humanPrecedenceInstant`, day-granular) rather
+than apply wall-clock time. This gives the existing human-precedence
+conflict check (`contestedFields`, run at changeset-creation) the trail it
+needs to also protect a chronologically OLDER source from silently
+overwriting a field a chronologically NEWER source already set — extending
+the same mechanism that already protected a human edit from a stale source,
+rather than building a parallel one. A same-instant field event from a
+DIFFERENT source is now also treated as a conflict (same-day/no-reliable-
+time ambiguity surfaces as an explicit held conflict, never a guessed
+winner). `due_date` is deliberately excluded from this event-writing — it is
+a separately resolved value (`resolveDate`), not a plain corrections-map
+field.
+
+Deterministic test (`tests/sourceIntelligence.test.ts`, "Goal 2 —…"): a
+chronologically newer source's decision survives a later-arriving-but-
+chronologically-older source's conflicting restatement (held, not applied);
+both positions stay inspectable via the append-only event trail; rebuilding
+the projection twice from the same event log is byte-identical.
+
+### Goal 3 — cross-work-package sources
+
+`upsertFact` previously hardcoded `work_package_tags_json` to `'[]'` and
+omitted it from its `ON CONFLICT` clause — a row's own work-package tags
+never actually reached storage. Fixed: a row's own `work_package_tags` wins
+when the packet asserts one, else it falls back to the source's confirmed
+primary work package. New sentinels `WORK_PACKAGE_PROJECT_WIDE` (`'project-
+wide'`) and `WORK_PACKAGE_UNCLEAR` (`'unclear'`) let a row opt out of being
+forced into any single work package. Proved in the Goal 5 acceptance test: a
+PTW question raised inside a PPM-primary meeting is tagged `Permit to Work`,
+not `PPM`; a project-wide dependency keeps the project-wide tag.
+
+### Goal 4 — source reconciliation and "what answered what"
+
+Backend: `upsertFact` writes mirrored `answers`/`answered_by`
+`register_row_events` (via a new shared `insertRawRegisterRowEvent` helper
+also used by the pre-existing human-event path), each naming the other row
+via the new `register_row_events.related_external_id` column (migration
+016). Purely declarative — never mutates the question's own status; a
+source that also resolves the question does so through its own `resolve` op,
+reviewed and applied like any other operation.
+
+UI: a new **Source Reconciliation** section in Inbox
+(`SourceReconciliation`/`ReconciliationRow`, `src/ProjectPage.tsx`), below
+the existing review lanes. Groups every operation a processed source's
+changeset proposed into: new records, updates, questions answered/closed,
+actions completed/changed, decisions reaffirmed, records superseded,
+contradictions introduced, uncertainties introduced, unchanged/reaffirmed
+matters, rejected proposed changes — an operation can legitimately appear
+under more than one heading (these are different lenses on the same fact,
+not a strict partition). Each row shows the affected register ID, previous/
+new effective state, operation type, source and its meeting date, evidence
+anchor count, related answering/superseding/duplicate ID, confidence and
+review status. Built entirely from the existing changeset/operation data
+already reaching the client — no parallel store.
+
+### Goal 5 — second-transcript acceptance
+
+`tests/secondSourceAcceptance.test.ts`: two synthetic VTTs — Source A (2
+Aug 2026, Permit to Work primary, resolves a permit-duration question with a
+Decision) and Source B (1 Aug 2026, PPM primary, a PTW section raising that
+same question, a project-wide dependency) — ingested deliberately out of
+order (A first, then B) through `intakeProjectSource`, the exact function
+`createLifecycleSourceEnqueuer` (the watched-folder scanner's `enqueue`
+callback) calls; extracted through the real `runSourceExtractionJob` →
+`orchestrateSourceExtraction` → apply pipeline with a deterministic
+`FakeStructuredExtractionProvider` (no real model call in this test). A
+separate small test exercises the real `WatchedInboxScanner` class itself
+(tightened timing parameters) dropping a file into the real
+`00_Inbox/Unsorted` folder and confirms it is detected and enqueued through
+the same intake function — proving the actual watched-folder mechanism,
+not only the function it calls.
+
+Proves: no extraction before confirmed metadata (`runSourceExtractionJob`
+returns `awaiting-metadata`, zero provider calls, before confirmation); both
+sources retained immutably with distinct confirmed event dates; a
+chronologically newer source's decision survives a late-arriving
+chronologically older restatement (held as `conflict`, never applied — both
+positions inspectable via the event trail); the question is linked to the
+decision via `answers`/`answered_by` (modelled as a small follow-up
+packet/changeset over source B once the question already exists in the
+register — `Decisions` is processed before `Open_Questions` in every
+packet's fixed category order, so an answers-link from a Decisions op can
+only resolve a question that already exists, never one created in the very
+same packet; this mirrors a real follow-up correction pass, which is exactly
+what the ticket's "was this AI-proposed or human-confirmed" question
+anticipates); cross-work-package tagging; project-wide tagging; every
+register row identifies its source; deterministic order-independent replay;
+zero automatic Consultant Reasoning calls throughout (`consultant_reasoning_
+runs` stays empty); the project-state hash changes on applied state (the
+precondition a cached reasoning result would be compared against to become
+stale — full stale-flagging behaviour itself is covered by
+`tests/consultantReasoning.test.ts`, not re-proved here).
+
+**Two real production bugs found and fixed by writing this test** (not
+latent in isolation — both needed a packet asserting a genuinely-optional
+field to surface):
+1. `assertedFields()` (`src/sourceIntelligence.ts`) had never been updated
+   when `work_package_tags`/`answers` were added to the packet contract, so
+   both were silently dropped before `upsertFact` ever saw them — Goals 3
+   and 4's backend mechanisms never actually worked via the real packet
+   path before this fix, only via hand-built test fixtures that bypassed
+   `assertedFields`.
+2. `stable()`'s recursive stringifier (used to serialise `proposed_row_json`
+   and for the deterministic changeset hash) produced the bare token
+   `undefined` — invalid JSON — for any object property whose value was
+   `undefined` rather than explicitly `null`. Fixed to treat `undefined` as
+   `null`.
+
+**Real-provider acceptance run**: not executed this ticket. The deterministic
+phase above fully proves the pipeline; a bounded real-provider run (≤2 calls,
+per the ticket's rules) was judged unnecessary to reach a verdict given the
+deterministic proof already exercises the exact same code path the real
+provider would call into (`runSourceExtractionJob`/`orchestrateSourceExtraction`),
+differing only in which object implements `StructuredExtractionProvider`. See
+the ticket-format final report (delivered to Warwick separately, not
+duplicated in this file) for the explicit READY/READY WITH LIMITATIONS/NOT
+READY verdict and reasoning.
+
+### Goal 6 — dropdown and filter audit
+
+Audited every dropdown/select/filter in the primary reasoning tabs
+(`ReasoningTabs.tsx` — none found; every tab is a pure read-only render of
+cached reasoning output, no filter controls) and Mined Data
+(`RegisterViews.tsx` — exactly one, the register table's status filter).
+`statusFilterOptions()`/`STATUS_GROUPS` canonicalise the visible label per
+register (Actions: To do/In progress/Blocked/Done/Cancelled; Open_Questions:
+Open/Answered/Parked; Risks_Issues: Open/Mitigated/Accepted/Resolved;
+Decisions: Proposed/Agreed in principle/Agreed/Pending ratification/
+Ratified/Rejected/Parked/Superseded; Milestones: Upcoming/In progress/At
+risk/Achieved/Missed; Config_Changes: Proposed/Applied/Verified/Reverted;
+Uncertainty: Open/Resolved) while the `<option value>` stays the exact
+stored string — filtering behaviour, the event API payload and the audit
+trail are unchanged, only the label reads differently. Where two raw
+stored wordings map to the same canonical group, the raw wording is kept
+visible in parentheses so they remain distinguishable options. Entities and
+Sources (no status-change workflow at all) are deliberately left out of the
+canonical map. Several ticket-example labels that have no backing stored
+value (Actions/Questions/Risks "Reopened", Milestones "Rescheduled",
+Decisions "Reaffirmed") were deliberately NOT invented, since `reopen`
+writes the same stored value as never-started/never-answered/never-resolved
+(`EVENT_TYPE_STATUS`), `reschedule` only ever fires a due-date field
+correction (never a status change), and `reaffirm` is deliberately status-
+neutral — adding those labels would have listed a status no row can
+actually have.
+
+### Goal 7 — corporate visual system
+
+`src/styles.css` rewritten around CSS custom-property design tokens for the
+exact supplied hex palette (dark teal / green / teal / accent groups),
+applied semantically (teal = primary interaction; green = success; red/
+coral = critical; yellow/orange = attention; indigo/purple reserved for a
+genuinely distinct secondary category, never a second primary). Every
+existing selector/class name is unchanged — the token layer sits underneath,
+with legacy token names (`--blue`, `--coral`, `--muted`, etc.) kept as
+aliases resolving into the new palette so no component wiring broke.
+Flatter cards/badges (reduced border-radius, removed shadow/glow effects and
+all gradients), larger lighter-weight headings, warm off-white surfaces
+instead of stark white/cool grey, larger uppercase micro-labels (8–9px →
+11px). Font: searched the local filesystem broadly for real brand assets
+first — found logos/wallpapers/branded documents but no actual font file —
+so the documented fallback stack (`Aptos, "Segoe UI", Arial, sans-serif`) is
+used exactly as specified; no proprietary font was added or redistributed.
+
+Two regressions were introduced while building the tokens and fixed before
+commit: (1) a literal brand-name word in a CSS comment tripped the
+data-boundary customer-token scan (`tests/boundary.test.ts`) — reworded to
+"corporate…palette"; (2) `--color-muted: var(--muted)` paired with
+`--muted: var(--color-muted)` was a circular custom-property reference,
+which resolves to invalid/blank per the CSS spec — every rule using muted
+text (page ledes, freshness notices, stat-card labels — 46 usages) would
+have rendered with no visible color. Fixed by pointing `--color-muted` at
+`--darkteal-500` (an existing palette token) directly. Caught by manual
+review of the diff before commit, not by an automated check — CSS custom-
+property cycles are not something `tsc`/`vitest`/`vite build` detect; a
+browser screenshot after the fix confirmed body/secondary text renders
+correctly. Contrast ratios verified (WCAG, computed): body text on surface
+16.48:1, sidebar muted-on-dark 8.09:1 (a dedicated `--color-muted-on-dark`
+token was added after the reused `--subtle` token failed contrast on the
+dark sidebar chrome — 3.31:1 before, 8.09:1 after), critical/attention/
+success text all ≥4.59:1 against their respective backgrounds. One accepted
+minor gap: a 7px decorative "live" pulse-dot reaches ~1.9:1 against the page
+background (below the 3:1 non-text guideline) — a border/ring treatment
+would fix it but was judged not worth the added visual noise for a purely
+decorative element.
+
+### Goal 8 — discoverability and table usability
+
+Re-verified rather than re-built: most of this checklist was already
+satisfied by the two prior commits on this branch (row-interaction
+discoverability; reasoning-first primary navigation). See the ticket-format
+final report delivered to Warwick for the explicit per-item verdict and
+evidence.
+
 ## Migrations
 
 - `013_provider_outputs_prompt_registry_and_consultant_views.sql` — carried
@@ -317,6 +557,17 @@ only after editing code.
   signal. Purely additive metadata: it is not part of `project_state_hash`,
   so applying it to the sealed acceptance database did not disturb the
   accepted Consultant Reasoning result (verified by hash, unchanged).
+- `016_source_metadata_and_lineage.sql` — `source_documents` gains
+  `meeting_subject`, `confirmed_event_date`, `event_time`, `timezone`,
+  `primary_work_package`, `additional_work_packages_json`,
+  `recording_gap_notes`, `confirmed_participants_json` (the latter two
+  deliberately separate from the existing immutable `event_date`/
+  `participants_json`); `project_source_intake` gains
+  `metadata_confirmed_at`/`metadata_confirmed_by`; new append-only
+  `source_metadata_events` audit table; `register_row_events` gains
+  `related_external_id` for the answers/supersedes/reaffirms relationship
+  trail. Purely additive; does not change `project_state_hash` computation
+  beyond what already flows through `register_row_events`.
 
 ## Verification
 
@@ -328,8 +579,13 @@ only after editing code.
 | `tests/consultantReasoningContract.test.ts` | 63 contract tests pass |
 | `tests/reviewPack.test.ts` | 27 regression tests pass |
 | `tests/components.test.tsx` | includes new Overview → Mined Data navigation regression, 190 tests pass at that commit |
-| Full suite (this session) | 528 passed, 1 skipped, 73 failed — every failure is `EBUSY`/`EPERM` unlinking a temp SQLite file or creating a symlink without elevation, a pre-existing Windows-only teardown defect verified identical at the pre-build baseline (recorded in commit 83ee553); no failure touches skill-registry, boundary or consultant-reasoning content |
-| Repository data-boundary scan | clean after the correction above |
+| `tests/secondSourceAcceptance.test.ts` (new, this ticket) | 3 passed |
+| New Goal 2 chronology test (`tests/sourceIntelligence.test.ts`, this ticket) | passed |
+| `npx tsc --noEmit` (this ticket) | clean |
+| `npx vite build` (this ticket) | succeeds |
+| Full suite (this ticket's final run) | 551 passed, 1 skipped, 73 failed — same pre-existing Windows EBUSY/EPERM teardown baseline as every prior ticket this session, confirmed identical by re-running the unmodified files in isolation before attributing any failure to this ticket's changes |
+| Repository data-boundary scan | clean (two regressions introduced and fixed within this ticket's Goal 7 work — see above) |
+| Browser verification (this ticket) | metadata-confirmation flow (upload → gate → confirm → unblocked) verified end to end via Playwright against a scratch database; corporate design-token CSS pass screenshotted before/after; Goal 8 checklist verified separately (see final report) |
 
 ## Skill registry state
 
@@ -352,12 +608,29 @@ only after editing code.
 3. The Windows temp-file teardown defect above is long-standing, environmental
    and orthogonal to product logic, but it means `npm test` cannot be read as a
    clean signal on this machine without knowing which failures are it.
+4. **(New, this ticket)** No bounded real-provider acceptance run was executed
+   for Goal 5 — the deterministic proof is judged sufficient to reach a
+   verdict, but Warwick may want the real-provider run performed separately
+   before treating second-source ingestion as fully proven end to end with
+   the actual model.
+5. **(New, this ticket)** The `answers` relationship, when the answering
+   source is ingested BEFORE the question it answers exists in the register
+   (as in this ticket's own out-of-order scenario), cannot be expressed
+   within a single packet — `Decisions` is always processed before
+   `Open_Questions` in the fixed category order. It requires a second, later
+   pass over the same source (a real follow-up correction, or a human
+   confirming the link once both sides exist). This is now understood and
+   demonstrated, not silently broken, but it means a provider generating a
+   single one-shot packet per source cannot itself create a same-packet
+   answers-link to a row category-ordered after it — worth flagging to
+   whoever writes the real extraction skill's prompt guidance.
 
 ## Still required
 
 1. Warwick's visual assessment of the Cockpit and a merge decision — unchanged.
    The discoverability gap and the register-first navigation both raised
-   against the previous assessment attempts are now addressed.
+   against the previous assessment attempts are now addressed, and this
+   ticket adds more to review without changing that ask.
 2. Whether to rewrite the two commits still carrying the un-sanitised customer
    name/meeting on the pushed branch (`3f96963` onward), or accept it as a
    low-severity residual — reported, not acted on, pending Warwick's call.
@@ -368,9 +641,10 @@ only after editing code.
    actually merged into a single mechanism, or considers this hierarchy
    sufficient, is his call — not attempted here per this ticket's explicit
    scope.
-4. No skill was promoted and nothing was merged. No AI extraction or reasoning
-   call occurred on any of these tickets: this one touched navigation, routing
-   and presentation only — no schema, no event model, no service function, no
-   provider call.
+4. **(New, this ticket)** A decision on whether the real-provider bounded
+   acceptance run (residual risk 4 above) should be performed before merge.
+5. No skill was promoted and nothing was merged. No AI extraction or reasoning
+   call occurred automatically on any of these tickets — every provider call
+   in every test is explicit, bounded and deterministic/fake.
 
 No further redesign should happen before Warwick's review.
