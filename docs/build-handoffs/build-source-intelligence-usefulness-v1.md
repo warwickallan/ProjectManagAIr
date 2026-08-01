@@ -1,8 +1,9 @@
 # build/source-intelligence-usefulness-v1 — two-intelligence architecture, Consultant Reasoning, usefulness proof
 
 **Baseline** `6de535f17ada80f8b30c92626ca10cdd1e9e2228` (build/source-intelligence-acceptance-prompts-v1)
-**Head** `92d12c6...` (human project events, migration 015), extended again by this
-commit (row-interaction discoverability, UI-only) — see `git log` for the exact tip.
+**Head** `5ba0357...` (row-interaction discoverability), extended again by this
+commit (reasoning-first primary navigation, UI/routing only, no schema change)
+— see `git log` for the exact tip.
 **Built by** claude-opus-5 / claude-sonnet-5, 31 July – 1 August 2026
 **Verdict** PENDING WARWICK'S VISUAL ASSESSMENT — everything below is built and
 verified; **no skill has been promoted and this branch has not been merged.**
@@ -169,7 +170,7 @@ previous commit changed; this is presentation only.
   actual button (bordered, tinted, `.row-update-button`), not a bare icon.
   Its `onClick` calls `event.stopPropagation()` before opening the drawer, so
   clicking it cannot also fire the row's own click handler a second time.
-  Its accessible label names the row: `Update NPL-A-001: <title>`. Being a
+  Its accessible label names the row: `Update <register ID>: <title>`. Being a
   real `<button>`, it is focusable and activates on Enter/Space with no extra
   code.
 - **Static hint** above every register table: "Select a row or choose Update
@@ -188,6 +189,118 @@ previous commit changed; this is presentation only.
   focus + Enter on the Update button opens the correct row's drawer; opening
   a drawer writes no event. Narrow-width (390px) behaviour is unchanged from
   before — the table already scrolled horizontally, and still does.
+
+## Reasoning-first primary navigation (this commit)
+
+The dashboard read as a database administration interface: nine raw register
+categories sat as equally-weighted primary tabs, Mined Data duplicated the
+same content, and three overlapping briefing mechanisms coexisted. This
+commit reorganises the primary navigation around what Warwick needs to
+understand and do — no schema change, no event-model change, no provider
+call, nothing merged or promoted.
+
+**Old primary tab bar**: Overview, Inbox, Mined Data, Actions, Risks & Issues,
+Decisions, Config Changes, Open Questions, Milestones, Entities, Sources,
+Uncertainty, Activity / Verification.
+
+**New primary tab bar**: Overview, Meeting Brief, My Actions, Customer
+Dependencies, Decisions Needed, Risks & Blockers, Questions, Recent Changes,
+Mined Data, Inbox, Activity & Verification. The nine raw registers are no
+longer independent primary tabs — verified directly in the browser (`tests/components.test.tsx`
+now asserts no nav link named "Actions", "Risks & Issues", etc. exists). They
+live inside Mined Data's existing sub-navigation, unchanged: search, filters,
+sorting, the persistent Update button, the row drawer, notes, status/owner/
+due-date changes, History with origin badges, source anchors and extraction
+provenance are all untouched.
+
+**How the new tabs are populated.** Every one of Overview, Meeting Brief, My
+Actions, Customer Dependencies, Decisions Needed, Risks & Blockers, Questions
+and Recent Changes reads the SAME accepted, cached Consultant Reasoning
+result the old single-page panel did (`useReasoningView`, extracted from
+`ConsultantReasoningPanel.tsx` into a shared hook) — no new provider call, no
+new caching mechanism. Each tab renders one slice of that result in full
+(`src/ReasoningTabs.tsx`):
+
+- **Overview** — executive summary, top 5 of the meeting order, a prominent
+  Refresh control, and links to Meeting Brief and Mined Data. Not the whole
+  report any more.
+- **Meeting Brief** — the accepted top-ten meeting order, in full.
+- **My Actions** — the `needs-consultant` mode's own result, its
+  `consultant_next_actions` grouped by `owner_class` (consultant-owned,
+  shared, an explicit "ownership decision needed" group for `unowned`, and
+  customer-owned-but-tracked), plus that mode's own suggested order.
+- **Customer Dependencies / Decisions Needed / Risks & Blockers / Questions**
+  — one section each (`customer_dependencies`, `decisions_required`,
+  `risks_and_blockers`, `unanswered_questions`), matters written in full.
+  Questions already reconciled as answered/superseded/contradictory are
+  already excluded by the skill's own doctrine (unchanged) and explained via
+  each matter's state label, never silently dropped.
+- **Recent Changes** — the reasoning's own `recent_changes` and
+  `contradictions_and_state_conflicts` sections.
+
+Because each section is now its own destination rather than one part of a
+long scroll, there is no "claim once, cross-reference elsewhere" logic on
+these tabs — unlike the old single page, a matter appearing in two sections
+is written out in full on both, since a consultant who opens Decisions Needed
+directly wants the full record, not a pointer to a different tab.
+
+**The three overlapping briefing mechanisms — resolved, not deleted.**
+Consultant Reasoning is now unambiguously primary: it is what every new tab
+reads. `AdaptiveOverview` (the deterministic changes/meeting/needs-warwick
+lenses) still renders on Overview below the reasoning card — not removed, not
+touched. `ConsultantViewPanel` and the legacy `ConsultantBriefPanel` are still
+present but now inside a collapsed `<details>` labelled "Zero-call
+deterministic fallback", collapsed by default so they never visually compete
+with the reasoning card above them. The original all-sections,
+all-four-modes `ConsultantReasoningPanel` component is **not deleted** — it
+is unreachable from the primary journey but still renders, moved to
+Settings → More → **"Full Reasoning Report"**, which is also the only place
+the `status` and `handover` modes (which have no dedicated primary tab) are
+still reachable.
+
+**Citation and legacy-URL routing.** `registerRowRoute` (RegisterViews.tsx)
+now builds `#/projects/:id/mined-data?register=<name>&record=<id>` instead of
+a removed per-register tab URL — every Consultant Reasoning citation,
+relationship link and old bookmark to `#/projects/:id/actions` (etc.)
+resolves to the correct Mined Data register with the row focused.
+`LegacyRegisterRedirect` (ProjectPage.tsx) performs the translation for old
+tab URLs via one `window.location.hash` rewrite; the old per-register `TabId`
+values stay valid route targets for exactly this purpose, they are just no
+longer in the `primaryTabs` array so they no longer render as nav links.
+
+**Dead code removed, not hidden.** `RegisterBackedTab` and `MilestonesTab`
+(ProjectPage.tsx) became unreachable the moment the per-register redirect
+took over their branch — every register they rendered is now shown, more
+completely (with Update and History), by Mined Data's existing `RegisterTable`.
+Removed rather than left as dead code; nothing they showed is lost.
+
+**Placeholder tabs.** Data & Configuration, Meetings & Comms, UAT & Training
+and Handover were already in the secondary `More` menu, not the primary tab
+bar — no change was needed for these to satisfy "no empty tabs in the primary
+journey."
+
+**Verified in the browser**, read-only, against the original acceptance
+database (zero POST requests throughout): the new primary tab order renders
+exactly as specified; Overview, Meeting Brief and My Actions render their
+expected content from the real accepted `meeting`/`needs-consultant` results;
+Mined Data still exposes all nine registers with working search/filter/sort
+and the Update surface; a citation-shaped URL
+(`mined-data?register=Decisions&record=<row id>`) opens the correct row with
+its Update controls; a legacy per-register URL
+(`#/projects/<id>/actions?record=<row id>`) redirects to the equivalent
+`mined-data?register=Actions&record=<row id>` state; narrow-width
+(390px) renders usably. `tests/components.test.tsx` updated to match (11
+tests, including two new ones for the removed nav links and the legacy
+redirect); full suite otherwise unchanged from the established baseline (547
+passed, 1 skipped, 73 pre-existing Windows EBUSY/EPERM failures, same set of
+files as every prior session).
+
+Also fixed in passing: the previous commit's handoff text used a real
+register ID as a formatting example, which the boundary scan correctly
+flagged as a customer-token leak once re-run. Replaced with a
+placeholder (`<register ID>`); `tests/boundary.test.ts` passes clean again.
+This is a reminder to re-run the boundary scan after editing a handoff, not
+only after editing code.
 
 ## Migrations
 
@@ -243,18 +356,21 @@ previous commit changed; this is presentation only.
 ## Still required
 
 1. Warwick's visual assessment of the Cockpit and a merge decision — unchanged.
-   The discoverability gap that blocked the previous assessment attempt is
-   now addressed; nothing else about this ask is outstanding.
+   The discoverability gap and the register-first navigation both raised
+   against the previous assessment attempts are now addressed.
 2. Whether to rewrite the two commits still carrying the un-sanitised customer
    name/meeting on the pushed branch (`3f96963` onward), or accept it as a
    low-severity residual — reported, not acted on, pending Warwick's call.
-3. Whether the 9 standalone per-register tabs should be demoted/removed now
-   that Mined Data exists, and whether the three overlapping "meeting/needs-
-   warwick" mechanisms (Consultant Reasoning's own modes, `AdaptiveOverview`,
-   `consultantViews.ts`) should be reconciled — both explicitly out of scope
-   for every ticket so far.
+3. The three overlapping briefing mechanisms are now hierarchically resolved
+   (Consultant Reasoning primary; `AdaptiveOverview` and the deterministic
+   panel demoted and labelled; the full multi-mode report moved to
+   Settings → More) rather than merged into one. Whether Warwick wants them
+   actually merged into a single mechanism, or considers this hierarchy
+   sufficient, is his call — not attempted here per this ticket's explicit
+   scope.
 4. No skill was promoted and nothing was merged. No AI extraction or reasoning
-   call occurred on any of these tickets: this one touched only React
-   markup/CSS, no route, no schema, no service function.
+   call occurred on any of these tickets: this one touched navigation, routing
+   and presentation only — no schema, no event model, no service function, no
+   provider call.
 
 No further redesign should happen before Warwick's review.

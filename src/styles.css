@@ -600,10 +600,18 @@ select.input { appearance: auto; }
 .reasoning-provenance { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); }
 .reasoning-provenance h4 { margin: 0 0 8px; color: #24345b; font-size: 10px; }
 .reasoning-provenance .button { margin-top: 10px; }
+.reasoning-provenance.compact > summary { cursor: pointer; color: var(--subtle); font-size: 9px; font-weight: 700; }
+.reasoning-provenance.compact .inline-details { margin-top: 10px; }
 
 .fallback-surface { padding: 14px; border: 1px dashed var(--line); border-radius: 12px; background: rgba(255,255,255,.5); }
-.fallback-heading { margin: 0; color: var(--subtle); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+.fallback-heading { margin: 0; color: var(--subtle); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; cursor: pointer; }
 .fallback-note { margin: 6px 0 12px; color: var(--muted); font-size: 10px; line-height: 1.6; }
+
+/* Reasoning tabs (build/source-intelligence-usefulness-v1, IA reorganisation) */
+.reasoning-banner.prominent { padding: 16px; font-size: 105%; }
+.reasoning-refresh-prominent .button { padding: 12px 20px; font-size: 12px; }
+.matter-order.compact { gap: 6px; }
+.matter-order.compact .matter-reference { padding: 6px 8px; }
 
 /* ------------------------------------------------------------------ *
  * Mined Data — granular approved register rows, for audit not briefing.

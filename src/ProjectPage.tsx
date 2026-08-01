@@ -1,8 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useApi, type ProjectResponse } from './api';
 import { AIChatPanel } from './AIChatPanel';
 import { ConsultantViewPanel } from './ConsultantViewPanel';
 import { ConsultantReasoningPanel } from './ConsultantReasoningPanel';
+import {
+  CustomerDependenciesTab, DecisionsNeededTab, MeetingBriefTab, MyActionsTab, OverviewReasoningCard, QuestionsTab, RecentChangesTab, RisksBlockersTab,
+} from './ReasoningTabs';
 import { DetailFieldList, RegisterTable, Stacked, registerForTab, registerRowRoute, type RegisterRow } from './RegisterViews';
 import { ActivityList, AttentionList, EmptyState, ErrorState, FreshnessNotice, LoadingState, PageIntro, ProgressBar, Section, SourceProcessingAlerts, SourceProcessingNotice, StatusChip, formatDate, formatDateTime, humanize, postJson, sourceProcessingView } from './components';
 
@@ -68,12 +71,39 @@ type IntelligenceResponse = ProjectResponse & {
   sourceIntelligence?: SourceIntelligence;
   consultantBrief?: ConsultantBrief;
 };
-type TabId = 'overview' | 'inbox' | 'mined-data' | 'actions' | 'risks' | 'decisions' | 'config-changes' | 'open-questions' | 'milestones' | 'entities' | 'sources' | 'uncertainty' | 'activity' | 'register-comparison' | 'work-packages' | 'data-config' | 'meetings-comms' | 'deliverables' | 'uat-training' | 'handover';
+type TabId =
+  | 'overview' | 'meeting-brief' | 'my-actions' | 'customer-dependencies' | 'decisions-needed' | 'risks-blockers' | 'questions' | 'recent-changes'
+  | 'mined-data' | 'inbox' | 'activity'
+  | 'register-comparison' | 'work-packages' | 'deliverables' | 'reasoning-report' | 'data-config' | 'meetings-comms' | 'uat-training' | 'handover'
+  // Retired as primary tabs; kept as valid route targets so an existing link or
+  // bookmark redirects into the equivalent Mined Data state instead of landing
+  // nowhere (see `LegacyRegisterRedirect` and `normalizeTab` below).
+  | 'actions' | 'risks' | 'decisions' | 'config-changes' | 'open-questions' | 'milestones' | 'entities' | 'sources' | 'uncertainty';
 
+/**
+ * Primary navigation, reasoning-first: what Warwick needs to understand and do,
+ * not the nine raw registers. Mined Data is the one place those registers live
+ * as a primary tab now — see `registerForTab` in RegisterViews.tsx for its
+ * internal sub-navigation.
+ */
 const primaryTabs: Array<[TabId, string]> = [
-  ['overview', 'Overview'], ['inbox', 'Inbox'], ['mined-data', 'Mined Data'], ['actions', 'Actions'], ['risks', 'Risks & Issues'], ['decisions', 'Decisions'], ['config-changes', 'Config Changes'], ['open-questions', 'Open Questions'], ['milestones', 'Milestones'], ['entities', 'Entities'], ['sources', 'Sources'], ['uncertainty', 'Uncertainty'], ['activity', 'Activity / Verification'],
+  ['overview', 'Overview'], ['meeting-brief', 'Meeting Brief'], ['my-actions', 'My Actions'], ['customer-dependencies', 'Customer Dependencies'],
+  ['decisions-needed', 'Decisions Needed'], ['risks-blockers', 'Risks & Blockers'], ['questions', 'Questions'], ['recent-changes', 'Recent Changes'],
+  ['mined-data', 'Mined Data'], ['inbox', 'Inbox'], ['activity', 'Activity & Verification'],
 ];
-const moreTabs: Array<[TabId, string]> = [['register-comparison', 'Register Comparison'], ['work-packages', 'Work Packages'], ['data-config', 'Data & Configuration'], ['meetings-comms', 'Meetings & Comms'], ['deliverables', 'Deliverables'], ['uat-training', 'UAT & Training'], ['handover', 'Handover']];
+/**
+ * `reasoning-report` is the pre-existing all-sections, all-modes
+ * `ConsultantReasoningPanel` — not deleted, just no longer the primary
+ * journey. It stays reachable here for anyone who wants the single-page
+ * report (or the Status/Handover modes, which have no dedicated primary tab)
+ * without duplicating that rendering in eight places.
+ */
+const moreTabs: Array<[TabId, string]> = [
+  ['reasoning-report', 'Full Reasoning Report'], ['register-comparison', 'Register Comparison'], ['work-packages', 'Work Packages'],
+  ['deliverables', 'Deliverables'], ['data-config', 'Data & Configuration'], ['meetings-comms', 'Meetings & Comms'], ['uat-training', 'UAT & Training'], ['handover', 'Handover'],
+];
+/** Retired primary tab ids, still resolvable — see the `TabId` comment above. */
+const legacyRegisterTabIds: TabId[] = ['actions', 'risks', 'decisions', 'config-changes', 'open-questions', 'milestones', 'entities', 'sources', 'uncertainty'];
 
 /**
  * The nine approved registers, in the order the Mined Data workspace presents
@@ -114,23 +144,27 @@ export function ProjectPage({ projectId, tab }: { projectId: string; tab: string
   const sourceIntelligence = project.sourceIntelligence as SourceIntelligence | undefined;
   const consultantBrief = project.consultantBrief as ConsultantBrief | undefined;
   const activeTab = normalizeTab(tab);
-  const recordFocus = new URLSearchParams(window.location.hash.split('?')[1] ?? '').get('record');
+  const hashQuery = new URLSearchParams(window.location.hash.split('?')[1] ?? '');
+  const recordFocus = hashQuery.get('record');
+  const registerFocus = hashQuery.get('register');
   const onChanged = () => setReload((value) => value + 1);
   return (
     <div className="page-stack project-page">
       <a className="back-link" href="#/projects"><span aria-hidden="true">{'<-'}</span> Portfolio</a>
       <PageIntro eyebrow={`${project.code} . ${project.stage}`} title={project.name} description={project.summary} aside={<FreshnessNotice freshness={freshness} asOf={asOf} />} />
       <ProjectTabNav projectId={project.id} activeTab={activeTab} />
-      <ProjectTabContent project={project} activeTab={activeTab} attention={attention} attentionLabel={attentionLabel} userId={state.data.userConfig.userId} projectOverview={projectOverview} sourceIntelligence={sourceIntelligence} consultantBrief={consultantBrief} focusedRecordId={recordFocus} onChanged={onChanged} />
+      <ProjectTabContent project={project} activeTab={activeTab} attention={attention} attentionLabel={attentionLabel} userId={state.data.userConfig.userId} projectOverview={projectOverview} sourceIntelligence={sourceIntelligence} consultantBrief={consultantBrief} focusedRecordId={recordFocus} presetRegister={registerFocus} onChanged={onChanged} />
       <AIChatPanel contextOptions={[{ contextType: 'selected-project', contextId: project.id, label: project.name, preview: project.summary }, ...project.actions.map((item) => ({ contextType: 'project-record' as const, contextId: item.id, label: item.title, preview: item.summary })), ...project.risksIssues.map((item) => ({ contextType: 'project-record' as const, contextId: item.id, label: item.title, preview: item.summary })), ...project.decisions.map((item) => ({ contextType: 'project-record' as const, contextId: item.id, label: item.title, preview: item.summary }))]} />
     </div>
   );
 }
 
+const knownTabIds = new Set<TabId>([...primaryTabs.map(([id]) => id), ...moreTabs.map(([id]) => id), ...legacyRegisterTabIds]);
+
 function normalizeTab(tab: string | null): TabId {
   const aliases: Record<string, TabId> = { 'risk-issue': 'risks', change: 'config-changes', decision: 'decisions', 'open-question': 'open-questions', milestone: 'milestones', 'work-package': 'work-packages', deliverable: 'deliverables', 'ai-work': 'activity' };
   const value = tab ? aliases[tab] ?? tab : 'overview';
-  return [...primaryTabs, ...moreTabs].some(([id]) => id === value) ? value as TabId : 'overview';
+  return knownTabIds.has(value as TabId) ? value as TabId : 'overview';
 }
 
 function ProjectTabNav({ projectId, activeTab }: { projectId: string; activeTab: TabId }) {
@@ -142,18 +176,42 @@ function ProjectTabNav({ projectId, activeTab }: { projectId: string; activeTab:
   );
 }
 
-function ProjectTabContent({ project, activeTab, attention, attentionLabel, userId, projectOverview, sourceIntelligence, consultantBrief, focusedRecordId, onChanged }: { project: Project; activeTab: TabId; attention: ProjectResponse['attention']; attentionLabel: string; userId: string; projectOverview?: ProjectOverview; sourceIntelligence?: SourceIntelligence; consultantBrief?: ConsultantBrief; focusedRecordId: string | null; onChanged: () => void }) {
+function ProjectTabContent({ project, activeTab, attention, attentionLabel, userId, projectOverview, sourceIntelligence, consultantBrief, focusedRecordId, presetRegister, onChanged }: { project: Project; activeTab: TabId; attention: ProjectResponse['attention']; attentionLabel: string; userId: string; projectOverview?: ProjectOverview; sourceIntelligence?: SourceIntelligence; consultantBrief?: ConsultantBrief; focusedRecordId: string | null; presetRegister: string | null; onChanged: () => void }) {
   if (activeTab === 'overview') return <OverviewTab project={project} attention={attention} attentionLabel={attentionLabel} overview={projectOverview} brief={consultantBrief} onChanged={onChanged} />;
+  if (activeTab === 'meeting-brief') return <MeetingBriefTab projectId={project.id} />;
+  if (activeTab === 'my-actions') return <MyActionsTab projectId={project.id} />;
+  if (activeTab === 'customer-dependencies') return <CustomerDependenciesTab projectId={project.id} />;
+  if (activeTab === 'decisions-needed') return <DecisionsNeededTab projectId={project.id} />;
+  if (activeTab === 'risks-blockers') return <RisksBlockersTab projectId={project.id} />;
+  if (activeTab === 'questions') return <QuestionsTab projectId={project.id} />;
+  if (activeTab === 'recent-changes') return <RecentChangesTab projectId={project.id} />;
+  if (activeTab === 'reasoning-report') return <ConsultantReasoningPanel projectId={project.id} />;
   if (activeTab === 'inbox') return <ProjectInbox projectId={project.id} userId={userId} sources={project.inboxSources} proposals={project.proposedChanges} sourceIntelligence={sourceIntelligence} onChanged={onChanged} />;
   if (activeTab === 'activity') return <ActivityTab project={project} />;
   if (activeTab === 'register-comparison') return <RegisterComparison project={project} />;
   if (activeTab === 'work-packages') return <WorkPackagesTab project={project} />;
   if (activeTab === 'deliverables') return <DeliverablesTab project={project} attentionLabel={attentionLabel} userId={userId} />;
   if (['data-config', 'meetings-comms', 'uat-training', 'handover'].includes(activeTab)) return <PlaceholderSection id={activeTab} title={labelFor(activeTab)} />;
-  if (activeTab === 'mined-data') return <MinedDataTab project={project} focusedRecordId={focusedRecordId} userId={userId} onChanged={onChanged} />;
+  if (activeTab === 'mined-data') return <MinedDataTab project={project} focusedRecordId={focusedRecordId} presetRegister={presetRegister} userId={userId} onChanged={onChanged} />;
   const registerName = registerForTab[activeTab];
-  if (registerName) return <RegisterBackedTab project={project} tab={activeTab} registerName={registerName} attentionLabel={attentionLabel} userId={userId} focusedRecordId={focusedRecordId} onChanged={onChanged} />;
+  if (registerName) return <LegacyRegisterRedirect projectId={project.id} registerName={registerName} focusedRecordId={focusedRecordId} />;
   return <OverviewTab project={project} attention={attention} attentionLabel={attentionLabel} overview={projectOverview} brief={consultantBrief} onChanged={onChanged} />;
+}
+
+/**
+ * A bookmark or an old citation to a retired per-register primary tab
+ * (`#/projects/x/actions`, `#/projects/x/risks`, ...) translates into the
+ * equivalent Mined Data state — the same register, the same focused row —
+ * rather than landing on a tab that no longer exists in the nav.
+ */
+function LegacyRegisterRedirect({ projectId, registerName, focusedRecordId }: { projectId: string; registerName: string; focusedRecordId: string | null }) {
+  useEffect(() => {
+    const query = new URLSearchParams();
+    query.set('register', registerName);
+    if (focusedRecordId) query.set('record', focusedRecordId);
+    window.location.hash = `#/projects/${encodeURIComponent(projectId)}/mined-data?${query.toString()}`;
+  }, [projectId, registerName, focusedRecordId]);
+  return <LoadingState label={`Opening ${registerName} in Mined Data`} />;
 }
 
 function OverviewTab({ project, attention, attentionLabel, overview, brief, onChanged }: { project: Project; attention: ProjectResponse['attention']; attentionLabel: string; overview?: ProjectOverview; brief?: ConsultantBrief; onChanged: () => void }) {
@@ -168,19 +226,19 @@ function OverviewTab({ project, attention, attentionLabel, overview, brief, onCh
           <div><dt>Storage schema</dt><dd>{project.storageSchemaVersion}</dd></div>
         </dl>
       </section>
-      <ConsultantReasoningPanel projectId={project.id} />
+      <OverviewReasoningCard projectId={project.id} />
       {overview ? <AdaptiveOverview projectId={project.id} overview={overview} onChanged={onChanged} /> : null}
-      <div className="fallback-surface">
-        <h2 className="fallback-heading">Zero-call deterministic fallback</h2>
+      <details className="fallback-surface">
+        <summary className="fallback-heading">Zero-call deterministic fallback</summary>
         <p className="fallback-note">
-          Everything below is computed from the register by rule, with no model involved. It is kept as the fallback for when
-          consultant reasoning has not been generated, has gone stale, or failed its contract — it is no longer the primary briefing surface.
+          Everything below is computed from the register by rule, with no model involved. It is not a second briefing product —
+          it is the fallback for when consultant reasoning has not been generated, has gone stale, or failed its contract, and an
+          evidence/debugging tool otherwise. Collapsed by default so it never competes with the reasoning above.
         </p>
         <ConsultantViewPanel projectId={project.id} deterministicViews={(project.consultantViews ?? []) as never} />
         {brief ? <ConsultantBriefPanel brief={brief} /> : null}
-      </div>
+      </details>
       <Section id="attention" title={attentionLabel} kicker="Legacy operational attention" count={attention.length} className="attention-panel"><AttentionList items={attention} emptyLabel="This project has nothing assigned to your attention." /></Section>
-      <RegisterComparison project={project} compact />
     </div>
   );
 }
@@ -189,13 +247,17 @@ function OverviewTab({ project, attention, attentionLabel, overview, brief, onCh
  * Mined Data — every approved register row, in full, for inspection.
  *
  * This is deliberately not the briefing surface. It is the audit and
- * correction workspace: the granular project memory that consultant reasoning
- * reads from, exposed so a wrong row can be found and challenged. The
- * per-register tabs still exist and still deep-link, so `registerRowRoute`
- * targets are unaffected by anything here.
+ * correction workspace: the granular project memory Consultant Reasoning
+ * reads from, exposed so a wrong row can be found, updated and challenged.
+ * Every reasoning citation and every retired per-register tab URL resolves
+ * here, at the correct register sub-tab with the row focused — see
+ * `registerRowRoute` (RegisterViews.tsx) and `LegacyRegisterRedirect` above.
  */
-function MinedDataTab({ project, focusedRecordId, userId, onChanged }: { project: Project; focusedRecordId: string | null; userId: string; onChanged: () => void }) {
-  const [selectedRegister, setSelectedRegister] = useState<string>(minedRegisters[0][0]);
+function MinedDataTab({ project, focusedRecordId, presetRegister, userId, onChanged }: { project: Project; focusedRecordId: string | null; presetRegister: string | null; userId: string; onChanged: () => void }) {
+  const [selectedRegister, setSelectedRegister] = useState<string>(presetRegister && minedRegisters.some(([name]) => name === presetRegister) ? presetRegister : minedRegisters[0][0]);
+  useEffect(() => {
+    if (presetRegister && minedRegisters.some(([name]) => name === presetRegister)) setSelectedRegister(presetRegister);
+  }, [presetRegister]);
   const label = minedRegisters.find(([name]) => name === selectedRegister)?.[1] ?? humanize(selectedRegister);
   const rows = project.registerRows.filter((row) => row.registerName === selectedRegister) as RegisterRow[];
   return (
@@ -296,18 +358,6 @@ function overviewModeAvailable(overview: ProjectOverview, mode: OverviewMode) {
 
 function modeLabel(mode: OverviewMode) { return overviewModes.find((item) => item.id === mode)?.label ?? humanize(mode); }
 
-function RegisterBackedTab({ project, tab, registerName, attentionLabel, userId, focusedRecordId, onChanged }: { project: Project; tab: TabId; registerName: string; attentionLabel: string; userId: string; focusedRecordId: string | null; onChanged: () => void }) {
-  const rows = project.registerRows.filter((row) => row.registerName === registerName) as RegisterRow[];
-  if (rows.length > 0) return <RegisterTable title={labelFor(tab)} registerName={registerName} rows={rows} comparisonRows={project.registerComparisonRows.filter((row) => row.registerName === registerName)} focusedRecordId={focusedRecordId} userId={userId} onChanged={onChanged} />;
-  if (tab === 'actions') return <Section id="actions" title="Actions" kicker="Concrete next steps" count={project.actions.length}><RecordTable label="Project actions" columns={['ID', 'Action', 'Owner', 'Priority', 'Due', 'Status']} rows={project.actions.map((action) => [action.id, <RecordTitle key="title" title={action.title} summary={action.summary} attention={action.needsUserAttention && action.attentionOwner === userId ? attentionLabel : null} />, action.owner, <StatusChip key="priority" value={action.priority} />, formatDate(action.dueDate), <StatusChip key="status" value={action.status} />])} /></Section>;
-  if (tab === 'risks') return <Section id="risks" title="Risks and issues" kicker="Threats to delivery" count={project.risksIssues.length}><RecordTable label="Project risks and issues" columns={['ID', 'Risk / issue', 'Kind', 'Severity', 'Impact', 'Status']} rows={project.risksIssues.map((item) => [item.id, <RecordTitle key="title" title={item.title} summary={item.summary} attention={null} />, item.kind, <StatusChip key="severity" value={item.severity} />, item.impact, <StatusChip key="status" value={item.status} />])} /></Section>;
-  if (tab === 'decisions') return <Section id="decisions" title="Decisions" kicker="Choices and outcomes" count={project.decisions.length}><Stacked records={project.decisions.map((decision) => ({ id: decision.id, title: decision.title, text: decision.summary, chip: decision.decisionStatus, details: [['Needed by', formatDate(decision.decisionNeededBy)], ['Options', decision.optionsSummary], ['Outcome', decision.outcome ?? 'Pending']] }))} empty="No decisions recorded." /></Section>;
-  if (tab === 'config-changes') return <Section id="config-changes" title="Config Changes" kicker="Configuration movement" count={project.changes.length}><Stacked records={project.changes.map((change) => ({ id: change.id, title: change.title, text: change.summary, chip: change.status, details: [['Type', change.changeType], ['Impact', change.impact], ['Owner', change.owner]] }))} empty="No config changes recorded." /></Section>;
-  if (tab === 'open-questions') return <Section id="open-questions" title="Open Questions" kicker="Unknowns to resolve" count={project.openQuestions.length}><Stacked records={project.openQuestions.map((question) => ({ id: question.id, title: question.title, text: question.question, chip: question.blocking ? 'blocked' : question.status, details: [['Owner', question.owner], ['Answer needed', formatDate(question.answerNeededBy)]] }))} empty="No open questions." /></Section>;
-  if (tab === 'milestones') return <MilestonesTab project={project} />;
-  return <RegisterTable title={labelFor(tab)} registerName={registerName} rows={rows} comparisonRows={[]} focusedRecordId={focusedRecordId} userId={userId} onChanged={onChanged} />;
-}
-
 function RegisterComparison({ project, compact = false }: { project: Project; compact?: boolean }) {
   const rows = compact ? project.registerComparisonSummary.filter((row) => row.sqliteRowCount > 0) : project.registerComparisonSummary;
   const latestBlindReport = project.blindExtractionComparisonReports[0];
@@ -342,10 +392,6 @@ function BlindComparisonReport({ report }: { report: Project['blindExtractionCom
     {summary.registers ? <RecordTable label="Benchmark-informed extraction comparison" columns={['Register', 'Expected', 'Extracted', 'Exact', 'Semantic', 'Missing', 'Additional', 'Field mismatches', 'Status', 'Anchor', 'WP', 'Precision', 'Row recall', 'Fact recall']} rows={summary.registers.map((row) => [humanize(row.registerName), String(row.expectedRows), String(row.extractedRows), String(row.exactMatches), String(row.semanticMatches), String(row.missingItems.length), String(row.additionalItems.length), String(row.fieldLevelMismatches), String(row.statusDifferences), String(row.sourceAnchorDifferences), String(row.workPackageTagDifferences), row.metrics ? metricLabel(row.metrics.precision) : metricLabel(row.precision, row.applicable), row.metrics ? metricLabel(row.metrics.registerRowRecall) : metricLabel(row.recall, row.applicable), metricLabel(row.metrics?.distinctFactRecall)])} /> : null}
     <details className="report-details"><summary>Detailed difference report</summary><pre>{report.reportMarkdown}</pre></details>
   </div>;
-}
-
-function MilestonesTab({ project }: { project: Project }) {
-  return <Section id="milestones" title="Milestones" kicker="Delivery checkpoints" count={project.milestones.length}><div className="milestone-grid">{project.milestones.length === 0 ? <EmptyState /> : project.milestones.map((milestone) => <article className="milestone-card" key={milestone.id}><div className="record-line"><div><p className="record-type">{milestone.id} . {formatDate(milestone.targetDate)}</p><h3>{milestone.title}</h3></div><StatusChip value={milestone.milestoneStatus} /></div><p>{milestone.summary}</p><ProgressBar value={milestone.completionPercent} label="Milestone completion" /></article>)}</div></Section>;
 }
 
 function WorkPackagesTab({ project }: { project: Project }) {

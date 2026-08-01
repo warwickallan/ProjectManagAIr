@@ -37,9 +37,14 @@ export const registerForTab: Record<string, string | undefined> = {
   actions: 'Actions', risks: 'Risks_Issues', decisions: 'Decisions', 'config-changes': 'Config_Changes', 'open-questions': 'Open_Questions', milestones: 'Milestones', entities: 'Entities', uncertainty: 'Uncertainty', sources: 'Sources',
 };
 
+/**
+ * Every register-row citation and relationship link — from a Consultant
+ * Reasoning matter's supporting records to a row's own "related" list — opens
+ * Mined Data at the correct register sub-tab with the row focused, never a
+ * removed legacy per-register primary tab.
+ */
 export function registerRowRoute(projectId: string, registerName: string, rowId: string) {
-  const tab = Object.entries(registerForTab).find(([, register]) => register === registerName)?.[0] ?? 'overview';
-  return `#/projects/${encodeURIComponent(projectId)}/${tab}?record=${encodeURIComponent(rowId)}`;
+  return `#/projects/${encodeURIComponent(projectId)}/mined-data?register=${encodeURIComponent(registerName)}&record=${encodeURIComponent(rowId)}`;
 }
 
 export function RegisterTable({ title, registerName, rows, comparisonRows, focusedRecordId, userId, onChanged }: { title: string; registerName: string; rows: RegisterRow[]; comparisonRows: Project['registerComparisonRows']; focusedRecordId: string | null; userId?: string; onChanged?: () => void }) {

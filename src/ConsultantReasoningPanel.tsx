@@ -23,9 +23,9 @@ import type { ReasoningEvidence, ResolvedRegisterRow } from './consultantReasoni
  * written by a model.
  */
 
-type ReasoningState = 'none' | 'current' | 'stale' | 'failed';
+export type ReasoningState = 'none' | 'current' | 'stale' | 'failed';
 
-interface CachedReasoning {
+export interface CachedReasoning {
   id: string;
   runId: string;
   mode: string;
@@ -44,7 +44,7 @@ interface CachedReasoning {
   staleReason: string | null;
 }
 
-interface ReasoningViewResponse {
+export interface ReasoningViewResponse {
   projectId: string;
   mode: string;
   current: CachedReasoning | null;
@@ -67,7 +67,7 @@ interface ReasoningViewResponse {
   evidence: ReasoningEvidence;
 }
 
-interface GenerateResponse {
+export interface GenerateResponse {
   view: ReasoningViewResponse;
   providerCalls: 0 | 1;
   outcome: string;
@@ -83,8 +83,8 @@ const MODES: Array<{ id: BriefMode; label: string; description: string }> = [
   { id: 'handover', label: 'Handover', description: 'What a successor would need in order to take this over.' },
 ];
 
-/** Rendered after the meeting order, in this order. */
-const SECTIONS: Array<{ key: keyof ReasoningOutput; title: string; note?: string }> = [
+/** Rendered after the meeting order, in this order. Exported so single-section tabs can pick one. */
+export const SECTIONS: Array<{ key: keyof ReasoningOutput; title: string; note?: string }> = [
   { key: 'decisions_required', title: 'Decisions required' },
   { key: 'customer_dependencies', title: 'Customer dependencies' },
   { key: 'consultant_next_actions', title: 'Consultant next actions' },
@@ -95,8 +95,15 @@ const SECTIONS: Array<{ key: keyof ReasoningOutput; title: string; note?: string
   { key: 'confirmation_warnings', title: 'Confirmation warnings', note: 'Stale, conflicted or weakly supported. Do not read these as confirmed truth.' },
 ];
 
-export function ConsultantReasoningPanel({ projectId }: { projectId: string }) {
-  const [mode, setMode] = useState<BriefMode>('meeting');
+/**
+ * The read/generate lifecycle for one reasoning mode, extracted so every
+ * primary-navigation tab that shows a slice of the same accepted result
+ * (Overview, Meeting Brief, My Actions, ...) shares one fetch, one staleness
+ * reconciliation and one Generate/Refresh path, rather than each re-deriving
+ * it. The GET is provider-free by construction; POST (`generate`) is the only
+ * path that can spend a model call, and only ever fires on an explicit press.
+ */
+export function useReasoningView(projectId: string, mode: BriefMode) {
   const [view, setView] = useState<ReasoningViewResponse | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -146,6 +153,87 @@ export function ConsultantReasoningPanel({ projectId }: { projectId: string }) {
   const blocked = !skillResolved || !providerAvailable;
   const stateChanged = Boolean(view && view.latest && view.latest.projectStateHash !== view.projectStateHash);
 
+  return { view, busy, error, outcome, generate, state, cached, result, evidence, identity, skillResolved, providerAvailable, blocked, stateChanged };
+}
+
+/**
+ * Shared stale/failed banners plus the provenance-and-refresh footer, so
+ * every reasoning-backed tab shows the same staleness and generation
+ * behaviour instead of six independent copies of it.
+ */
+export function ReasoningStatusBanners({ state, cached, view, prominent = false }: { state: ReasoningState; cached: CachedReasoning | null; view: ReasoningViewResponse | null; prominent?: boolean }) {
+  const stateChanged = Boolean(view && view.latest && view.latest.projectStateHash !== view.projectStateHash);
+  return (
+    <>
+      {state === 'stale' && cached ? (
+        <div className={`reasoning-banner stale${prominent ? ' prominent' : ''}`} role="status">
+          <StatusChip value="watch" label="Stale" />
+          <div>
+            <strong>Project state has changed since this reasoning was generated.</strong>
+            <p>
+              It was generated against project-state hash <code className="hash">{shortHash(cached.projectStateHash, 12)}</code>; the register now stands at{' '}
+              <code className="hash">{shortHash(view?.projectStateHash, 12)}</code>
+              {stateChanged ? '' : ' (the stored result was marked stale explicitly)'}.
+              {cached.staleReason ? ` ${cached.staleReason}` : ''}
+            </p>
+            <p>Nothing has been regenerated. The previous judgement is shown below unchanged — press Refresh to spend one call.</p>
+          </div>
+        </div>
+      ) : null}
+      {state === 'failed' && view?.lastFailure ? (
+        <div className="reasoning-banner failed" role="alert">
+          <StatusChip value="failed" label={`Run ${humanize(view.lastFailure.status)}`} />
+          <div>
+            <strong>The last reasoning run was not accepted, and was preserved rather than retried.</strong>
+            <p>{view.lastFailure.error ?? 'The provider returned no error detail.'}</p>
+            <p className="inline-note">Recorded {formatDateTime(view.lastFailure.createdAt)}. Nothing is retrying, and nothing was charged again.</p>
+          </div>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+/** The Generate/Refresh control and disabled-reason text. Shared so the behaviour — one bounded call, only on press — cannot drift between tabs. */
+export function ReasoningRefreshControl({ state, busy, blocked, identity, onGenerate, prominent = false }: { state: ReasoningState; busy: boolean; blocked: boolean; identity: ReasoningViewResponse['identity'] | null; onGenerate: (force: boolean) => void; prominent?: boolean }) {
+  return (
+    <div className={`action-row${prominent ? ' reasoning-refresh-prominent' : ''}`}>
+      <button className="button" type="button" disabled={busy || blocked} onClick={() => onGenerate(state !== 'none')}>
+        {busy ? 'Generating…' : state === 'none' ? 'Generate consultant reasoning' : 'Refresh consultant reasoning'}
+      </button>
+      <span className="inline-note">
+        {blocked
+          ? !identity?.skillResolved
+            ? 'No publishable consultant-reasoning skill revision is resolved, so generation is disabled. Publish or pin a revision in Settings → AI Skills & Prompts.'
+            : `The configured provider is unavailable (${identity?.providerDetail ?? 'not reachable'}), so generation is disabled. Check the provider in Settings → AI Skills & Prompts.`
+          : 'One press, at most one bounded model call. Nothing on this page generates on its own.'}
+      </span>
+    </div>
+  );
+}
+
+/** Compact provenance strip, reused on every reasoning-backed tab. */
+export function ReasoningProvenanceStrip({ view, cached, mode }: { view: ReasoningViewResponse | null; cached: CachedReasoning | null; mode: BriefMode }) {
+  const identity = view?.identity ?? null;
+  return (
+    <details className="reasoning-provenance compact">
+      <summary>Provenance {cached ? `— generated ${formatDateTime(cached.generatedAt)}` : '— never generated'}</summary>
+      <dl className="inline-details">
+        <div><dt>Skill</dt><dd>{identity ? `${identity.skillId}@${identity.skillVersion ?? 'unresolved'}` : 'Not read yet'}</dd></div>
+        <div><dt>Provider / model</dt><dd>{identity ? `${identity.providerId} / ${identity.modelLabel}` : 'Not read yet'}</dd></div>
+        <div><dt>Project-state hash</dt><dd className="hash">{shortHash(view?.projectStateHash, 16)}</dd></div>
+        <div><dt>Result hash</dt><dd className="hash">{shortHash(cached?.resultSha256, 16)}</dd></div>
+        <div><dt>Calls made by this read</dt><dd>{view?.providerCallsThisRequest ?? 0}</dd></div>
+      </dl>
+      {cached ? <a className="button secondary" href={`/api/projects/${encodeURIComponent(view?.projectId ?? '')}/consultant-reasoning/download?mode=${encodeURIComponent(mode)}`} download>Download Markdown</a> : null}
+    </details>
+  );
+}
+
+export function ConsultantReasoningPanel({ projectId }: { projectId: string }) {
+  const [mode, setMode] = useState<BriefMode>('meeting');
+  const { view, busy, error, outcome, generate, state, cached, result, evidence, identity, providerAvailable, blocked } = useReasoningView(projectId, mode);
+
   return (
     <Section
       id="consultant-reasoning"
@@ -164,44 +252,20 @@ export function ConsultantReasoningPanel({ projectId }: { projectId: string }) {
 
       {error ? <p className="form-error" role="alert">{error}</p> : null}
 
-      {state === 'stale' && cached ? (
-        <div className="reasoning-banner stale" role="status">
-          <StatusChip value="watch" label="Stale" />
-          <div>
-            <strong>Project state has changed since this reasoning was generated.</strong>
-            <p>
-              It was generated against project-state hash <code className="hash">{shortHash(cached.projectStateHash, 12)}</code>; the register now stands at{' '}
-              <code className="hash">{shortHash(view?.projectStateHash, 12)}</code>
-              {stateChanged ? '' : ' (the stored result was marked stale explicitly)'}.
-              {cached.staleReason ? ` ${cached.staleReason}` : ''}
-            </p>
-            <p>Nothing has been regenerated. The previous judgement is shown below unchanged — press Refresh to spend one call.</p>
-          </div>
-        </div>
-      ) : null}
+      <ReasoningStatusBanners state={state} cached={cached} view={view} />
 
-      {state === 'failed' && view?.lastFailure ? (
+      {state === 'failed' && view?.lastFailure && view.lastFailure.violations.length > 0 ? (
         <div className="reasoning-banner failed" role="alert">
-          <StatusChip value="failed" label={`Run ${humanize(view.lastFailure.status)}`} />
-          <div>
-            <strong>The last reasoning run was not accepted, and was preserved rather than retried.</strong>
-            <p>{view.lastFailure.error ?? 'The provider returned no error detail.'}</p>
-            <p className="inline-note">Recorded {formatDateTime(view.lastFailure.createdAt)}. Nothing is retrying, and nothing was charged again.</p>
-            {view.lastFailure.violations.length === 0 ? null : (
-              <>
-                <h4>Contract violations ({view.lastFailure.violations.length})</h4>
-                <ul className="violation-list">
-                  {view.lastFailure.violations.map((violation, index) => (
-                    <li key={`${violation.code}:${violation.path}:${index}`}>
-                      <span className="violation-code">{violation.code}</span>
-                      <code className="hash">{violation.path}</code>
-                      <p>{violation.detail}</p>
-                    </li>
-                  ))}
-                </ul>
-              </>
-            )}
-          </div>
+          <h4>Contract violations ({view.lastFailure.violations.length})</h4>
+          <ul className="violation-list">
+            {view.lastFailure.violations.map((violation, index) => (
+              <li key={`${violation.code}:${violation.path}:${index}`}>
+                <span className="violation-code">{violation.code}</span>
+                <code className="hash">{violation.path}</code>
+                <p>{violation.detail}</p>
+              </li>
+            ))}
+          </ul>
         </div>
       ) : null}
 
@@ -256,18 +320,7 @@ export function ConsultantReasoningPanel({ projectId }: { projectId: string }) {
         </p>
       ) : null}
 
-      <div className="action-row">
-        <button className="button" type="button" disabled={busy || blocked} onClick={() => void generate(state !== 'none')}>
-          {busy ? 'Generating…' : state === 'none' ? 'Generate consultant reasoning' : 'Refresh consultant reasoning'}
-        </button>
-        <span className="inline-note">
-          {blocked
-            ? !skillResolved
-              ? 'No publishable consultant-reasoning skill revision is resolved, so generation is disabled. Publish or pin a revision in Settings → AI Skills & Prompts.'
-              : `The configured provider is unavailable (${identity?.providerDetail ?? 'not reachable'}), so generation is disabled. Check the provider in Settings → AI Skills & Prompts.`
-            : 'One press, at most one bounded model call. Nothing on this page generates on its own.'}
-        </span>
-      </div>
+      <ReasoningRefreshControl state={state} busy={busy} blocked={blocked} identity={identity} onGenerate={(force) => void generate(force)} />
     </Section>
   );
 }
@@ -379,7 +432,7 @@ function ReasoningBody({ result, evidence }: { result: ReasoningOutput; evidence
   );
 }
 
-function MatterReference({ matter, where }: { matter: ReasoningMatter; where: string }) {
+export function MatterReference({ matter, where }: { matter: ReasoningMatter; where: string }) {
   return (
     <div className="matter-reference">
       <code>{matter.matter_id}</code>
@@ -389,7 +442,7 @@ function MatterReference({ matter, where }: { matter: ReasoningMatter; where: st
   );
 }
 
-function MatterCard({ matter, evidence }: { matter: ReasoningMatter; evidence: ReasoningEvidence }) {
+export function MatterCard({ matter, evidence }: { matter: ReasoningMatter; evidence: ReasoningEvidence }) {
   const unconfirmed = matter.state !== 'confirmed_current';
   const weak = matter.evidence_strength !== 'strong';
   return (
@@ -436,7 +489,7 @@ function MatterCard({ matter, evidence }: { matter: ReasoningMatter; evidence: R
 }
 
 /** The drill-down. Every quote here came out of the register, never a model. */
-function RegisterCitations({ ids, evidence, label = 'Cites' }: { ids: string[]; evidence: ReasoningEvidence; label?: string }) {
+export function RegisterCitations({ ids, evidence, label = 'Cites' }: { ids: string[]; evidence: ReasoningEvidence; label?: string }) {
   if (ids.length === 0) return null;
   return (
     <div className="register-citations">
@@ -493,7 +546,7 @@ function RegisterEvidence({ row }: { row: ResolvedRegisterRow }) {
   );
 }
 
-function shortHash(value: string | null | undefined, length: number): string {
+export function shortHash(value: string | null | undefined, length: number): string {
   return typeof value === 'string' && value.length > 0 ? value.slice(0, length) : '-';
 }
 

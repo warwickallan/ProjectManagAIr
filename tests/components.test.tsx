@@ -66,14 +66,45 @@ describe('Cockpit states and routes', () => {
 
   it('renders true project tab routes for required project detail sections', async () => {
     const response = buildProjectResponse(fixture, 'atlas', new Date(fixture.asOf));
-    vi.stubGlobal('fetch', vi.fn(() => jsonResponse(response)));
-    for (const [route, heading] of [['actions', /Actions/i], ['risks', /Risks and issues/i], ['decisions', /Decisions/i], ['open-questions', /Open Questions/i], ['milestones', /Milestones/i], ['work-packages', /Work Packages/i], ['activity', /AI write and verification status/i]] as const) {
+    vi.stubGlobal('fetch', vi.fn((input: unknown) => {
+      const url = String(input);
+      if (url.includes('/consultant-reasoning')) return jsonResponse(reasoningView);
+      if (url.includes('/consultant-view')) return jsonResponse(consultantView);
+      return jsonResponse(response);
+    }));
+    for (const [route, heading] of [
+      ['meeting-brief', /Meeting Brief/i], ['my-actions', /My Actions/i], ['customer-dependencies', /Customer Dependencies/i],
+      ['decisions-needed', /Decisions Needed/i], ['risks-blockers', /Risks & Blockers/i], ['questions', /^Questions$/i],
+      ['recent-changes', /Recent Changes/i], ['work-packages', /Work Packages/i], ['activity', /AI write and verification status/i],
+    ] as const) {
       cleanup();
       window.location.hash = `#/projects/atlas/${route}`;
       render(<App />);
       expect(await screen.findByRole('heading', { name: 'Project Atlas' })).toBeInTheDocument();
       expect(await screen.findByRole('heading', { name: heading })).toBeInTheDocument();
     }
+  });
+
+  it('does not keep the nine raw registers as independent primary tabs, and redirects an old register URL into the equivalent Mined Data state', async () => {
+    const response = buildProjectResponse(fixture, 'atlas', new Date(fixture.asOf));
+    vi.stubGlobal('fetch', vi.fn((input: unknown) => {
+      const url = String(input);
+      if (url.includes('/consultant-reasoning')) return jsonResponse(reasoningView);
+      if (url.includes('/consultant-view')) return jsonResponse(consultantView);
+      return jsonResponse(response);
+    }));
+    window.location.hash = '#/projects/atlas/overview';
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Project Atlas' });
+    for (const label of ['Actions', 'Risks & Issues', 'Decisions', 'Config Changes', 'Open Questions', 'Milestones', 'Entities', 'Sources', 'Uncertainty']) {
+      expect(screen.queryByRole('link', { name: label })).not.toBeInTheDocument();
+    }
+
+    cleanup();
+    window.location.hash = '#/projects/atlas/actions?record=SYN-A-001';
+    render(<App />);
+    expect(await screen.findByRole('heading', { name: 'Mined Data' })).toBeInTheDocument();
+    expect(window.location.hash).toBe('#/projects/atlas/mined-data?register=Actions&record=SYN-A-001');
   });
 
   it('renders the Mined Data workspace on its own route rather than falling back to Overview', async () => {
@@ -97,7 +128,7 @@ describe('Cockpit states and routes', () => {
       return jsonResponse(response);
     });
     vi.stubGlobal('fetch', fetchSpy);
-    for (const route of ['overview', 'mined-data', 'actions', 'decisions'] as const) {
+    for (const route of ['overview', 'meeting-brief', 'my-actions', 'customer-dependencies', 'decisions-needed', 'risks-blockers', 'questions', 'recent-changes', 'mined-data', 'actions', 'decisions'] as const) {
       cleanup();
       window.location.hash = `#/projects/atlas/${route}`;
       render(<App />);
@@ -122,17 +153,20 @@ describe('Cockpit states and routes', () => {
     expect(await screen.findByRole('heading', { name: /No consultant reasoning has been generated/i })).toBeInTheDocument();
     expect(screen.getAllByRole('link', { name: 'Mined Data' }).every((link) => link.getAttribute('href') === '#/projects/atlas/mined-data')).toBe(true);
     expect(await screen.findByRole('button', { name: 'Generate consultant reasoning' })).toBeDisabled();
-    expect(screen.getByRole('heading', { name: /Zero-call deterministic fallback/i })).toBeInTheDocument();
+    // Demoted to a collapsed <details>/<summary>, not a competing heading.
+    expect(screen.getByText(/Zero-call deterministic fallback/i)).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /Zero-call deterministic fallback/i })).not.toBeInTheDocument();
   });
 
-  it('renders an honest empty state for an empty project tab', async () => {
-    window.location.hash = '#/projects/atlas/open-questions';
+  it('renders an honest empty state for an empty register inside Mined Data', async () => {
+    window.location.hash = '#/projects/atlas/mined-data?register=Open_Questions';
     const response = buildProjectResponse(fixture, 'atlas', new Date(fixture.asOf));
     if (!response) throw new Error('Expected fixture project');
-    response.project.openQuestions = [];
+    response.project.registerRows = response.project.registerRows.filter((row) => row.registerName !== 'Open_Questions');
     vi.stubGlobal('fetch', vi.fn(() => jsonResponse(response)));
     render(<App />);
-    expect(await screen.findByText('No open questions.')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Mined Data' })).toBeInTheDocument();
+    expect(await screen.findByText('No register rows loaded.')).toBeInTheDocument();
   });
 });
 
