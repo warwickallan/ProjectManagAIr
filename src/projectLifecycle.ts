@@ -7,6 +7,8 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { registerNormalizedSource } from './sourceIntelligence.js';
+import { chronologyFromRow, describeChronology, normaliseChronology, type ChronologyBasis, type ChronologyPrecision, type ChronologyState, type SourceChronology } from './sourceChronology.js';
+import { classifyAndRecordSource, recordAlternateName, recordSourceFingerprints, type ClassificationResult } from './sourceSafety.js';
 
 export type SourceState = 'awaiting_metadata' | 'awaiting_processing' | 'processing' | 'awaiting_review' | 'verified' | 'failed' | 'rejected' | 'archived';
 export type ProposedStatus = 'proposed' | 'reviewed' | 'approved' | 'applied' | 'rejected';
@@ -462,8 +464,17 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
   const bytes = Buffer.from(file.dataBase64, 'base64');
   const contentHash = createHash('sha256').update(bytes).digest('hex');
   const sourceType = sourceTypeFor(file.name);
+  // Byte identity, checked first because it is the cheapest and the most
+  // certain. The same file re-dropped is recognised whatever it is called, and
+  // the new name is recorded so the consultant can see the file arrived twice
+  // under two names — the exact situation two Teams exports differing only by
+  // " (2)" create.
   const existing = db.prepare('SELECT id, processing_status FROM project_source_intake WHERE project_id = ? AND content_hash = ?').get(projectId, contentHash) as { id: string; processing_status: string } | undefined;
-  if (existing) return { sourceId: existing.id, duplicate: true, processingStatus: existing.processing_status };
+  if (existing) {
+    const known = db.prepare('SELECT id FROM source_documents WHERE intake_source_id = ?').get(existing.id) as { id: string } | undefined;
+    if (known) recordAlternateName(db, String(known.id), projectId, file.name);
+    return { sourceId: existing.id, duplicate: true, processingStatus: existing.processing_status, classification: 'exact-duplicate' as const, blocksExtraction: true };
+  }
 
   const inboxPath = path.join(pPath, '00_Inbox', 'Unsorted');
   mkdirSync(inboxPath, { recursive: true });
@@ -538,7 +549,50 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
         throw error;
       }
       if (path.resolve(target) !== path.resolve(filed.destinationPath) && existsSync(target)) rmSync(target, { force: true });
-      return { ...normalized, intakeSourceId: sourceId, proposedChangeId: null, processingStatus: 'awaiting_metadata', extractedCount: 0, immutablePath: filed.destinationPath };
+      // Fingerprint and classify BEFORE returning, so the duplicate/overlap
+      // verdict exists the moment the source appears in the Inbox — and
+      // therefore before any of the three extraction triggers could reach a
+      // provider. Nothing here calls a model.
+      let classification: ClassificationResult | null = null;
+      const normalizedSourceId = String((normalized as { sourceId?: string }).sourceId ?? sourceId);
+      // Seed chronology from the transcript's OWN header when the normaliser
+      // recovered one.
+      //
+      // This is deliberately different from a filename or a file timestamp.
+      // A `NOTE Recorded:` line is evidence carried by the source itself, so it
+      // is a legitimate `transcript-header` basis rather than a suggestion —
+      // but it is recorded as `approximate`, never `confirmed`, because no
+      // person has yet agreed with it. It gives precedence something honest to
+      // work with instead of the upload time it used to fall back to, and the
+      // human confirmation that follows overrides it and is audited as a change.
+      //
+      // A source whose transcript carries no date stays explicitly `unknown`.
+      // Nothing infers one.
+      const headerDate = db.prepare('SELECT event_date FROM source_documents WHERE id = ?').get(normalizedSourceId) as { event_date: string | null } | undefined;
+      if (headerDate?.event_date && isoDateOnly(String(headerDate.event_date))) {
+        db.prepare("UPDATE source_documents SET chronology_state = 'approximate', chronology_precision = 'date', chronology_basis = 'transcript-header', confirmed_event_date = ? WHERE id = ?")
+          .run(String(headerDate.event_date), normalizedSourceId);
+      }
+      try {
+        const text = bytes.toString('utf8');
+        recordSourceFingerprints(db, normalizedSourceId, projectId, text);
+        recordAlternateName(db, normalizedSourceId, projectId, file.name);
+        db.prepare('UPDATE project_source_intake SET canonical_fingerprint = (SELECT canonical_fingerprint FROM source_documents WHERE id = ?) WHERE id = ?').run(normalizedSourceId, sourceId);
+        classification = classifyAndRecordSource(db, projectId, sourceId, {
+          fileName: file.name, contentHash, text, excludeSourceId: normalizedSourceId,
+        });
+      } catch {
+        // A source whose bytes cannot be read as text still lands safely; it
+        // simply has no canonical fingerprint and is compared on raw hash
+        // alone. Failing intake outright would be a worse answer than
+        // comparing less.
+      }
+      return {
+        ...normalized, intakeSourceId: sourceId, proposedChangeId: null, processingStatus: 'awaiting_metadata', extractedCount: 0, immutablePath: filed.destinationPath,
+        classification: classification?.verdict.classification ?? 'apparently-new',
+        blocksExtraction: classification?.blocksExtraction ?? false,
+        comparisonLabel: classification?.label ?? 'Apparently new',
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       db.prepare("UPDATE project_source_intake SET processing_status = 'failed', verification_state = 'failed', updated_at = ? WHERE id = ?").run(nowIso(), sourceId);
@@ -561,9 +615,24 @@ export async function intakeProjectSource(db: DatabaseSync, projectId: string, f
 export interface SourceMetadataInput {
   actor: string;
   meetingSubject: string;
-  eventDate: string;
+  /**
+   * The meeting date, when one is known.
+   *
+   * No longer mandatory. A consultant who genuinely does not know when a
+   * transcript was recorded selects `chronologyState: 'unknown'` instead, and
+   * this is left empty. Requiring a value here is what previously forced an
+   * invented date onto every Teams export with no reliable header.
+   */
+  eventDate?: string | null;
   eventTime?: string | null;
   timezone?: string | null;
+  /** confirmed | approximate | unknown. Defaults to `confirmed` when a date is supplied, so existing callers behave exactly as before. */
+  chronologyState?: ChronologyState;
+  chronologyPrecision?: ChronologyPrecision | null;
+  /** Where the value came from. A `*-suggestion` basis can never be stored as `confirmed`. */
+  chronologyBasis?: ChronologyBasis | null;
+  chronologyRangeStart?: string | null;
+  chronologyRangeEnd?: string | null;
   primaryWorkPackage: string;
   additionalWorkPackages?: string[];
   participants?: string[];
@@ -577,6 +646,8 @@ export interface SourceMetadataRecord {
   eventDate: string | null;
   eventTime: string | null;
   timezone: string | null;
+  chronology: SourceChronology;
+  chronologyLabel: string;
   primaryWorkPackage: string | null;
   additionalWorkPackages: string[];
   participants: string[];
@@ -584,10 +655,51 @@ export interface SourceMetadataRecord {
   confirmed: boolean;
   confirmedAt: string | null;
   confirmedBy: string | null;
+  /** Labelled, never-auto-applied prefills the form may offer. Accepting one is an explicit human act. */
+  suggestions: ChronologySuggestion[];
 }
 
-/** Every mandatory-field check `confirmSourceMetadata` enforces, named so the UI and the API agree on what "confirmed" means. */
-export const MANDATORY_SOURCE_METADATA_FIELDS = ['meetingSubject', 'eventDate', 'primaryWorkPackage'] as const;
+/**
+ * Every mandatory-field check `confirmSourceMetadata` enforces, named so the UI
+ * and the API agree on what "confirmed" means.
+ *
+ * `eventDate` is deliberately NOT here any more. The meeting date must always
+ * be ANSWERED — including by explicitly choosing Unknown — but it must never be
+ * required to be a value, because that is what forced consultants to invent one.
+ */
+export const MANDATORY_SOURCE_METADATA_FIELDS = ['meetingSubject', 'primaryWorkPackage', 'chronologyState'] as const;
+
+export interface ChronologySuggestion {
+  basis: ChronologyBasis;
+  date: string;
+  label: string;
+}
+
+/**
+ * Dates that MIGHT be the meeting date, each labelled with where it came from.
+ *
+ * These are offered to the form and nothing else. Nothing in the product writes
+ * one automatically: `normaliseChronology` refuses to store a `*-suggestion`
+ * basis as `confirmed`, so an unaccepted suggestion can never become chronology
+ * by accident.
+ */
+export function chronologySuggestions(input: { fileName: string; transcriptHeaderDate?: string | null; fileTimestamp?: string | null }): ChronologySuggestion[] {
+  const suggestions: ChronologySuggestion[] = [];
+  if (input.transcriptHeaderDate && isoDateOnly(input.transcriptHeaderDate)) {
+    suggestions.push({ basis: 'transcript-header', date: input.transcriptHeaderDate, label: `The transcript's own header says ${input.transcriptHeaderDate}` });
+  }
+  // A date embedded in the filename, in the orderings an export is likely to use.
+  const iso = /(\d{4})[-_.](\d{2})[-_.](\d{2})/.exec(input.fileName);
+  const dmy = /\b(\d{2})[-_.](\d{2})[-_.](\d{4})\b/.exec(input.fileName);
+  const candidate = iso ? `${iso[1]}-${iso[2]}-${iso[3]}` : dmy ? `${dmy[3]}-${dmy[2]}-${dmy[1]}` : null;
+  if (candidate && isoDateOnly(candidate)) {
+    suggestions.push({ basis: 'filename-suggestion', date: candidate, label: `The filename contains ${candidate} — a suggestion only, not evidence of when the meeting happened` });
+  }
+  if (input.fileTimestamp && isoDateOnly(input.fileTimestamp.slice(0, 10))) {
+    suggestions.push({ basis: 'file-timestamp-suggestion', date: input.fileTimestamp.slice(0, 10), label: `The file was created or downloaded on ${input.fileTimestamp.slice(0, 10)} — this is usually the download date, not the meeting date` });
+  }
+  return suggestions;
+}
 
 function isoDateOnly(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}$/.test(value);
@@ -613,12 +725,20 @@ export function readSourceMetadata(db: DatabaseSync, idOrIntakeId: string): Sour
   if (!source) return null;
   const sourceId = String(source.id);
   const intake = db.prepare('SELECT metadata_confirmed_at, metadata_confirmed_by FROM project_source_intake WHERE id = ?').get(String(source.intake_source_id)) as { metadata_confirmed_at: string | null; metadata_confirmed_by: string | null } | undefined;
+  const chronology = chronologyFromRow(source);
   return {
     sourceId,
     meetingSubject: source.meeting_subject ? String(source.meeting_subject) : null,
     eventDate: source.confirmed_event_date ? String(source.confirmed_event_date) : null,
     eventTime: source.event_time ? String(source.event_time) : null,
     timezone: source.timezone ? String(source.timezone) : null,
+    chronology,
+    chronologyLabel: describeChronology(chronology),
+    suggestions: chronologySuggestions({
+      fileName: String(source.original_file_name ?? ''),
+      transcriptHeaderDate: source.event_date ? String(source.event_date) : null,
+      fileTimestamp: source.created_at ? String(source.created_at) : null,
+    }),
     primaryWorkPackage: source.primary_work_package ? String(source.primary_work_package) : null,
     additionalWorkPackages: JSON.parse(String(source.additional_work_packages_json ?? '[]')) as string[],
     participants: JSON.parse(String(source.confirmed_participants_json ?? '[]')) as string[],
@@ -643,9 +763,27 @@ export function confirmSourceMetadata(db: DatabaseSync, projectId: string, idOrI
   if (!source || String(source.project_id) !== projectId) throw new Error('Source not found.');
   const sourceId = String(source.id);
   if (!input.meetingSubject?.trim()) throw new Error('Meeting subject is required.');
-  if (!input.eventDate?.trim() || !isoDateOnly(input.eventDate.trim())) throw new Error('Meeting event date is required, as YYYY-MM-DD.');
   if (!input.primaryWorkPackage?.trim()) throw new Error('Primary work package is required.');
   if (!input.actor?.trim()) throw new Error('Confirming metadata requires a named actor.');
+
+  // The meeting date must be ANSWERED, never invented. A caller that supplies a
+  // date without naming a state is treated as confirming it (which is how every
+  // pre-existing caller behaves); a caller that supplies neither is asked to
+  // choose explicitly rather than being handed a silent default.
+  const declaredState: ChronologyState = input.chronologyState ?? (input.eventDate?.trim() ? 'confirmed' : 'unknown');
+  if (!input.chronologyState && !input.eventDate?.trim()) {
+    throw new Error('State the meeting date, or explicitly select "Meeting date unknown". It is never inferred.');
+  }
+  const chronology = normaliseChronology({
+    state: declaredState,
+    precision: input.chronologyPrecision ?? (declaredState === 'unknown' ? 'none' : input.eventTime?.trim() ? 'exact-datetime' : 'date'),
+    basis: input.chronologyBasis ?? (declaredState === 'unknown' ? 'absent' : 'human-confirmed'),
+    date: declaredState === 'unknown' ? null : input.eventDate ?? null,
+    time: input.eventTime ?? null,
+    timezone: input.timezone ?? null,
+    rangeStart: input.chronologyRangeStart ?? null,
+    rangeEnd: input.chronologyRangeEnd ?? null,
+  });
 
   const now = new Date().toISOString();
   const reason = input.reason?.trim() || (source.meeting_subject ? 'Corrected meeting metadata.' : 'Confirmed meeting metadata before extraction.');
@@ -656,9 +794,17 @@ export function confirmSourceMetadata(db: DatabaseSync, projectId: string, idOrI
   // with that evidence-integrity invariant.
   const next: Record<string, string | null> = {
     meeting_subject: input.meetingSubject.trim(),
-    confirmed_event_date: input.eventDate.trim(),
-    event_time: input.eventTime?.trim() || null,
-    timezone: input.timezone?.trim() || null,
+    confirmed_event_date: chronology.date,
+    event_time: chronology.time,
+    timezone: chronology.timezone,
+    // Chronology state, precision and basis are audited exactly like every
+    // other confirmable field, so a later correction — including "I found out
+    // the real date" — leaves one `source_metadata_events` row per change.
+    chronology_state: chronology.state,
+    chronology_precision: chronology.precision,
+    chronology_basis: chronology.basis,
+    chronology_range_start: chronology.rangeStart,
+    chronology_range_end: chronology.rangeEnd,
     primary_work_package: input.primaryWorkPackage.trim(),
     additional_work_packages_json: JSON.stringify(input.additionalWorkPackages ?? []),
     recording_gap_notes: input.recordingGapNotes?.trim() || null,
@@ -677,8 +823,8 @@ export function confirmSourceMetadata(db: DatabaseSync, projectId: string, idOrI
       db.prepare('INSERT INTO source_metadata_events (id, source_id, project_id, occurred_at, actor, field, previous_value, new_value, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(randomUUID(), sourceId, projectId, now, input.actor.trim(), field, previous, value, reason);
     }
-    db.prepare('UPDATE source_documents SET meeting_subject = ?, confirmed_event_date = ?, event_time = ?, timezone = ?, primary_work_package = ?, additional_work_packages_json = ?, recording_gap_notes = ?, confirmed_participants_json = ? WHERE id = ?')
-      .run(next.meeting_subject, next.confirmed_event_date, next.event_time, next.timezone, next.primary_work_package, next.additional_work_packages_json, next.recording_gap_notes, next.confirmed_participants_json, sourceId);
+    db.prepare('UPDATE source_documents SET meeting_subject = ?, confirmed_event_date = ?, event_time = ?, timezone = ?, chronology_state = ?, chronology_precision = ?, chronology_basis = ?, chronology_range_start = ?, chronology_range_end = ?, primary_work_package = ?, additional_work_packages_json = ?, recording_gap_notes = ?, confirmed_participants_json = ? WHERE id = ?')
+      .run(next.meeting_subject, next.confirmed_event_date, next.event_time, next.timezone, next.chronology_state, next.chronology_precision, next.chronology_basis, next.chronology_range_start, next.chronology_range_end, next.primary_work_package, next.additional_work_packages_json, next.recording_gap_notes, next.confirmed_participants_json, sourceId);
     const intakeSourceId = String(source.intake_source_id);
     db.prepare("UPDATE project_source_intake SET metadata_confirmed_at = COALESCE(metadata_confirmed_at, ?), metadata_confirmed_by = COALESCE(metadata_confirmed_by, ?), processing_status = CASE WHEN processing_status = 'awaiting_metadata' THEN 'processing' ELSE processing_status END, updated_at = ? WHERE id = ?")
       .run(now, input.actor.trim(), now, intakeSourceId);

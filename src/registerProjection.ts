@@ -497,7 +497,29 @@ const EVENT_TYPE_STATUS: Record<string, string> = {
   revert: 'reverted',
 };
 
-function stateFor(db: DatabaseSync, projectId: string, row: Record<string, unknown>) {
+/**
+ * The relationship event types whose meaning depends on the row at the OTHER
+ * end still existing in effective state. When a void removes or materially
+ * alters that other end, every surviving row on this list is flagged for human
+ * review rather than silently repaired or deleted.
+ */
+export const RELATIONSHIP_EVENT_TYPES: readonly string[] = ['answers', 'answered_by', 'supersedes', 'superseded_by', 'resolves', 'reaffirm', 'reaffirmed_by', 'contradicts'];
+
+/**
+ * Sources whose contribution is excluded from effective state.
+ *
+ * A void is a replay-time exclusion, never a compensating write: the events
+ * stay in the append-only log exactly as recorded, and this set decides which
+ * of them the projector reads. That is what makes a void deterministic and
+ * reversible, and what stops it from landing a "correction" dated after every
+ * later valid source and human edit.
+ */
+export function voidedSourceIds(db: DatabaseSync, projectId: string): Set<string> {
+  const rows = db.prepare("SELECT id FROM source_documents WHERE project_id = ? AND lifecycle_state = 'voided'").all(projectId) as Array<{ id: string }>;
+  return new Set(rows.map((row) => String(row.id)));
+}
+
+function stateFor(db: DatabaseSync, projectId: string, row: Record<string, unknown>, voided: ReadonlySet<string>) {
   const state: Record<string, string | null> = {
     status: String(row.record_status),
     owner: ownerOrNull(row.owner),
@@ -507,7 +529,13 @@ function stateFor(db: DatabaseSync, projectId: string, row: Record<string, unkno
   // Every field event that is not one of the four state fields, last write wins,
   // in the same deterministic event order.
   const corrections = new Map<string, string | null>();
-  const events = db.prepare(`SELECT * FROM register_row_events WHERE project_id = ? AND external_register_id = ? ${EVENT_ORDER}`).all(projectId, String(row.external_register_id)) as Array<Record<string, unknown>>;
+  const all = db.prepare(`SELECT * FROM register_row_events WHERE project_id = ? AND external_register_id = ? ${EVENT_ORDER}`).all(projectId, String(row.external_register_id)) as Array<Record<string, unknown>>;
+  // Exactly the exclusion the void contract specifies: origin = source AND
+  // source_id = a voided source. A human event is never excluded, whichever
+  // source prompted it, and neither is a valid source's event.
+  const events = voided.size === 0
+    ? all
+    : all.filter((event) => !(String(event.origin) === 'source' && event.source_id !== null && voided.has(String(event.source_id))));
   for (const event of events) {
     const field = event.field ? String(event.field) : null;
     if (field) {
@@ -518,7 +546,11 @@ function stateFor(db: DatabaseSync, projectId: string, row: Record<string, unkno
     const eventType = String(event.event_type);
     if (Object.hasOwn(EVENT_TYPE_STATUS, eventType)) state.status = EVENT_TYPE_STATUS[eventType];
   }
-  return { state, corrections, events };
+  // `allEvents` keeps the unfiltered log available to the void-disposition pass,
+  // which has to reason about relationships a voided source recorded — those
+  // events are excluded from STATE but are still how we know the relationship
+  // existed and therefore which surviving row needs review.
+  return { state, corrections, events, allEvents: all };
 }
 
 function scoreRow(db: DatabaseSync, projectId: string, row: Record<string, unknown>, detail: JsonObject, state: Record<string, string | null>, events: Array<Record<string, unknown>>, timestamp: string, config: ScoringConfig) {
@@ -799,14 +831,130 @@ function repairMilestoneReferences(db: DatabaseSync, projectId: string) {
   db.prepare('UPDATE projects SET next_milestone_id = NULL WHERE id = ? AND next_milestone_id IS NOT NULL AND next_milestone_id <> \'\' AND next_milestone_id NOT IN (SELECT id FROM milestones WHERE project_id = ?)').run(projectId, projectId);
 }
 
+export interface VoidDisposition {
+  /** False when the row has left current effective state because its only evidence came from a voided source. */
+  effective: boolean;
+  reviewFlag: string | null;
+  reviewDetail: string | null;
+}
+
+/**
+ * Decide what a source void means for one register row.
+ *
+ * The rule, applied to a row founded by a now-voided source:
+ *
+ *  A. A still-valid source independently evidences this row — it has at least
+ *     one anchor of its own on the row whose quote was MECHANICALLY VERIFIED
+ *     against that source's transcript. The claim stands on evidence the void
+ *     did not remove, so the row is retained, its surviving effective state is
+ *     re-anchored to that valid evidence, and it is flagged
+ *     "Founding source voided — review required".
+ *
+ *  B. Every other case: later sources merely referred to, updated or depended
+ *     upon a claim that is now unsupported. The row leaves effective state and
+ *     is retained in history, flagged "Orphaned by source void — review
+ *     required". It is never deleted and its identifier is never reused.
+ *
+ * `verified = 1` is the discriminator because it is the one property that
+ * already distinguishes "this source's own transcript demonstrably says this"
+ * from "this source mentioned a row that something else asserted". An
+ * unverified or inference-only reference is not independent evidence.
+ *
+ * A human event on the row also retains it: a person has deliberately worked on
+ * this record, and the void contract requires human events to survive. Deleting
+ * a row somebody owns because an unrelated transcript was withdrawn would be
+ * exactly the silent damage this design exists to prevent.
+ */
+function voidDispositionFor(
+  db: DatabaseSync,
+  projectId: string,
+  row: Record<string, unknown>,
+  voided: ReadonlySet<string>,
+  allEvents: ReadonlyArray<Record<string, unknown>>,
+): VoidDisposition {
+  if (voided.size === 0) return { effective: true, reviewFlag: null, reviewDetail: null };
+  const externalId = String(row.external_register_id);
+  const foundedBy = row.first_seen_source_id ? String(row.first_seen_source_id) : row.source_id ? String(row.source_id) : null;
+  const anchors = db.prepare('SELECT source_id, verified FROM register_row_anchors WHERE project_id = ? AND external_register_id = ?').all(projectId, externalId) as Array<{ source_id: string; verified: number }>;
+  const touchedByVoided = anchors.some((anchor) => voided.has(String(anchor.source_id)));
+  const foundedByVoided = (foundedBy !== null && voided.has(foundedBy)) || (foundedBy === null && touchedByVoided);
+  if (!foundedByVoided) {
+    // The row was not founded by a voided source. It may still have been
+    // TOUCHED by one — those events are already excluded from state above — but
+    // it stands on its own founding evidence and stays effective.
+    return touchedByVoided
+      ? { effective: true, reviewFlag: 'relationship-review', reviewDetail: 'A voided source previously updated this row; its contribution has been removed from effective state. Review the remaining values.' }
+      : { effective: true, reviewFlag: null, reviewDetail: null };
+  }
+
+  const validEvidence = anchors.some((anchor) => !voided.has(String(anchor.source_id)) && Number(anchor.verified) === 1);
+  const humanEvents = allEvents.some((event) => String(event.origin) === 'human');
+  if (validEvidence || humanEvents) {
+    return {
+      effective: true,
+      reviewFlag: 'founding-source-voided',
+      reviewDetail: validEvidence
+        ? 'Founding source voided — review required. This row is retained because another valid source independently evidences it; its effective state is now anchored to that evidence.'
+        : 'Founding source voided — review required. This row is retained because it carries human events that the void does not remove.',
+    };
+  }
+  return {
+    effective: false,
+    reviewFlag: 'orphaned-by-source-void',
+    reviewDetail: 'Orphaned by source void — review required. The only evidence for this row came from a voided source, so it has left current effective state. It is retained in history and its identifier is never reused.',
+  };
+}
+
 export function rebuildProjection(db: DatabaseSync, projectId: string, timestamp = nowIso()) {
   const rows = db.prepare('SELECT * FROM project_register_rows WHERE project_id = ? ORDER BY register_name, external_register_id').all(projectId) as Array<Record<string, unknown>>;
   const config = readActiveScoringConfig(db);
   const owned = previouslyProjectedIds(db, projectId);
+  const voided = voidedSourceIds(db, projectId);
+
+  // Dispositions are computed for every row BEFORE anything is projected,
+  // because a relationship flag depends on whether the row at the other end
+  // survived — which is not known until all of them have been decided.
+  const replay = new Map<string, ReturnType<typeof stateFor>>();
+  const dispositions = new Map<string, VoidDisposition>();
+  for (const row of rows) {
+    const id = String(row.external_register_id);
+    const computed = stateFor(db, projectId, row, voided);
+    replay.set(id, computed);
+    dispositions.set(id, voidDispositionFor(db, projectId, row, voided, computed.allEvents));
+  }
+  if (voided.size > 0) {
+    // Second pass — a surviving row whose relationship counterpart has left
+    // effective state, or whose relationship was recorded by a voided source,
+    // is flagged for a human. Relationships are never silently repaired and
+    // never deleted.
+    for (const row of rows) {
+      const id = String(row.external_register_id);
+      const disposition = dispositions.get(id)!;
+      if (!disposition.effective || disposition.reviewFlag === 'founding-source-voided' || disposition.reviewFlag === 'orphaned-by-source-void') continue;
+      const relationships = replay.get(id)!.allEvents.filter((event) => RELATIONSHIP_EVENT_TYPES.includes(String(event.event_type)));
+      const broken = relationships.filter((event) => {
+        const other = event.related_external_id ? String(event.related_external_id) : null;
+        const fromVoided = String(event.origin) === 'source' && event.source_id !== null && voided.has(String(event.source_id));
+        return fromVoided || (other !== null && dispositions.get(other)?.effective === false);
+      });
+      if (broken.length === 0) continue;
+      const named = [...new Set(broken.map((event) => `${String(event.event_type)}${event.related_external_id ? ` ${String(event.related_external_id)}` : ''}`))].sort();
+      dispositions.set(id, {
+        effective: true,
+        reviewFlag: 'relationship-review',
+        reviewDetail: `A related record was removed or materially altered by a source void — review required. Affected relationships: ${named.join(', ')}.`,
+      });
+    }
+  }
+
   const current = new Map<string, string>();
   for (const row of rows) {
     const table = operationalTableFor[String(row.register_name) as RegisterName];
-    if (table) current.set(String(row.external_register_id), table);
+    // A row excluded by a void must genuinely LEAVE effective state, so it is
+    // omitted here and `clearRetiredProjectedRows` removes it from the
+    // operational table it used to occupy — the same path a row that leaves the
+    // register already takes, references repaired and all.
+    if (table && dispositions.get(String(row.external_register_id))?.effective !== false) current.set(String(row.external_register_id), table);
   }
   clearRetiredProjectedRows(db, projectId, owned, current);
   db.prepare('DELETE FROM register_row_state WHERE project_id = ?').run(projectId);
@@ -817,22 +965,37 @@ export function rebuildProjection(db: DatabaseSync, projectId: string, timestamp
     const register = String(row.register_name) as RegisterName;
     const id = String(row.external_register_id);
     const raw = JSON.parse(String(row.raw_row_json)) as JsonObject;
-    const { state, corrections, events } = stateFor(db, projectId, row);
+    const { state, corrections, events } = replay.get(id)!;
+    const disposition = dispositions.get(id)!;
     // Replayed before scoring, so a corrected `severity` reaches the score and
     // the band rather than only the display layer (N2).
     const detail = correctedDetails(db, register, String(row.id), readTypedDetails(db, register, String(row.id)), corrections);
-    const source = row.source_id ? db.prepare('SELECT event_date FROM source_documents WHERE id = ?').get(String(row.source_id)) as { event_date: string | null } | undefined : undefined;
+    // A due date relative to "the meeting" resolves against the CONFIRMED
+    // meeting date, so a source whose date was corrected — or which never had
+    // one — no longer resolves against an unrelated evidence-derived value.
+    const source = row.source_id ? db.prepare('SELECT confirmed_event_date, event_date FROM source_documents WHERE id = ?').get(String(row.source_id)) as { confirmed_event_date: string | null; event_date: string | null } | undefined : undefined;
     const rawDue = text(rawDueValue(register, raw));
-    const resolved = resolveDate(rawDue, source?.event_date ?? null);
+    const resolved = resolveDate(rawDue, source?.confirmed_event_date ?? source?.event_date ?? null);
     if (!events.some((event) => event.field === 'due_date')) state.due_date = resolved.date;
     const correctedTitle = correctedRowField(corrections, 'title');
     const correctedSummary = correctedRowField(corrections, 'summary');
     db.prepare('UPDATE project_register_rows SET due_date = ?, due_date_raw = ?, due_date_confidence = ?, title = COALESCE(?, title), summary = COALESCE(?, summary) WHERE id = ?').run(resolved.date, rawDue || null, resolved.confidence, correctedTitle, correctedSummary, String(row.id));
     const score = scoreRow(db, projectId, row, detail, state, events, timestamp, config);
-    const projected = insertOperational(db, projectId, register, id, raw, detail, state, corrections, score, timestamp);
+    // A row orphaned by a void is NOT projected into its operational table: it
+    // has left effective state. It keeps its `register_row_state` row so it
+    // stays inspectable, flagged, and reachable from history.
+    const projected = disposition.effective ? insertOperational(db, projectId, register, id, raw, detail, state, corrections, score, timestamp) : null;
     const inputs = projected?.unrecognisedStatus ? { ...score.inputs, unrecognisedStatus: projected.unrecognisedStatus } : score.inputs;
-    db.prepare('INSERT INTO register_row_state (project_id, external_register_id, register_name, status, owner, due_date, resolution, last_human_event_at, last_source_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(projectId, id, register, state.status, state.owner, state.due_date, state.resolution, events.at(-1)?.occurred_at ? String(events.at(-1)?.occurred_at) : null, row.last_updated_source_id ? String(row.last_updated_source_id) : row.source_id ? String(row.source_id) : null, timestamp);
+    // `last_source_id` must name a source that still counts. When the row's own
+    // latest source was voided, effective state is re-anchored to the most
+    // recent VALID source that evidenced it (rule A), rather than continuing to
+    // credit a withdrawn transcript.
+    const ownSource = row.last_updated_source_id ? String(row.last_updated_source_id) : row.source_id ? String(row.source_id) : null;
+    const storedSource = disposition.effective && ownSource !== null && voided.has(ownSource)
+      ? (db.prepare("SELECT source_id FROM register_row_anchors WHERE project_id = ? AND external_register_id = ? AND source_id NOT IN (SELECT id FROM source_documents WHERE lifecycle_state = 'voided') ORDER BY verified DESC, source_id DESC LIMIT 1").get(projectId, id) as { source_id: string } | undefined)?.source_id ?? null
+      : ownSource;
+    db.prepare('INSERT INTO register_row_state (project_id, external_register_id, register_name, status, owner, due_date, resolution, last_human_event_at, last_source_id, updated_at, effective, review_flag, review_detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(projectId, id, register, state.status, state.owner, state.due_date, state.resolution, events.at(-1)?.occurred_at ? String(events.at(-1)?.occurred_at) : null, storedSource, timestamp, disposition.effective ? 1 : 0, disposition.reviewFlag, disposition.reviewDetail);
     db.prepare('INSERT INTO register_row_scores (project_id, external_register_id, score, band, inputs_json, scoring_version, computed_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
       .run(projectId, id, score.score, score.band, JSON.stringify(inputs), config.version, timestamp);
   }

@@ -13,6 +13,7 @@ import { importProjectRegisterBenchmark } from './src/projectRegisters.js';
 import { recordRegisterEvent, validateOccurredAt } from './src/registerProjection.js';
 import { acknowledgeChangeset, applyReviewedChangeset, buildConsultantBrief, freezePacketAndCreateChangeset, pinOverviewMode, readSourceIntelligence, replayPacket, reviewChangeset } from './src/sourceIntelligence.js';
 import { createLifecycleSourceEnqueuer, retrySourceJob, runSourceExtractionJob, skipSourceAfterComprehension, startSourceJobSweeper, WatchedInboxScanner } from './src/sourcePipeline.js';
+import { decideSourceComparison, discardSource, readSourceSafety, voidSource, type ComparisonDecision, type SourceLifecycleState } from './src/sourceSafety.js';
 import { createLocalOriginGuard } from './src/httpSecurity.js';
 import {
   compareSkillRevisions,
@@ -287,15 +288,27 @@ app.get('/api/projects/:projectId/sources/:sourceId/metadata', (request, respons
 });
 app.post('/api/projects/:projectId/sources/:sourceId/metadata', asyncRoute(async (request, response) => {
   const body = request.body as {
-    actor?: string; meetingSubject?: string; eventDate?: string; eventTime?: string | null; timezone?: string | null;
+    actor?: string; meetingSubject?: string; eventDate?: string | null; eventTime?: string | null; timezone?: string | null;
+    chronologyState?: 'confirmed' | 'approximate' | 'unknown';
+    chronologyPrecision?: 'exact-datetime' | 'date' | 'month' | 'range' | null;
+    chronologyBasis?: 'human-confirmed' | 'transcript-header' | 'filename-suggestion' | 'file-timestamp-suggestion' | null;
+    chronologyRangeStart?: string | null; chronologyRangeEnd?: string | null;
     primaryWorkPackage?: string; additionalWorkPackages?: string[]; participants?: string[]; recordingGapNotes?: string | null; reason?: string | null;
   };
   const metadata = confirmSourceMetadata(db(), String(request.params.projectId), String(request.params.sourceId), {
     actor: String(body.actor ?? 'current-user'),
     meetingSubject: String(body.meetingSubject ?? ''),
-    eventDate: String(body.eventDate ?? ''),
+    // Deliberately passed through as-is rather than coerced to a string: an
+    // absent date must stay absent so the chronology state decides, instead of
+    // an empty string being validated as a malformed date.
+    eventDate: body.eventDate ?? null,
     eventTime: body.eventTime ?? null,
     timezone: body.timezone ?? null,
+    chronologyState: body.chronologyState,
+    chronologyPrecision: body.chronologyPrecision ?? null,
+    chronologyBasis: body.chronologyBasis ?? null,
+    chronologyRangeStart: body.chronologyRangeStart ?? null,
+    chronologyRangeEnd: body.chronologyRangeEnd ?? null,
     primaryWorkPackage: String(body.primaryWorkPackage ?? ''),
     additionalWorkPackages: body.additionalWorkPackages,
     participants: body.participants,
@@ -308,6 +321,48 @@ app.post('/api/projects/:projectId/sources/:sourceId/metadata', asyncRoute(async
   // separate, visible step, exactly like every other schedule call.
   if (metadata.confirmed) scheduleSourceExtraction(metadata.sourceId);
   response.json(metadata);
+}));
+/* ---------------------------------------------------------------------------- *
+ * Source safety — duplicate comparison, discard before application, void after.
+ *
+ * Every route here is deterministic and makes ZERO provider calls. The
+ * dangerous ones (discard, void) require a named actor and a mandatory reason,
+ * enforced in the service rather than only in the UI.
+ * ---------------------------------------------------------------------------- */
+app.get('/api/projects/:projectId/sources/:sourceId/safety', (request, response) => {
+  const record = readSourceSafety(db(), String(request.params.projectId), String(request.params.sourceId));
+  if (!record) { response.status(404).json({ error: 'Source not found.' }); return; }
+  response.json(record);
+});
+app.post('/api/projects/:projectId/sources/:sourceId/comparison-decision', asyncRoute(async (request, response) => {
+  const body = request.body as { decision?: ComparisonDecision; actor?: string; reason?: string };
+  if (!body.decision) { response.status(400).json({ error: 'decision is required.' }); return; }
+  if (!body.reason || !String(body.reason).trim()) { response.status(400).json({ error: 'reason is required to decide a duplicate comparison.' }); return; }
+  const result = decideSourceComparison(db(), String(request.params.projectId), String(request.params.sourceId), {
+    decision: body.decision, actor: String(body.actor ?? 'current-user'), reason: String(body.reason),
+  });
+  // Retaining a source as new clears the hold, so extraction may now be
+  // scheduled — the same explicit, visible step confirming metadata performs.
+  // Every other decision retires the source and schedules nothing.
+  if (result.lifecycleState === 'active') {
+    const metadata = readSourceMetadata(db(), String(request.params.sourceId));
+    if (metadata?.confirmed) scheduleSourceExtraction(metadata.sourceId);
+  }
+  response.json(result);
+}));
+app.post('/api/projects/:projectId/sources/:sourceId/discard', asyncRoute(async (request, response) => {
+  const body = request.body as { state?: SourceLifecycleState; actor?: string; reason?: string };
+  if (!body.reason || !String(body.reason).trim()) { response.status(400).json({ error: 'reason is required to discard a source.' }); return; }
+  response.json(discardSource(db(), String(request.params.projectId), String(request.params.sourceId), {
+    state: body.state ?? 'discarded', actor: String(body.actor ?? 'current-user'), reason: String(body.reason),
+  }));
+}));
+app.post('/api/projects/:projectId/sources/:sourceId/void', asyncRoute(async (request, response) => {
+  const body = request.body as { actor?: string; reason?: string };
+  if (!body.reason || !String(body.reason).trim()) { response.status(400).json({ error: 'reason is required to void a source.' }); return; }
+  response.json(voidSource(db(), String(request.params.projectId), String(request.params.sourceId), {
+    actor: String(body.actor ?? 'current-user'), reason: String(body.reason),
+  }));
 }));
 app.post('/api/projects/:projectId/changesets/:changesetId/acknowledge', asyncRoute(async (request, response) => {
   response.json(acknowledgeChangeset(db(), String(request.params.changesetId), String((request.body as { actor?: string }).actor ?? 'current-user')));

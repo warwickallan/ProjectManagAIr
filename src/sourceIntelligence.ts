@@ -7,6 +7,7 @@ import { estimateTokens } from './extractionProvider.js';
 import type { GroundedBriefProvider } from './briefProvider.js';
 import { normalizeSource, SOURCE_NORMALISER_VERSION, type NormalizedDocument, type NormalizedSegment } from './sourceNormalizers.js';
 import { activeScoringVersion, canonicalNormalizedRowJson, canonicalNormalizedValue, canonicalRowJson, canonicalValueJson, insertRawRegisterRowEvent, needsConsultantAttention, PROJECTOR_VERSION, rebuildProjection, readRowEvidence, readTypedDetails } from './registerProjection.js';
+import { chronologyFromRow, compareChronology, describeUnresolved, humanPrecedenceInstant, type SourceChronology } from './sourceChronology.js';
 
 /** Work-package sentinels a row's `work_package_tags` (or a source's own primary/additional tags) may hold, alongside a real tag name. */
 export const WORK_PACKAGE_PROJECT_WIDE = 'project-wide';
@@ -840,20 +841,32 @@ function assertedFields(row: PacketRow): Record<string, unknown> {
   return asserted;
 }
 
-// The instant after which a human edit outranks this source. When the source
-// carries an event date we use the end of that day; when it does not — which is
-// every transcript with no recoverable date — we fall back to the moment the
-// source was ingested, because a human edit recorded after ingest unambiguously
-// postdates the source. The previous code returned `false` outright on a null
-// event date, which disabled human-edit protection entirely (B5).
-function humanPrecedenceInstant(source: { event_date: string | null; created_at: string }): string {
-  return source.event_date ? `${source.event_date}T23:59:59.999Z` : source.created_at;
+/**
+ * Read one source's confirmed chronology.
+ *
+ * This is now the ONLY thing that decides when a meeting happened. The previous
+ * implementation read the immutable, evidence-derived `event_date` and fell back
+ * to `created_at` when it was NULL — which is every real Teams export — so
+ * meeting precedence silently became upload order and a source could outrank an
+ * earlier-uploaded meeting purely by arriving second. Upload time appears
+ * nowhere in this file any more.
+ */
+function sourceChronologyFor(db: DatabaseSync, sourceId: string): SourceChronology {
+  const row = db.prepare('SELECT chronology_state, chronology_precision, chronology_basis, chronology_range_start, chronology_range_end, confirmed_event_date, event_time, timezone FROM source_documents WHERE id = ?').get(sourceId) as Record<string, unknown> | undefined;
+  return chronologyFromRow(row ?? {});
+}
+
+/** A short, human-readable name for a source, used inside a held operation's reason. */
+function sourceLabel(db: DatabaseSync, sourceId: string): string {
+  const row = db.prepare('SELECT original_file_name, meeting_subject FROM source_documents WHERE id = ?').get(sourceId) as { original_file_name: string; meeting_subject: string | null } | undefined;
+  if (!row) return sourceId;
+  return row.meeting_subject ? String(row.meeting_subject) : String(row.original_file_name);
 }
 
 // Precedence is checked per field, not per row (B6): a newer human note on
 // `owner` must not block an extracted update to `mitigation`. Only fields this
 // packet actually asserts a change to can be contested.
-function contestedFields(db: DatabaseSync, projectId: string, targetId: string, row: PacketRow, instant: string, sourceId: string): string[] {
+function contestedFields(db: DatabaseSync, projectId: string, targetId: string, row: PacketRow, chronology: SourceChronology, sourceId: string): { fields: string[]; unresolvedAgainst: string[] } {
   const asserted = assertedFields(row);
   const stored = db.prepare('SELECT raw_row_json FROM project_register_rows WHERE project_id = ? AND external_register_id = ?').get(projectId, targetId) as { raw_row_json: string } | undefined;
   const existing = stored ? (JSON.parse(stored.raw_row_json) as JsonObject) : {};
@@ -881,15 +894,48 @@ function contestedFields(db: DatabaseSync, projectId: string, targetId: string, 
     if (canonicalValueJson(value) === canonicalValueJson(currentOf(key, existingDetails[key]))) continue;
     changed.add(key);
   }
-  // A strictly later event always wins outright. An event recorded at the
-  // EXACT same instant from a DIFFERENT source is same-day/no-reliable-time
-  // ambiguity (Goal 2) — this must surface as an explicit conflict for human
-  // adjudication rather than either side silently winning by apply order. A
-  // same-source match at the identical instant (a retry or idempotent
-  // replay of this same packet) is excluded, or every re-run would contest
-  // its own prior write.
-  const statement = db.prepare("SELECT 1 FROM register_row_events WHERE project_id = ? AND external_register_id = ? AND field = ? AND (occurred_at > ? OR (occurred_at = ? AND source_id IS NOT NULL AND source_id != ?)) LIMIT 1");
-  return [...changed].sort().filter((field) => Boolean(statement.get(projectId, targetId, field, instant, instant, sourceId)));
+  // Precedence, decided per competing event rather than by one timestamp
+  // comparison, because "which meeting happened first" and "did a human touch
+  // this after the meeting" are different questions with different safe answers:
+  //
+  //  - a HUMAN (or system) event is contested when it was recorded after this
+  //    source's meeting ended. For a source with no known meeting date that is
+  //    ALWAYS — the conservative answer, which protects a human correction from
+  //    being reverted by an undateable transcript;
+  //
+  //  - another SOURCE's event is contested unless this source's meeting
+  //    demonstrably happened later. Same-instant, overlapping and unknown
+  //    chronologies all resolve to `unresolved` and are held, never guessed;
+  //
+  //  - this source's own events are skipped, or an idempotent re-apply would
+  //    contest its own prior write.
+  const humanInstant = humanPrecedenceInstant(chronology);
+  const competing = db.prepare('SELECT field, origin, source_id, occurred_at FROM register_row_events WHERE project_id = ? AND external_register_id = ? AND field IS NOT NULL').all(projectId, targetId) as Array<{ field: string; origin: string; source_id: string | null; occurred_at: string }>;
+  const chronologyCache = new Map<string, SourceChronology>();
+  const chronologyOf = (id: string): SourceChronology => {
+    if (!chronologyCache.has(id)) chronologyCache.set(id, sourceChronologyFor(db, id));
+    return chronologyCache.get(id)!;
+  };
+
+  const contested: string[] = [];
+  const unresolvedAgainst = new Set<string>();
+  for (const field of [...changed].sort()) {
+    for (const event of competing) {
+      if (event.field !== field) continue;
+      const isSourceEvent = event.origin === 'source' && event.source_id !== null;
+      if (isSourceEvent && String(event.source_id) === sourceId) continue;
+      if (!isSourceEvent) {
+        if (event.occurred_at > humanInstant) { contested.push(field); break; }
+        continue;
+      }
+      const order = compareChronology(chronology, chronologyOf(String(event.source_id)));
+      if (order === 'after') continue;
+      if (order === 'unresolved') unresolvedAgainst.add(String(event.source_id));
+      contested.push(field);
+      break;
+    }
+  }
+  return { fields: contested, unresolvedAgainst: [...unresolvedAgainst].sort() };
 }
 
 // Deterministic near-duplicate detection for additions (B8). The
@@ -918,12 +964,12 @@ function duplicateCandidate(db: DatabaseSync, projectId: string, registerName: R
 }
 
 function deterministicOps(db: DatabaseSync, projectId: string, packet: SourceIntelligencePacket) {
-  const source = db.prepare('SELECT event_date, created_at FROM source_documents WHERE id = ?').get(packet.source.source_id) as { event_date: string | null; created_at: string } | undefined;
+  const source = db.prepare('SELECT id FROM source_documents WHERE id = ?').get(packet.source.source_id) as { id: string } | undefined;
   // No weaker fallback: a missing source row must not silently disable
   // human-edit precedence. `validatePacket` already blocks this, and a second,
   // laxer copy of the removed defect sitting behind one gate is not acceptable.
   if (!source) throw new Error('Cannot reconcile a packet whose source document is not registered.');
-  const instant = humanPrecedenceInstant(source);
+  const chronology = sourceChronologyFor(db, packet.source.source_id);
   // Phase 0 of packet-internal relationship resolution, mirrored from
   // `validatePacket`: which client_refs this packet will turn into brand-new
   // durable rows, and in which register. A target naming one of these is a
@@ -952,10 +998,17 @@ function deterministicOps(db: DatabaseSync, projectId: string, packet: SourceInt
         op = 'unverified_link';
         reason = 'Target does not exist in the same project and register.';
       } else {
-        contested = contestedFields(db, projectId, row.target_id, row, instant, packet.source.source_id);
+        const outcome = contestedFields(db, projectId, row.target_id, row, chronology, packet.source.source_id);
+        contested = outcome.fields;
         if (contested.length > 0) {
           op = 'conflict';
-          reason = `A newer or same-day field event outranks this source assertion on: ${contested.join(', ')}.`;
+          // When the hold exists because two meetings cannot be ordered, say so
+          // in those words. "Chronology unresolved" is a different situation
+          // from "a newer source outranks you", and a reviewer deciding it
+          // needs to know which one they are looking at.
+          reason = outcome.unresolvedAgainst.length > 0
+            ? `${describeUnresolved(chronology, sourceChronologyFor(db, outcome.unresolvedAgainst[0]), sourceLabel(db, outcome.unresolvedAgainst[0]))} Held for review on: ${contested.join(', ')}.`
+            : `A newer or same-day field event outranks this source assertion on: ${contested.join(', ')}.`;
         }
       }
     } else if (row.op === 'add') {
@@ -1204,8 +1257,12 @@ function materialiseFact(db: DatabaseSync, context: ApplyContext, op: Record<str
   raw.related_refs = relatedIds;
   raw.supersedes = supersedesIds;
   if (op.op === 'resolve') raw.status = 'resolved';
-  const sourceRow = db.prepare('SELECT event_date, created_at, primary_work_package FROM source_documents WHERE id = ?').get(context.sourceId) as { event_date: string | null; created_at: string; primary_work_package: string | null };
-  const due = resolveDate(proposed.due_date_raw, sourceRow.event_date);
+  const sourceRow = db.prepare('SELECT confirmed_event_date, event_date, primary_work_package FROM source_documents WHERE id = ?').get(context.sourceId) as { confirmed_event_date: string | null; event_date: string | null; primary_work_package: string | null };
+  // A relative due date ("two weeks after this meeting") resolves against the
+  // CONFIRMED meeting date. An unknown-date source simply has no anchor to
+  // resolve against, which `resolveDate` already reports honestly rather than
+  // inventing one.
+  const due = resolveDate(proposed.due_date_raw, sourceRow.confirmed_event_date ?? sourceRow.event_date);
   // A row's own work-package tags win when the source stated one; otherwise it
   // falls back to the source's confirmed primary work package (Goal 3 — a
   // source has a primary work package for context, but need not force every
@@ -1237,7 +1294,7 @@ function materialiseFact(db: DatabaseSync, context: ApplyContext, op: Record<str
   // stays keyed on event chronology, not upload/apply order (extends the same
   // mechanism that already protects a human edit from a stale source, rather
   // than building a parallel one).
-  const sourceInstant = humanPrecedenceInstant({ event_date: sourceRow.event_date, created_at: sourceRow.created_at });
+  const sourceInstant = humanPrecedenceInstant(sourceChronologyFor(db, context.sourceId));
   // `due_date` is deliberately excluded here: it is a resolved value computed
   // by `resolveDate` and written to its own column, not a plain corrections-
   // map field, so writing its raw (often natural-language) asserted value as
@@ -1417,8 +1474,7 @@ export function applyReviewedChangeset(db: DatabaseSync, changesetId: string) {
     // inside a single already-reviewed changeset's apply transaction. Only
     // operations a human accepted are read, and the whole thing still commits
     // or rolls back as one unit.
-    const sourceForInstant = db.prepare('SELECT event_date, created_at FROM source_documents WHERE id = ?').get(String(changeset.source_id)) as { event_date: string | null; created_at: string };
-    const sourceInstant = humanPrecedenceInstant(sourceForInstant);
+    const sourceInstant = humanPrecedenceInstant(sourceChronologyFor(db, String(changeset.source_id)));
     const allocations = new Map<string, string>();
     for (const op of ops) {
       if (op.op === 'add' || op.op === 'supersede') allocations.set(String(op.client_ref), allocateId(db, String(changeset.project_id), project.code, String(op.register_name) as RegisterName));

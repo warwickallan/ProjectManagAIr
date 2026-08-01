@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
+import { LIFECYCLE_LABELS, pendingDuplicateDecision, RETIRED_LIFECYCLE_STATES, type SourceLifecycleState } from './sourceSafety.js';
 import {
   SOURCE_INTELLIGENCE_CATEGORIES,
   assembleExtractionPrompt,
@@ -1266,7 +1267,7 @@ export type SourcePipelineEvent =
   | { type: 'claimed'; jobId: string; sourceId: string; attempt: number; maxAttempts: number }
   | { type: 'completed'; jobId: string; sourceId: string; packetId: string; changesetId: string | null; gateVerdict: string; calls: number }
   | { type: 'failed'; jobId: string; sourceId: string; kind: SourceFailureKind; message: string; recoveryAction: string; attempt: number; maxAttempts: number; willRetry: boolean }
-  | { type: 'skipped'; jobId: string; sourceId: string; reason: 'lease-held' | 'already-frozen' | 'no-source' | 'awaiting-metadata'; detail: string };
+  | { type: 'skipped'; jobId: string; sourceId: string; reason: 'lease-held' | 'already-frozen' | 'no-source' | 'awaiting-metadata' | 'awaiting-duplicate-decision' | 'source-retired'; detail: string };
 
 function defaultPipelineLogger(event: SourcePipelineEvent): void {
   if (event.type === 'failed') {
@@ -1293,7 +1294,7 @@ export type SourceExtractionHandoff = Awaited<ReturnType<typeof runSourceExtract
 
 export interface SourceJobRunResult {
   ok: boolean;
-  status: 'completed' | 'already-frozen' | 'quarantined' | 'lease-held' | 'blocked' | 'awaiting-metadata';
+  status: 'completed' | 'already-frozen' | 'quarantined' | 'lease-held' | 'blocked' | 'awaiting-metadata' | 'awaiting-duplicate-decision' | 'source-retired';
   jobId: string;
   sourceId: string;
   providerCalls: number;
@@ -1328,6 +1329,26 @@ export async function runSourceExtractionJob(db: DatabaseSync, options: SourceJo
   // unconfirmed source's metadata gate. `metadata_confirmed_at` is the single
   // source of truth; `processing_status` is a display label that mirrors it.
   const intakeId = resolveIntakeId(db, source);
+  // Source safety gate, ahead of the metadata gate because it is the cheaper
+  // refusal and the more absolute one: a retired source must not be extracted
+  // whatever its metadata says.
+  const lifecycleState = String((db.prepare('SELECT lifecycle_state FROM source_documents WHERE id = ?').get(source.id) as { lifecycle_state: string } | undefined)?.lifecycle_state ?? 'active');
+  if (RETIRED_LIFECYCLE_STATES.includes(lifecycleState as SourceLifecycleState)) {
+    const detail = `This source is marked "${LIFECYCLE_LABELS[lifecycleState as SourceLifecycleState] ?? lifecycleState}", so Source Intelligence is not invoked. Retain it as new first if that was a mistake.`;
+    emit({ type: 'skipped', jobId, sourceId: source.id, reason: 'source-retired', detail });
+    return { ok: false, status: 'source-retired', jobId, sourceId: source.id, providerCalls: 0, attempts: 0, message: detail };
+  }
+  // A duplicate or overlap verdict nobody has decided yet blocks the provider.
+  // This is the single centralised place all three triggers funnel through, so
+  // no sweeper reclaim or retry can bypass the decision.
+  if (intakeId) {
+    const pending = pendingDuplicateDecision(db, intakeId);
+    if (pending && pending.blocksExtraction) {
+      const detail = `${pending.label}: ${pending.detail} Decide what to do with this source in Inbox before it can be extracted.`;
+      emit({ type: 'skipped', jobId, sourceId: source.id, reason: 'awaiting-duplicate-decision', detail });
+      return { ok: false, status: 'awaiting-duplicate-decision', jobId, sourceId: source.id, providerCalls: 0, attempts: 0, message: detail };
+    }
+  }
   const intake = intakeId ? db.prepare('SELECT metadata_confirmed_at FROM project_source_intake WHERE id = ?').get(intakeId) as { metadata_confirmed_at: string | null } | undefined : undefined;
   if (!intake?.metadata_confirmed_at) {
     const detail = 'Meeting subject, event date and primary work package have not been confirmed for this source; Source Intelligence is not invoked until they are. Confirm details in Inbox.';
